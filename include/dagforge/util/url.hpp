@@ -1,0 +1,72 @@
+#pragma once
+
+#include "dagforge/core/error.hpp"
+
+#include <boost/url/encode.hpp>
+#include <boost/url/rfc/unreserved_chars.hpp>
+#include <boost/url/url_view.hpp>
+
+#include <cstdint>
+#include <string>
+#include <string_view>
+
+namespace dagforge::util {
+
+struct ParsedHttpUrl {
+  std::string host;
+  std::uint16_t port{80};
+  std::string path{"/"};
+};
+
+[[nodiscard]] inline auto url_encode(std::string_view input) -> std::string {
+  return boost::urls::encode(input, boost::urls::unreserved_chars);
+}
+
+[[nodiscard]] inline auto parse_http_url(std::string_view url)
+    -> Result<ParsedHttpUrl> {
+  std::string normalized;
+  if (url.find("://") == std::string_view::npos) {
+    normalized = "http://";
+    normalized.append(url);
+    url = normalized;
+  }
+
+  boost::urls::url_view uri;
+  try {
+    uri = boost::urls::url_view(url);
+  } catch (...) {
+    return fail(Error::InvalidUrl);
+  }
+
+  if (uri.scheme() != "http") {
+    return fail(Error::InvalidUrl);
+  }
+
+  ParsedHttpUrl out;
+  out.host = std::string(uri.host());
+  if (out.host.empty()) {
+    return fail(Error::InvalidUrl);
+  }
+
+  if (uri.has_port()) {
+    auto port = uri.port_number();
+    if (port == 0) {
+      return fail(Error::InvalidUrl);
+    }
+    out.port = static_cast<std::uint16_t>(port);
+  }
+
+  auto path = std::string(uri.encoded_path());
+  if (path.empty()) {
+    path = "/";
+  }
+  if (auto query = uri.encoded_query(); !query.empty()) {
+    path.push_back('?');
+    path.append(query.data(), query.size());
+  }
+  out.path = std::move(path);
+
+  return out;
+}
+
+} // namespace dagforge::util

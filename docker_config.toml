@@ -1,0 +1,29 @@
+# DAGForge Docker Deployment Configuration
+# This configuration is optimized for running DAGForge in Docker with MySQL
+
+[database]
+host      = "mysql"
+port      = 3306
+user      = "dagforge"
+password  = "dagforge"
+dbname    = "dagforge"
+pool_size = 4
+
+[api]
+enabled    = true
+host       = "0.0.0.0"
+port       = 8888
+cors_origin = "*"
+
+[scheduler]
+log_level       = "info"
+tick_interval_ms = 1000
+max_concurrency  = 10
+shards          = 0  # 0 = auto-detect CPU cores
+
+[dag_source]
+directory       = "/opt/dagforge/dags"
+scan_interval_sec = 60
+
+[executor]
+default_docker_socket = "/var/run/docker.sock"
