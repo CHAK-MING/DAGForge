@@ -9,7 +9,7 @@
 
 #include <boost/algorithm/string/trim.hpp>
 #include <chrono>
-#include <format>
+#include <cstdio>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -132,7 +132,7 @@ template <typename Alloc = std::allocator<char>> struct DateFormatsT {
 };
 
 using DateFormats = DateFormatsT<>;
-using DateFormatsPmr = DateFormatsT<std::pmr::polymorphic_allocator<char>>;
+using DateFormatsPmr = DateFormatsT<pmr::polymorphic_allocator<char>>;
 
 template <typename Alloc>
 auto compute_date_formats_t(
@@ -142,26 +142,49 @@ auto compute_date_formats_t(
     return DateFormatsT<Alloc>(alloc);
   }
 
-  auto const day_tp = std::chrono::floor<std::chrono::days>(execution_date);
   auto const sec_tp = std::chrono::floor<std::chrono::seconds>(execution_date);
+  auto const utc_tm = util::to_utc(sec_tp);
+  const int year = utc_tm.tm_year + 1900;
+  const unsigned month = static_cast<unsigned>(utc_tm.tm_mon + 1);
+  const unsigned day = static_cast<unsigned>(utc_tm.tm_mday);
+  const unsigned hour = static_cast<unsigned>(utc_tm.tm_hour);
+  const unsigned minute = static_cast<unsigned>(utc_tm.tm_min);
+  const unsigned second = static_cast<unsigned>(utc_tm.tm_sec);
 
   DateFormatsT<Alloc> fmts(alloc);
-  fmts.ds = std::format("{:%Y-%m-%d}", day_tp);
-  fmts.ds_nodash = std::format("{:%Y%m%d}", day_tp);
 
-  // Build std::pmr::string from a temporary std::string payload.
+  {
+    char buf[32]{0};
+    const int n = std::snprintf(buf, sizeof(buf), "%04d-%02u-%02u", year,
+                                month, day);
+    if (n > 0) {
+      fmts.ds.assign(buf, static_cast<std::size_t>(n));
+    }
+  }
+  {
+    char buf[32]{0};
+    const int n =
+        std::snprintf(buf, sizeof(buf), "%04d%02u%02u", year, month, day);
+    if (n > 0) {
+      fmts.ds_nodash.assign(buf, static_cast<std::size_t>(n));
+    }
+  }
+
+  // Build pmr::string from a temporary std::string payload.
   std::string ts_std = util::format_iso8601(execution_date);
   fmts.ts =
       typename DateFormatsT<Alloc>::String(ts_std.data(), ts_std.size(), alloc);
 
-  fmts.ts_nodash = std::format("{:%Y%m%dT%H%M%S}", sec_tp);
+  {
+    char buf[32]{0};
+    const int n = std::snprintf(buf, sizeof(buf), "%04d%02u%02uT%02u%02u%02u",
+                                year, month, day, hour, minute, second);
+    if (n > 0) {
+      fmts.ts_nodash.assign(buf, static_cast<std::size_t>(n));
+    }
+  }
   fmts.valid = true;
   return fmts;
-}
-
-auto compute_date_formats(std::chrono::system_clock::time_point execution_date)
-    -> DateFormats {
-  return compute_date_formats_t(execution_date, std::allocator<char>{});
 }
 
 auto format_time_point(std::chrono::system_clock::time_point tp)
@@ -203,7 +226,7 @@ using XComWhitelist =
     ankerl::unordered_dense::map<XComLookupKey, const XComPullConfig *,
                                  XComLookupKeyHash>;
 
-auto try_replace_date_token(std::pmr::string &output, std::string_view token,
+auto try_replace_date_token(pmr::string &output, std::string_view token,
                             const DateFormatsPmr &date_fmts) -> bool {
   if (!date_fmts.valid) {
     return false;
@@ -229,7 +252,7 @@ auto try_replace_date_token(std::pmr::string &output, std::string_view token,
   return false;
 }
 
-auto try_replace_interval_token(std::pmr::string &output,
+auto try_replace_interval_token(pmr::string &output,
                                 std::string_view token,
                                 const DateFormatsPmr &date_fmts) -> bool {
   if (token == "data_interval_start" &&
@@ -244,7 +267,7 @@ auto try_replace_interval_token(std::pmr::string &output,
   return false;
 }
 
-auto try_replace_metadata_token(std::pmr::string &output,
+auto try_replace_metadata_token(pmr::string &output,
                                 std::string_view token,
                                 const TemplateContext &ctx) -> bool {
   if (token == "dag_id") {
@@ -263,7 +286,7 @@ auto try_replace_metadata_token(std::pmr::string &output,
 }
 
 auto try_replace_xcom_token(TemplateResolver &resolver,
-                            std::pmr::string &output, std::string_view token,
+                            pmr::string &output, std::string_view token,
                             const TemplateContext &ctx, bool strict_whitelist,
                             const XComWhitelist &whitelist) -> Result<bool> {
   auto xcom_parts = parse_xcom_token(token);
@@ -326,13 +349,13 @@ auto TemplateResolver::resolve_template(
     return ok(std::string{});
   }
 
-  std::pmr::memory_resource *resource = nullptr;
+  pmr::memory_resource *resource = nullptr;
   if (detail::current_runtime != nullptr &&
       detail::current_shard_id != kInvalidShard) {
     resource = current_memory_resource();
   }
   if (resource == nullptr) {
-    resource = std::pmr::get_default_resource();
+    resource = pmr::get_default_resource();
   }
 
   // Build whitelist lookup for strict mode
@@ -349,13 +372,13 @@ auto TemplateResolver::resolve_template(
 
   // Pre-compute date formats once using PMR
   auto date_fmts = compute_date_formats_t(
-      ctx.execution_date, std::pmr::polymorphic_allocator<char>(resource));
+      ctx.execution_date, pmr::polymorphic_allocator<char>(resource));
   date_fmts.data_interval_start =
-      std::pmr::string(format_time_point(ctx.data_interval_start), resource);
+      pmr::string(format_time_point(ctx.data_interval_start), resource);
   date_fmts.data_interval_end =
-      std::pmr::string(format_time_point(ctx.data_interval_end), resource);
+      pmr::string(format_time_point(ctx.data_interval_end), resource);
 
-  std::pmr::string output(resource);
+  pmr::string output(resource);
   output.reserve(tmpl.size() * 2);
 
   size_t pos = 0;
@@ -410,24 +433,6 @@ auto TemplateResolver::resolve_template(
   }
 
   return ok(std::string(output));
-}
-
-auto TemplateResolver::resolve_date_variables(std::string_view tmpl,
-                                              const TemplateContext &ctx)
-    -> std::string {
-  if (ctx.execution_date == std::chrono::system_clock::time_point{}) {
-    return std::string(tmpl);
-  }
-
-  auto const date_fmts = compute_date_formats(ctx.execution_date);
-
-  std::string result(tmpl);
-  boost::algorithm::replace_all(result, "{{ts_nodash}}", date_fmts.ts_nodash);
-  boost::algorithm::replace_all(result, "{{ds_nodash}}", date_fmts.ds_nodash);
-  boost::algorithm::replace_all(result, "{{ts}}", date_fmts.ts);
-  boost::algorithm::replace_all(result, "{{ds}}", date_fmts.ds);
-
-  return result;
 }
 
 } // namespace dagforge

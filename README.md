@@ -33,7 +33,16 @@
 - **DAG Engine:** TOML-based DAGs supporting dependencies, trigger rules, branching, and sensors.
 - **Executors:** Native support for Shell, Docker, and Sensor execution modes.
 - **XCom:** Cross-task communication mechanism using template variables (e.g., `{{ds}}`, `{{xcom_pull(...)}}`).
+- **HTTP API + WebSocket:** Built-in REST endpoints, metrics, and real-time event/log streaming.
 - **Web UI:** Real-time visualization and management powered by React 19, Tailwind CSS, and React Flow.
+
+## 📈 Performance Snapshot
+
+| Scenario | Topology | DAG Runs | Tasks / DAG | Total Tasks | Total Task Lag | Avg Lag / Task | Max Lag |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `scene1_linear_100x10` | 10-step linear chain | 100 | 10 | 1000 | 1237.0 ms | 1.237 ms | 24.0 ms |
+| `scene2_linear_10x100` | 100-step linear chain | 10 | 100 | 1000 | 86.0 ms | 0.086 ms | 15.0 ms |
+| `scene3_tree_100x10` | tree-shaped DAG | 100 | 10 | 1000 | 1134.0 ms | 1.134 ms | 12.0 ms |
 
 ## 📚 Documentation
 
@@ -64,9 +73,9 @@
 
 ```bash
 # Download from GitHub Releases (replace version as needed)
-curl -LO https://github.com/CHAK-MING/dagforge/releases/download/0.1.0-beta/dagforge-0.1.0-beta-linux-x86_64.tar.gz
-tar -xzf dagforge-0.1.0-beta-linux-x86_64.tar.gz
-cd dagforge-0.1.0-beta-linux-x86_64
+curl -LO https://github.com/CHAK-MING/dagforge/releases/download/0.2.0/dagforge-0.2.0-linux-x86_64.tar.gz
+tar -xzf dagforge-0.2.0-linux-x86_64.tar.gz
+cd dagforge-0.2.0-linux-x86_64
 ```
 
 Binary: `./bin/dagforge`
@@ -88,6 +97,16 @@ cp system_config.toml my_config.local.toml
 export DAGFORGE_CONFIG=my_config.local.toml
 ```
 
+Edit at least the `[database]` section before starting. The sample config also exposes:
+
+- `database.connect_timeout`
+- `scheduler.log_file` / `scheduler.pid_file`
+- `scheduler.zombie_reaper_interval_sec`
+- `scheduler.zombie_heartbeat_timeout_sec`
+- `scheduler.pin_shards_to_cores`, `scheduler.cpu_affinity_offset`
+- `api.tls_enabled`, `api.tls_cert_file`, `api.tls_key_file`
+- `dag_source.mode = "File" | "Api" | "Hybrid"`
+
 ### 4) Init DB + Validate DAGs
 
 ```bash
@@ -106,7 +125,12 @@ dagforge serve start --log-level debug --shards 4
 dagforge serve start --daemon --log-file dagforge.log
 ```
 
+Note:
+- `--daemon` requires a log file destination. Pass `--log-file` or set `scheduler.log_file` in the config first.
+
 API/UI: `http://127.0.0.1:8888`
+
+Prometheus metrics: `http://127.0.0.1:8888/metrics`
 
 ### 6) Trigger and Inspect
 
@@ -121,7 +145,7 @@ dagforge logs hello_world --latest
 ```bash
 cmake --preset default
 cmake --build --preset default
-./build/bin/dagforge serve start
+./build/bin/dagforge serve start -c system_config.toml
 ```
 
 ### 8) Alternative: Docker Compose
@@ -137,9 +161,9 @@ docker compose logs -f dagforge
 
 ```bash
 # Service
-dagforge serve start  [-c file] [--daemon/-d] [--log-file path] [--no-api] [--log-level trace|debug|info|warn|error] [--shards N]
-dagforge serve status [-c file] [--json]
-dagforge serve stop   [-c file] [--timeout N] [--force]
+dagforge serve start  [-c file] [--pid-file path] [--daemon/-d] [--log-file path] [--no-api] [--log-level trace|debug|info|warn|error] [--shards N]
+dagforge serve status [-c file] [--pid-file path] [--json]
+dagforge serve stop   [-c file] [--pid-file path] [--timeout N] [--force]
 
 # Trigger & Test
 dagforge trigger <dag_id> [--wait] [-e execution_date] [--no-api] [--json]
@@ -167,6 +191,11 @@ dagforge db prune-stale [--dry-run]
 # Validate
 dagforge validate [-c file | -f dag.toml] [--json]
 ```
+
+`-c/--config` is required unless `DAGFORGE_CONFIG` is set.
+
+Notes:
+- `dagforge serve start --daemon` requires `--log-file` or `scheduler.log_file` in config.
 
 ---
 

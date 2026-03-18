@@ -19,10 +19,6 @@ namespace dagforge {
 std::atomic<bool> g_shutdown_requested{false};
 
 namespace {
-auto delete_file_lock(void *ptr) -> void {
-  delete static_cast<boost::interprocess::file_lock *>(ptr);
-}
-
 auto ensure_parent_directory(std::string_view path) -> Result<void> {
   boost::system::error_code ec;
   const boost::filesystem::path p{std::string(path)};
@@ -59,8 +55,8 @@ void signal_handler(int) {
 }
 } // namespace
 
-PidFileGuard::PidFileGuard(
-    std::string path, std::unique_ptr<void, void (*)(void *)> lock) noexcept
+PidFileGuard::PidFileGuard(std::string path,
+                           std::unique_ptr<boost::interprocess::file_lock> lock) noexcept
     : path_(std::move(path)), lock_(std::move(lock)), owns_(true) {}
 
 PidFileGuard::~PidFileGuard() { release(); }
@@ -98,16 +94,15 @@ auto PidFileGuard::acquire(std::string_view path) -> Result<PidFileGuard> {
     }
   }
 
-  auto *raw_lock =
-      new boost::interprocess::file_lock(std::string(path).c_str());
-  std::unique_ptr<void, void (*)(void *)> lock(raw_lock, delete_file_lock);
-  if (!raw_lock->try_lock()) {
+  const std::string path_str(path);
+  auto lock = std::make_unique<boost::interprocess::file_lock>(path_str.c_str());
+  if (!lock->try_lock()) {
     return fail(Error::AlreadyExists);
   }
 
   if (auto r = write_pid_to_file(path, static_cast<std::int64_t>(::getpid()));
       !r) {
-    raw_lock->unlock();
+    lock->unlock();
     return fail(r.error());
   }
 
@@ -121,8 +116,7 @@ auto PidFileGuard::release() noexcept -> void {
   owns_ = false;
 
   if (lock_) {
-    auto *raw = static_cast<boost::interprocess::file_lock *>(lock_.get());
-    raw->unlock();
+    lock_->unlock();
   }
   lock_.reset();
 
@@ -221,7 +215,9 @@ void setup_signal_handlers() {
 }
 
 void wait_for_shutdown() {
-  g_shutdown_requested.wait(false, std::memory_order_acquire);
+  while (!g_shutdown_requested.load(std::memory_order_acquire)) {
+    g_shutdown_requested.wait(false, std::memory_order_acquire);
+  }
 }
 
 } // namespace dagforge

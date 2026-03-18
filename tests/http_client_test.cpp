@@ -13,7 +13,7 @@ class HttpClientTest : public ::testing::Test {
 protected:
   void SetUp() override {
     runtime_ = std::make_unique<Runtime>();
-    runtime_->start();
+    ASSERT_TRUE(runtime_->start().has_value());
   }
 
   void TearDown() override {

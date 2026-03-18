@@ -3,6 +3,7 @@
 #include "dagforge/config/system_config.hpp"
 #include "dagforge/storage/database_service.hpp"
 
+#include <boost/mysql/any_connection.hpp>
 #include <boost/mysql/connection_pool.hpp>
 #include <boost/mysql/pool_params.hpp>
 
@@ -49,6 +50,15 @@ public:
       -> task<Result<void>> override;
 
   auto save_dag_run(const DAGRun &run) -> task<Result<int64_t>> override;
+  auto create_run_with_task_instances_transaction(
+      const DAGRun &run, const std::vector<TaskInstanceInfo> &instances)
+      -> task<Result<int64_t>>;
+  auto acquire_batch_writer_connection()
+      -> task<Result<boost::mysql::pooled_connection>>;
+  auto create_runs_with_task_instances_transaction(
+      boost::mysql::any_connection &conn,
+      const std::vector<RunInsertBundle> &bundles)
+      -> task<Result<std::vector<int64_t>>>;
   auto update_dag_run_state(const DAGRunId &id, DAGRunState state)
       -> task<Result<void>> override;
   auto get_dag_run_state(const DAGRunId &id)
@@ -81,7 +91,7 @@ public:
       -> task<Result<RunHistoryEntry>> override;
 
   auto save_xcom(const DAGRunId &run_id, const TaskId &task_id,
-                 std::string_view key, const JsonValue &value)
+                 std::string key, const JsonValue &value)
       -> task<Result<void>> override;
   auto get_xcom(const DAGRunId &run_id, const TaskId &task_id,
                 std::string_view key) -> task<Result<XComEntry>> override;
@@ -97,6 +107,9 @@ public:
       -> task<Result<bool>> override;
   auto has_dag_run(const DAGId &dag_id, TimePoint execution_date)
       -> task<Result<bool>> override;
+  auto list_dag_run_execution_dates(const DAGId &dag_id, TimePoint start,
+                                    TimePoint end)
+      -> task<Result<std::vector<TimePoint>>>;
 
   auto save_watermark(const DAGId &dag_id, TimePoint ts)
       -> task<Result<void>> override;
@@ -106,14 +119,14 @@ public:
   auto update_watermark_failure(const DAGId &dag_id, TimePoint ts)
       -> task<Result<void>> override;
 
-  auto get_previous_task_state(const DAGId &dag_id, const TaskId &task_id,
+  auto get_previous_task_state(std::int64_t task_rowid,
                                TimePoint current_execution_date,
                                const DAGRunId &current_run_id)
       -> task<Result<TaskState>> override;
 
   auto append_task_log(const DAGRunId &run_id, const TaskId &task_id,
-                       int attempt, std::string_view stream,
-                       std::string_view content) -> task<Result<void>> override;
+                       int attempt, std::string stream, std::string content)
+      -> task<Result<void>> override;
   auto get_task_logs(const DAGRunId &run_id, const TaskId &task_id, int attempt,
                      std::size_t limit = 5000)
       -> task<Result<std::vector<orm::TaskLogEntry>>> override;
@@ -129,6 +142,13 @@ private:
   auto ensure_schema(boost::mysql::any_connection &conn) -> task<Result<void>>;
   auto get_dag_rowid(boost::mysql::any_connection &conn, const DAGId &dag_id)
       -> task<Result<int64_t>>;
+  auto save_dag_run_on_connection(boost::mysql::any_connection &conn,
+                                  const DAGRun &run) -> task<Result<int64_t>>;
+  auto save_task_instances_batch_on_connection(
+      boost::mysql::any_connection &conn, const DAGRunId &run_id,
+      const std::vector<TaskInstanceInfo> &instances, int64_t run_rowid,
+      std::int64_t execution_date_ms = -1)
+      -> task<Result<void>>;
 
   DatabaseConfig cfg_;
   boost::mysql::connection_pool pool_;

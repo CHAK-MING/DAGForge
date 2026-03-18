@@ -17,6 +17,7 @@ TEST(CLITest, TriggerOptionsDefaults) {
 TEST(CLITest, ServeStartOptionsDefaults) {
   ServeStartOptions opts;
   EXPECT_TRUE(opts.config_file.empty());
+  EXPECT_FALSE(opts.pid_file.has_value());
   EXPECT_FALSE(opts.log_file.has_value());
   EXPECT_FALSE(opts.log_level.has_value());
   EXPECT_FALSE(opts.no_api);
@@ -27,11 +28,13 @@ TEST(CLITest, ServeStartOptionsDefaults) {
 TEST(CLITest, ServeStopStatusOptionsDefaults) {
   ServeStopOptions stop;
   EXPECT_TRUE(stop.config_file.empty());
+  EXPECT_FALSE(stop.pid_file.has_value());
   EXPECT_EQ(stop.timeout_sec, 10);
   EXPECT_FALSE(stop.force);
 
   ServeStatusOptions status;
   EXPECT_TRUE(status.config_file.empty());
+  EXPECT_FALSE(status.pid_file.has_value());
   EXPECT_FALSE(status.json);
 }
 

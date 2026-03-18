@@ -1,5 +1,6 @@
 // bench_dag_engine.cpp
 
+#include "dagforge/core/memory.hpp"
 #include "dagforge/dag/dag.hpp"
 #include "dagforge/dag/dag_run.hpp"
 
@@ -301,7 +302,7 @@ void BM_DagReadyTasks(benchmark::State &state) {
   auto &run = *run_result;
   (void)run.mark_task_started(0, InstanceId{"root_inst"});
   (void)run.mark_task_completed(0, 0);
-  std::pmr::vector<NodeIndex> ready;
+  pmr::vector<NodeIndex> ready;
   ready.reserve(width);
 
   for (auto _ : state) {
@@ -342,7 +343,7 @@ void BM_EndToEnd_Scheduling_Throughput(benchmark::State &state) {
     }
     auto &run = *run_result;
     std::size_t completed = 0;
-    std::pmr::vector<NodeIndex> ready;
+    pmr::vector<NodeIndex> ready;
     ready.reserve(nodes);
     state.ResumeTiming();
 

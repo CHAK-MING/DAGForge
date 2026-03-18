@@ -1,4 +1,5 @@
 #include "dagforge/dag/dag_manager.hpp"
+#include "dagforge/dag/dag_domain.hpp"
 #include "dagforge/util/id.hpp"
 
 #include "test_utils.hpp"
@@ -51,6 +52,48 @@ TEST_F(DAGManagerTest, GetDag) {
   auto result = dag_manager_->get_dag(dag_id);
   EXPECT_TRUE(result.has_value());
   EXPECT_EQ(result->name, "Test DAG");
+}
+
+TEST_F(DAGManagerTest, CreateDagPreparesRuntimeArtifacts) {
+  DAGId dag_id{"compiled_dag"};
+  auto info = test::create_dag_info_with_task("Compiled DAG", TaskId{"task1"});
+  ASSERT_TRUE(dag_manager_->create_dag(dag_id, info).has_value());
+
+  auto result = dag_manager_->get_dag(dag_id);
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->compiled_graph);
+  ASSERT_TRUE(result->compiled_executor_configs);
+  ASSERT_TRUE(result->compiled_indexed_task_configs);
+  EXPECT_EQ(result->compiled_graph->size(), 1);
+  EXPECT_EQ(result->compiled_executor_configs->size(), 1);
+  EXPECT_EQ(result->compiled_indexed_task_configs->size(), 1);
+}
+
+TEST_F(DAGManagerTest, MergeDbStateInvalidatesAndRebuildsRuntimeArtifacts) {
+  auto file_dag =
+      test::create_dag_info_with_task("Merged DAG", TaskId{"task1"});
+  file_dag.dag_id = DAGId{"merged_dag"};
+  ASSERT_TRUE(file_dag.prepare_runtime_artifacts().has_value());
+  ASSERT_TRUE(file_dag.compiled_indexed_task_configs);
+  ASSERT_EQ(file_dag.compiled_indexed_task_configs->size(), 1);
+  EXPECT_EQ((*file_dag.compiled_indexed_task_configs)[0].task_rowid, 0);
+
+  auto db_dag = file_dag;
+  db_dag.dag_rowid = 42;
+  db_dag.tasks[0].task_rowid = 99;
+  ASSERT_TRUE(db_dag.prepare_runtime_artifacts().has_value());
+
+  merge_db_state_into_dag_info(file_dag, db_dag);
+  EXPECT_EQ(file_dag.dag_rowid, 42);
+  EXPECT_EQ(file_dag.tasks[0].task_rowid, 99);
+  EXPECT_FALSE(file_dag.compiled_graph);
+  EXPECT_FALSE(file_dag.compiled_executor_configs);
+  EXPECT_FALSE(file_dag.compiled_indexed_task_configs);
+
+  ASSERT_TRUE(file_dag.prepare_runtime_artifacts().has_value());
+  ASSERT_TRUE(file_dag.compiled_indexed_task_configs);
+  ASSERT_EQ(file_dag.compiled_indexed_task_configs->size(), 1);
+  EXPECT_EQ((*file_dag.compiled_indexed_task_configs)[0].task_rowid, 99);
 }
 
 TEST_F(DAGManagerTest, GetNonExistentDag) {

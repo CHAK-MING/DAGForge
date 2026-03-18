@@ -1,6 +1,7 @@
 // bench_memory_arena.cpp
 
 #include "dagforge/core/arena.hpp"
+#include "dagforge/core/memory.hpp"
 
 #include <benchmark/benchmark.h>
 #include <glaze/json.hpp>
@@ -24,14 +25,13 @@ struct DocStd {
 };
 
 struct NodeArena {
-  using allocator_type = std::pmr::polymorphic_allocator<std::byte>;
+  using allocator_type = pmr::polymorphic_allocator<std::byte>;
 
-  std::pmr::string id;
-  std::pmr::string cmd;
+  pmr::string id;
+  pmr::string cmd;
 
   NodeArena()
-      : id(std::pmr::get_default_resource()),
-        cmd(std::pmr::get_default_resource()) {}
+      : id(pmr::get_default_resource()), cmd(pmr::get_default_resource()) {}
 
   explicit NodeArena(const allocator_type &alloc)
       : id(alloc.resource()), cmd(alloc.resource()) {}
@@ -45,7 +45,7 @@ struct NodeArena {
 };
 
 struct DocArena {
-  std::pmr::vector<NodeArena> nodes;
+  pmr::vector<NodeArena> nodes;
 };
 
 namespace {
@@ -110,9 +110,9 @@ void BM_Memory_PmrArena_VectorString(benchmark::State &state) {
 
   for (auto _ : state) {
     Arena<1 << 20> arena;
-    auto values = arena.vector<std::pmr::string>(count);
+    auto values = arena.vector<pmr::string>(count);
     for (const auto &payload : payloads) {
-      values.push_back(std::pmr::string(payload, arena.resource()));
+      values.push_back(pmr::string(payload, arena.resource()));
     }
     benchmark::DoNotOptimize(values.size());
   }
@@ -162,7 +162,7 @@ void BM_Glaze_JsonParse_ToArena(benchmark::State &state) {
   for (auto _ : state) {
     Arena<1 << 22> arena;
     DocArena doc;
-    doc.nodes = std::pmr::vector<NodeArena>(arena.resource());
+    doc.nodes = pmr::vector<NodeArena>(arena.resource());
     doc.nodes.reserve(count);
     if (auto ec = glz::read<kOpts>(doc, payload); ec) {
       state.SkipWithError("glaze arena parse failed");

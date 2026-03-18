@@ -62,6 +62,9 @@ inline auto merge_db_state_into_dag_info(DAGInfoT &file_dag,
       task.task_rowid = it->second;
   }
   file_dag.rebuild_task_index();
+  file_dag.compiled_graph.reset();
+  file_dag.compiled_executor_configs.reset();
+  file_dag.compiled_indexed_task_configs.reset();
 }
 
 // Extract a DagStateRecord from any DAGInfo-like type (duck-typed).

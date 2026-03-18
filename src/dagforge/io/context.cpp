@@ -10,6 +10,8 @@ namespace dagforge::io {
 template <typename Rep, typename Period>
 auto async_sleep(IoContext &ctx, std::chrono::duration<Rep, Period> duration)
     -> spawn_task {
+  // Keep this wrapper instead of exposing steady_timer directly so callers get
+  // one uniform "cancel is normal, everything else is exceptional" policy.
   boost::asio::steady_timer timer(
       ctx, std::chrono::duration_cast<std::chrono::nanoseconds>(duration));
 

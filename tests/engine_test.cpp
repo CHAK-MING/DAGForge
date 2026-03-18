@@ -22,7 +22,7 @@ class EngineTest : public ::testing::Test {
 protected:
   void SetUp() override {
     runtime_ = std::make_unique<Runtime>(2);
-    runtime_->start();
+    ASSERT_TRUE(runtime_->start().has_value());
     engine_ = std::make_unique<Engine>(*runtime_);
   }
 
@@ -163,4 +163,57 @@ TEST_F(EngineTest, RemoveAfterAdd) {
   // Both calls return true - they queue events, actual removal is async
   EXPECT_TRUE(engine_->remove_task(dag_id, task_id));
   EXPECT_TRUE(engine_->remove_task(dag_id, task_id));
+}
+
+TEST_F(EngineTest, CatchupUsesBatchedExistenceCallbackWhenAvailable) {
+  engine_->start();
+
+  std::atomic<int> batch_calls = 0;
+  std::atomic<int> single_calls = 0;
+  std::atomic<int> trigger_calls = 0;
+
+  engine_->set_run_exists_callback(
+      [&single_calls](const DAGId &, std::chrono::system_clock::time_point)
+          -> boost::asio::awaitable<Result<bool>> {
+        single_calls.fetch_add(1, std::memory_order_relaxed);
+        co_return ok(false);
+      });
+  engine_->set_list_run_execution_dates_callback(
+      [&batch_calls](const DAGId &, std::chrono::system_clock::time_point,
+                     std::chrono::system_clock::time_point)
+          -> boost::asio::awaitable<
+              Result<std::vector<std::chrono::system_clock::time_point>>> {
+        batch_calls.fetch_add(1, std::memory_order_relaxed);
+        co_return ok(std::vector<std::chrono::system_clock::time_point>{});
+      });
+  engine_->set_on_dag_trigger(
+      [&trigger_calls](const DAGId &, std::chrono::system_clock::time_point) {
+        trigger_calls.fetch_add(1, std::memory_order_relaxed);
+      });
+
+  auto now = std::chrono::system_clock::now();
+  auto info =
+      make_execution_info_with_cron("catchup_dag", "schedule", "* * * * *");
+  ASSERT_TRUE(info.cron_expr.has_value());
+  info.catchup = true;
+  info.start_date = now - std::chrono::minutes(3);
+
+  const auto expected_first = info.cron_expr->next_after(*info.start_date);
+  int expected_runs = 0;
+  for (auto ts = expected_first; ts <= now; ts = info.cron_expr->next_after(ts)) {
+    ++expected_runs;
+  }
+  ASSERT_GT(expected_runs, 0);
+
+  ASSERT_TRUE(engine_->add_task(info));
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (trigger_calls.load(std::memory_order_relaxed) < expected_runs &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(kPollInterval);
+  }
+
+  EXPECT_EQ(batch_calls.load(std::memory_order_relaxed), 1);
+  EXPECT_EQ(single_calls.load(std::memory_order_relaxed), 0);
+  EXPECT_EQ(trigger_calls.load(std::memory_order_relaxed), expected_runs);
 }

@@ -13,7 +13,7 @@ class DockerExecutorTest : public ::testing::Test {
 protected:
   void SetUp() override {
     runtime_ = std::make_unique<Runtime>();
-    runtime_->start();
+    ASSERT_TRUE(runtime_->start().has_value());
     executor_ = create_docker_executor(*runtime_);
   }
 
@@ -68,6 +68,7 @@ TEST_F(DockerExecutorTest, ExecutorHandlesInvalidConfig) {
   ExecutorRequest req{
       .instance_id = InstanceId{"test-instance-1"},
       .config = wrong_config,
+      .memory_resource = {},
   };
 
   ExecutionSink sink{
@@ -109,6 +110,7 @@ TEST_F(DockerExecutorTest, ExecutorFailsWithNonExistentSocket) {
   ExecutorRequest req{
       .instance_id = InstanceId{"test-instance-2"},
       .config = config,
+      .memory_resource = {},
   };
 
   ExecutionSink sink{

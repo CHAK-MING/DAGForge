@@ -51,17 +51,21 @@ protected:
         std::make_unique<PersistenceService>(runtime_, load_test_db_config());
     auto open_res = run_coro(service_->open());
     if (!open_res) {
-      runtime_.stop();
       GTEST_SKIP() << "MySQL unavailable for persistence tests: "
                    << open_res.error().message();
     }
+    db_ready_ = true;
+    auto clear_res = run_coro(service_->clear_all_dag_data());
+    ASSERT_TRUE(clear_res.has_value()) << clear_res.error().message();
   }
 
   void TearDown() override {
-    if (service_) {
+    if (service_ && db_ready_) {
+      auto clear_res = run_coro(service_->clear_all_dag_data());
+      EXPECT_TRUE(clear_res.has_value());
       run_coro(service_->close());
-      service_.reset();
     }
+    service_.reset();
     runtime_.stop();
   }
 
@@ -124,6 +128,7 @@ protected:
 
   Runtime runtime_{1};
   std::unique_ptr<PersistenceService> service_;
+  bool db_ready_{false};
 };
 
 TEST_F(PersistenceTest, SaveDagAndListDags_RealServicePath) {
@@ -224,6 +229,30 @@ TEST_F(PersistenceTest, ClaimTaskInstances_ClaimsPendingRowsAsRunning) {
   auto hb =
       run_coro(service_->touch_task_heartbeat(run_id, persisted.task_rowid, 1));
   EXPECT_TRUE(hb.has_value());
+}
+
+TEST_F(PersistenceTest, CreateRunWithTaskInstances_NormalizesInitialAttemptToOne) {
+  auto persisted = create_persisted_dag("attempt_norm_dag", "attempt_norm_task");
+  ASSERT_GT(persisted.dag_rowid, 0);
+  ASSERT_GT(persisted.task_rowid, 0);
+
+  const DAGRunId run_id{unique_token("attempt_norm_run")};
+  auto run = create_run(run_id, persisted.dag_rowid);
+  ASSERT_TRUE(run.has_value());
+
+  TaskInstanceInfo ti{};
+  ti.task_rowid = persisted.task_rowid;
+  ti.attempt = 0;
+  ti.state = TaskState::Pending;
+
+  auto create_res = run_coro(service_->create_run_with_task_instances(
+      std::move(*run), std::vector<TaskInstanceInfo>{ti}));
+  ASSERT_TRUE(create_res.has_value());
+
+  auto tasks = run_coro(service_->get_task_instances(run_id));
+  ASSERT_TRUE(tasks.has_value());
+  ASSERT_EQ(tasks->size(), 1U);
+  EXPECT_EQ(tasks->front().attempt, 1);
 }
 
 TEST_F(PersistenceTest,
@@ -367,5 +396,48 @@ TEST(PersistenceOpenTest, OpenWithInvalidHostFailsGracefully) {
   auto open_res = run_coro(service.open());
   EXPECT_FALSE(open_res.has_value());
 
+  runtime.stop();
+}
+
+TEST(PersistenceOpenTest, SyncWaitOpenSucceedsWhenDatabaseIsReachable) {
+  Runtime runtime(1);
+  ASSERT_TRUE(runtime.start().has_value());
+
+  PersistenceService service(runtime, load_test_db_config());
+  auto open_res = service.sync_wait(service.open());
+  if (!open_res) {
+    runtime.stop();
+    GTEST_SKIP() << "MySQL unavailable for sync_wait open test: "
+                 << open_res.error().message();
+  }
+
+  EXPECT_TRUE(open_res.has_value());
+  service.sync_wait(service.close());
+  runtime.stop();
+}
+
+TEST(PersistenceOpenTest, SyncWaitListDagsSucceedsAfterOpen) {
+  Runtime runtime(1);
+  ASSERT_TRUE(runtime.start().has_value());
+
+  DatabaseConfig cfg;
+  cfg.host = env_or_default("DAGFORGE_E2E_MYSQL_HOST", "127.0.0.1");
+  cfg.username = env_or_default("DAGFORGE_E2E_MYSQL_USER", "dagforge_e2e8");
+  cfg.password = env_or_default("DAGFORGE_E2E_MYSQL_PASSWORD", "dagforge_e2e8");
+  cfg.database = env_or_default("DAGFORGE_E2E_MYSQL_DB", "dagforge_e2e8");
+  cfg.connect_timeout = 2;
+
+  PersistenceService service(runtime, cfg);
+  auto open_res = service.sync_wait(service.open());
+  if (!open_res) {
+    runtime.stop();
+    GTEST_SKIP() << "MySQL unavailable for sync_wait list_dags test: "
+                 << open_res.error().message();
+  }
+
+  auto dags_res = service.sync_wait(service.list_dags());
+  EXPECT_TRUE(dags_res.has_value());
+
+  service.sync_wait(service.close());
   runtime.stop();
 }

@@ -26,6 +26,9 @@ struct SchedulerConfig {
   int tick_interval_ms{1000};
   int max_concurrency{10};
   int shards{0}; // 0 = auto (hardware_concurrency)
+  int scheduler_shards{1};
+  bool pin_shards_to_cores{false};
+  int cpu_affinity_offset{0};
   int zombie_reaper_interval_sec{0};
   int zombie_heartbeat_timeout_sec{0};
 

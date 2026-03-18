@@ -13,12 +13,7 @@ auto CompositeExecutor::register_executor(ExecutorType type,
 
 auto CompositeExecutor::start(ExecutorRequest req, ExecutionSink sink)
     -> Result<void> {
-  auto type = std::visit(
-      overloaded{
-          [](const ShellExecutorConfig &) { return ExecutorType::Shell; },
-          [](const DockerExecutorConfig &) { return ExecutorType::Docker; },
-          [](const SensorExecutorConfig &) { return ExecutorType::Sensor; }},
-      req.config);
+  auto type = req.config.type();
 
   auto it = executors_.find(type);
   if (it == executors_.end()) {
@@ -42,9 +37,9 @@ auto CompositeExecutor::cancel(const InstanceId &instance_id) -> void {
 
 auto create_composite_executor(Runtime &rt) -> std::unique_ptr<IExecutor> {
   auto composite = std::make_unique<CompositeExecutor>();
-  auto &factory = ExecutorFactory::instance();
-  for (auto type : factory.registered_types()) {
-    if (auto executor = factory.create(type, rt)) {
+  auto &registry = ExecutorRegistry::instance();
+  for (auto type : registry.registered_types()) {
+    if (auto executor = registry.create(type, rt)) {
       composite->register_executor(type, std::move(executor));
     }
   }

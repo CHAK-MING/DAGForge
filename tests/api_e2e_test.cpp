@@ -1,4 +1,5 @@
 #include "dagforge/app/application.hpp"
+#include "dagforge/cli/management_client.hpp"
 #include "dagforge/client/http/http_client.hpp"
 #include "dagforge/config/task_config.hpp"
 #include "dagforge/util/json.hpp"
@@ -7,6 +8,7 @@
 #include "gtest/gtest.h"
 
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/generic/stream_protocol.hpp>
 #include <boost/asio/use_future.hpp>
 
 #include <array>
@@ -185,10 +187,10 @@ auto assert_all_tasks_terminal_or_expected(
       timeout, std::chrono::milliseconds(100));
 }
 
-auto poll_task_state(Application &app, std::uint16_t port,
-                     std::string_view run_id, std::string_view task_id,
-                     std::string_view expected_state,
-                     std::chrono::seconds timeout = std::chrono::seconds(8))
+[[maybe_unused]] auto
+poll_task_state(Application &app, std::uint16_t port, std::string_view run_id,
+                std::string_view task_id, std::string_view expected_state,
+                std::chrono::seconds timeout = std::chrono::seconds(8))
     -> bool {
   const std::string expected{expected_state};
   return dagforge::test::poll_until(
@@ -219,6 +221,34 @@ auto poll_task_state(Application &app, std::uint16_t port,
         return false;
       },
       timeout, std::chrono::milliseconds(100));
+}
+
+auto fetch_task_entry(Application &app, std::uint16_t port,
+                      std::string_view run_id, std::string_view task_id)
+    -> Result<JsonValue> {
+  auto tasks_resp =
+      http_get(app, port, std::format("/api/runs/{}/tasks", run_id));
+  if (!tasks_resp) {
+    return fail(tasks_resp.error());
+  }
+  if (tasks_resp->status != http::HttpStatus::Ok) {
+    return fail(Error::NotFound);
+  }
+  auto tasks_json = parse_json(response_body_string(*tasks_resp));
+  if (!tasks_json || !tasks_json->contains("tasks")) {
+    return fail(Error::ParseError);
+  }
+  const auto *arr = (*tasks_json)["tasks"].get_if<JsonValue::array_t>();
+  if (!arr) {
+    return fail(Error::ParseError);
+  }
+  for (const auto &entry : *arr) {
+    const auto *tid = entry["task_id"].get_if<std::string>();
+    if (tid && *tid == task_id) {
+      return ok(entry);
+    }
+  }
+  return fail(Error::NotFound);
 }
 
 auto wait_api_ready(Application &app, std::uint16_t port,
@@ -253,6 +283,103 @@ auto json_bool(const JsonValue &value) -> bool {
   return false;
 }
 
+auto read_exact(int fd, std::span<std::byte> buf) -> bool {
+  std::size_t off = 0;
+  while (off < buf.size()) {
+    auto n = ::recv(fd, buf.data() + off, buf.size() - off, 0);
+    if (n <= 0) {
+      return false;
+    }
+    off += static_cast<std::size_t>(n);
+  }
+  return true;
+}
+
+auto collect_ws_messages(std::uint16_t port,
+                         std::vector<std::string> *messages,
+                         std::atomic<bool> *stop_flag) -> void {
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    return;
+  }
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+    ::close(fd);
+    return;
+  }
+
+  const std::string request = "GET /ws HTTP/1.1\r\n"
+                              "Host: localhost\r\n"
+                              "Upgrade: websocket\r\n"
+                              "Connection: Upgrade\r\n"
+                              "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                              "Sec-WebSocket-Version: 13\r\n"
+                              "\r\n";
+  if (::send(fd, request.data(), request.size(), 0) !=
+      static_cast<ssize_t>(request.size())) {
+    ::close(fd);
+    return;
+  }
+
+  std::array<char, 1024> handshake{};
+  auto n = ::recv(fd, handshake.data(), handshake.size(), 0);
+  if (n <= 0) {
+    ::close(fd);
+    return;
+  }
+
+  while (!stop_flag->load(std::memory_order_acquire)) {
+    pollfd pfd{.fd = fd, .events = POLLIN, .revents = 0};
+    int rc = ::poll(&pfd, 1, 100);
+    if (rc <= 0 || (pfd.revents & POLLIN) == 0) {
+      continue;
+    }
+
+    std::array<std::byte, 2> hdr{};
+    if (!read_exact(fd, hdr)) {
+      break;
+    }
+    std::uint64_t len = (std::to_integer<uint8_t>(hdr[1]) & 0x7F);
+    if (len == 126) {
+      std::array<std::byte, 2> ext{};
+      if (!read_exact(fd, ext)) {
+        break;
+      }
+      len = (static_cast<std::uint64_t>(std::to_integer<uint8_t>(ext[0])) << 8) |
+            static_cast<std::uint64_t>(std::to_integer<uint8_t>(ext[1]));
+    } else if (len == 127) {
+      std::array<std::byte, 8> ext{};
+      if (!read_exact(fd, ext)) {
+        break;
+      }
+      len = 0;
+      for (int i = 0; i < 8; ++i) {
+        len = (len << 8) | static_cast<std::uint64_t>(
+                               std::to_integer<uint8_t>(ext[i]));
+      }
+    }
+
+    std::vector<std::byte> payload(len);
+    if (len > 0 &&
+        !read_exact(fd, std::span<std::byte>(payload.data(), payload.size()))) {
+      break;
+    }
+
+    std::string text;
+    text.reserve(payload.size());
+    for (auto b : payload) {
+      text.push_back(static_cast<char>(b));
+    }
+    messages->push_back(std::move(text));
+  }
+
+  ::close(fd);
+}
+
 } // namespace
 
 TEST(ApiE2EIntegrationTest, TriggerHistoryAndXComRoundtrip) {
@@ -284,6 +411,9 @@ TEST(ApiE2EIntegrationTest, TriggerHistoryAndXComRoundtrip) {
   task_res->xcom_push.push_back(XComPushConfig{
       .key = "payload",
       .source = XComSource::Json,
+      .json_path = "",
+      .regex_pattern = "",
+      .regex_group = 0,
   });
   dag.tasks.push_back(*task_res);
   dag.rebuild_task_index();
@@ -387,6 +517,451 @@ TEST(ApiE2EIntegrationTest, DagPauseAndUnpauseEndpointsReflectPausedState) {
   ASSERT_TRUE(dag_unpaused_json.has_value());
   ASSERT_TRUE(dag_unpaused_json->contains("is_paused"));
   EXPECT_FALSE(json_bool((*dag_unpaused_json)["is_paused"]));
+
+  app.stop();
+}
+
+TEST(ApiE2EIntegrationTest, PausedDagRejectsManualTrigger) {
+  const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
+  ASSERT_NE(port, 0);
+
+  Application app(make_test_config(port));
+  ASSERT_TRUE(app.init().has_value());
+  auto start_res = app.start();
+  if (!start_res) {
+    GTEST_SKIP() << "MySQL unavailable for paused trigger E2E: "
+                 << start_res.error().message();
+  }
+
+  const auto dag_id = unique_token("paused_trigger_dag");
+  DAGInfo dag{};
+  dag.dag_id = DAGId{dag_id};
+  dag.name = dag_id;
+  dag.is_paused = true;
+  dag.created_at = std::chrono::system_clock::now();
+  dag.updated_at = dag.created_at;
+
+  auto task_res = TaskConfig::builder()
+                      .id("worker")
+                      .name("worker")
+                      .command("echo worker")
+                      .build();
+  ASSERT_TRUE(task_res.has_value());
+  dag.tasks.push_back(*task_res);
+  dag.rebuild_task_index();
+  ASSERT_TRUE(app.dag_manager().upsert_dag(dag.dag_id, dag).has_value());
+
+  auto trigger_resp = http_post_json(
+      app, port, std::format("/api/dags/{}/trigger", dag_id), "{}");
+  ASSERT_TRUE(trigger_resp.has_value());
+  EXPECT_EQ(trigger_resp->status, http::HttpStatus::Conflict);
+
+  app.stop();
+}
+
+TEST(ApiE2EIntegrationTest, DagOwnerRejectsTriggerWhenMaxConcurrentRunsReached) {
+  const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
+  ASSERT_NE(port, 0);
+
+  Application app(make_test_config(port));
+  ASSERT_TRUE(app.init().has_value());
+  auto start_res = app.start();
+  if (!start_res) {
+    GTEST_SKIP() << "MySQL unavailable for max_concurrent_runs E2E: "
+                 << start_res.error().message();
+  }
+
+  const auto dag_id = unique_token("max_runs_dag");
+  DAGInfo dag{};
+  dag.dag_id = DAGId{dag_id};
+  dag.name = dag_id;
+  dag.max_concurrent_runs = 1;
+  dag.created_at = std::chrono::system_clock::now();
+  dag.updated_at = dag.created_at;
+
+  auto task_res = TaskConfig::builder()
+                      .id("worker")
+                      .name("worker")
+                      .command("sleep 2")
+                      .build();
+  ASSERT_TRUE(task_res.has_value());
+  dag.tasks.push_back(*task_res);
+  dag.rebuild_task_index();
+  ASSERT_TRUE(app.dag_manager().upsert_dag(dag.dag_id, dag).has_value());
+
+  auto trigger_first = http_post_json(
+      app, port, std::format("/api/dags/{}/trigger", dag_id), "{}");
+  ASSERT_TRUE(trigger_first.has_value());
+  ASSERT_EQ(trigger_first->status, http::HttpStatus::Created);
+
+  auto first_json = parse_json(response_body_string(*trigger_first));
+  ASSERT_TRUE(first_json.has_value());
+  const auto first_run_id = (*first_json)["dag_run_id"].as<std::string>();
+
+  auto trigger_second = http_post_json(
+      app, port, std::format("/api/dags/{}/trigger", dag_id), "{}");
+  ASSERT_TRUE(trigger_second.has_value());
+  EXPECT_EQ(trigger_second->status, http::HttpStatus::Conflict);
+
+  ASSERT_TRUE(poll_run_state(app, port, first_run_id, "success",
+                             std::chrono::seconds(10)));
+
+  app.stop();
+}
+
+TEST(ApiE2EIntegrationTest, InvalidCommandRunFailsAndPersistsTaskFailure) {
+  const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
+  ASSERT_NE(port, 0);
+
+  Application app(make_test_config(port));
+  ASSERT_TRUE(app.init().has_value());
+  auto start_res = app.start();
+  if (!start_res) {
+    GTEST_SKIP() << "MySQL unavailable for invalid-command E2E: "
+                 << start_res.error().message();
+  }
+
+  const auto dag_id = unique_token("invalid_command_dag");
+  DAGInfo dag{};
+  dag.dag_id = DAGId{dag_id};
+  dag.name = dag_id;
+  dag.created_at = std::chrono::system_clock::now();
+  dag.updated_at = dag.created_at;
+
+  auto task_res = TaskConfig::builder()
+                      .id("bad_task")
+                      .name("bad_task")
+                      .command("/nonexistent/command/that/does/not/exist")
+                      .build();
+  ASSERT_TRUE(task_res.has_value());
+  dag.tasks.push_back(*task_res);
+  dag.rebuild_task_index();
+  ASSERT_TRUE(app.dag_manager().upsert_dag(dag.dag_id, dag).has_value());
+
+  auto trigger_resp = http_post_json(
+      app, port, std::format("/api/dags/{}/trigger", dag_id), "{}");
+  ASSERT_TRUE(trigger_resp.has_value());
+  ASSERT_EQ(trigger_resp->status, http::HttpStatus::Created);
+
+  auto trigger_json = parse_json(response_body_string(*trigger_resp));
+  ASSERT_TRUE(trigger_json.has_value());
+  const auto run_id = (*trigger_json)["dag_run_id"].as<std::string>();
+
+  ASSERT_TRUE(poll_run_state(app, port, run_id, "failed",
+                             std::chrono::seconds(10)));
+
+  auto task_entry = fetch_task_entry(app, port, run_id, "bad_task");
+  ASSERT_TRUE(task_entry.has_value()) << task_entry.error().message();
+  EXPECT_EQ((*task_entry)["state"].as<std::string>(), "failed");
+  EXPECT_EQ((*task_entry)["exit_code"].as<int>(), 127);
+
+  app.stop();
+}
+
+TEST(ApiE2EIntegrationTest, NonZeroExitRunPersistsRetryingState) {
+  const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
+  ASSERT_NE(port, 0);
+
+  Application app(make_test_config(port));
+  ASSERT_TRUE(app.init().has_value());
+  auto start_res = app.start();
+  if (!start_res) {
+    GTEST_SKIP() << "MySQL unavailable for nonzero-exit E2E: "
+                 << start_res.error().message();
+  }
+
+  const auto dag_id = unique_token("nonzero_exit_dag");
+  DAGInfo dag{};
+  dag.dag_id = DAGId{dag_id};
+  dag.name = dag_id;
+  dag.created_at = std::chrono::system_clock::now();
+  dag.updated_at = dag.created_at;
+
+  auto task_res = TaskConfig::builder()
+                      .id("exit_task")
+                      .name("exit_task")
+                      .command("exit 1")
+                      .build();
+  ASSERT_TRUE(task_res.has_value());
+  dag.tasks.push_back(*task_res);
+  dag.rebuild_task_index();
+  ASSERT_TRUE(app.dag_manager().upsert_dag(dag.dag_id, dag).has_value());
+
+  auto trigger_resp = http_post_json(
+      app, port, std::format("/api/dags/{}/trigger", dag_id), "{}");
+  ASSERT_TRUE(trigger_resp.has_value());
+  ASSERT_EQ(trigger_resp->status, http::HttpStatus::Created);
+
+  auto trigger_json = parse_json(response_body_string(*trigger_resp));
+  ASSERT_TRUE(trigger_json.has_value());
+  const auto run_id = (*trigger_json)["dag_run_id"].as<std::string>();
+
+  auto retried = dagforge::test::poll_until(
+      [&]() {
+        auto task_entry = fetch_task_entry(app, port, run_id, "exit_task");
+        return task_entry.has_value() &&
+               (*task_entry)["state"].as<std::string>() == "retrying";
+      },
+      std::chrono::seconds(10), std::chrono::milliseconds(100));
+  ASSERT_TRUE(retried);
+
+  auto task_entry = fetch_task_entry(app, port, run_id, "exit_task");
+  ASSERT_TRUE(task_entry.has_value()) << task_entry.error().message();
+  EXPECT_EQ((*task_entry)["state"].as<std::string>(), "retrying");
+  EXPECT_EQ((*task_entry)["exit_code"].as<int>(), 1);
+
+  app.stop();
+}
+
+TEST(ApiE2EIntegrationTest, RunLogsReturnLargeStdoutAsPerLineEntries) {
+  const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
+  ASSERT_NE(port, 0);
+
+  auto cfg = make_test_config(port);
+  Application app(cfg);
+  ASSERT_TRUE(app.init().has_value());
+  auto start_res = app.start();
+  if (!start_res) {
+    GTEST_SKIP() << "MySQL unavailable for run-log E2E: "
+                 << start_res.error().message();
+  }
+
+  const auto dag_id = unique_token("large_stdout_dag");
+  DAGInfo dag{};
+  dag.dag_id = DAGId{dag_id};
+  dag.name = dag_id;
+  dag.created_at = std::chrono::system_clock::now();
+  dag.updated_at = dag.created_at;
+
+  auto task_res = TaskConfig::builder()
+                      .id("worker")
+                      .name("worker")
+                      .command("i=1; while [ $i -le 100 ]; do echo line_$i; "
+                               "i=$((i+1)); done")
+                      .build();
+  ASSERT_TRUE(task_res.has_value());
+  dag.tasks.push_back(*task_res);
+  dag.rebuild_task_index();
+  ASSERT_TRUE(app.dag_manager().upsert_dag(dag.dag_id, dag).has_value());
+
+  auto trigger_resp = http_post_json(
+      app, port, std::format("/api/dags/{}/trigger", dag_id), "{}");
+  ASSERT_TRUE(trigger_resp.has_value());
+  ASSERT_EQ(trigger_resp->status, http::HttpStatus::Created);
+
+  auto trigger_json = parse_json(response_body_string(*trigger_resp));
+  ASSERT_TRUE(trigger_json.has_value());
+  const auto run_id = (*trigger_json)["dag_run_id"].as<std::string>();
+
+  ASSERT_TRUE(poll_run_state(app, port, run_id, "success"));
+
+  std::size_t worker_stdout_lines = 0;
+  bool saw_line_1 = false;
+  bool saw_line_100 = false;
+  dagforge::cli::ManagementClient client(cfg.database);
+  ASSERT_TRUE(client.open().has_value());
+  const auto logs_ready = dagforge::test::poll_until(
+      [&]() {
+        worker_stdout_lines = 0;
+        saw_line_1 = false;
+        saw_line_100 = false;
+
+        auto logs_res = client.get_run_logs(DAGRunId{run_id}, 200);
+        if (!logs_res) {
+          return false;
+        }
+
+        for (const auto &entry : *logs_res) {
+          if (entry.task_id.str() != "worker" || entry.stream != "stdout") {
+            continue;
+          }
+          if (entry.content.starts_with("line_")) {
+            ++worker_stdout_lines;
+          }
+          if (entry.content == "line_1") {
+            saw_line_1 = true;
+          }
+          if (entry.content == "line_100") {
+            saw_line_100 = true;
+          }
+        }
+
+        return worker_stdout_lines >= 100 && saw_line_1 && saw_line_100;
+      },
+      std::chrono::seconds(5), std::chrono::milliseconds(100));
+
+  ASSERT_TRUE(logs_ready);
+  EXPECT_GE(worker_stdout_lines, 100U);
+  EXPECT_TRUE(saw_line_1);
+  EXPECT_TRUE(saw_line_100);
+
+  app.stop();
+}
+
+TEST(ApiE2EIntegrationTest, WebSocketReceivesMessagesForSlowDag) {
+  const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
+  ASSERT_NE(port, 0);
+
+  Application app(make_test_config(port));
+  ASSERT_TRUE(app.init().has_value());
+  auto start_res = app.start();
+  if (!start_res) {
+    GTEST_SKIP() << "MySQL unavailable for websocket E2E: "
+                 << start_res.error().message();
+  }
+
+  const auto dag_id = unique_token("ws_slow_dag");
+  DAGInfo dag{};
+  dag.dag_id = DAGId{dag_id};
+  dag.name = dag_id;
+  dag.created_at = std::chrono::system_clock::now();
+  dag.updated_at = dag.created_at;
+
+  auto task_a = TaskConfig::builder()
+                    .id("task_a")
+                    .name("task_a")
+                    .command("echo start_a && sleep 1 && echo end_a")
+                    .build();
+  ASSERT_TRUE(task_a.has_value());
+  auto task_b = TaskConfig::builder()
+                    .id("task_b")
+                    .name("task_b")
+                    .command("echo start_b && sleep 1 && echo end_b")
+                    .depends_on("task_a")
+                    .build();
+  ASSERT_TRUE(task_b.has_value());
+  dag.tasks.push_back(*task_a);
+  dag.tasks.push_back(*task_b);
+  dag.rebuild_task_index();
+  ASSERT_TRUE(app.dag_manager().upsert_dag(dag.dag_id, dag).has_value());
+
+  std::vector<std::string> messages;
+  std::atomic<bool> stop_ws{false};
+  std::thread ws_thread([&] { collect_ws_messages(port, &messages, &stop_ws); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  auto trigger_resp = http_post_json(
+      app, port, std::format("/api/dags/{}/trigger", dag_id), "{}");
+  ASSERT_TRUE(trigger_resp.has_value());
+  ASSERT_EQ(trigger_resp->status, http::HttpStatus::Created);
+
+  auto trigger_json = parse_json(response_body_string(*trigger_resp));
+  ASSERT_TRUE(trigger_json.has_value());
+  const auto run_id = (*trigger_json)["dag_run_id"].as<std::string>();
+
+  ASSERT_TRUE(poll_run_state(app, port, run_id, "success",
+                             std::chrono::seconds(10)));
+
+  stop_ws.store(true, std::memory_order_release);
+  ws_thread.join();
+
+  ASSERT_FALSE(messages.empty());
+  const bool has_log_or_event = std::ranges::any_of(messages, [](const auto &msg) {
+    return msg.find("\"type\":\"log\"") != std::string::npos ||
+           msg.find("\"type\":\"event\"") != std::string::npos;
+  });
+  EXPECT_TRUE(has_log_or_event);
+
+  app.stop();
+}
+
+TEST(ApiE2EIntegrationTest, HttpSensorDagDoesNotCrashServer) {
+  const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
+  ASSERT_NE(port, 0);
+
+  auto cfg = make_test_config(port);
+  cfg.dag_source.directory = example_dags_dir();
+
+  Application app(cfg);
+  ASSERT_TRUE(app.init().has_value());
+  auto start_res = app.start();
+  if (!start_res) {
+    GTEST_SKIP() << "MySQL unavailable for http-sensor E2E: "
+                 << start_res.error().message();
+  }
+
+  ASSERT_TRUE(wait_api_ready(app, port));
+
+  auto trigger_resp =
+      http_post_json(app, port, "/api/dags/sensor_http_test/trigger", "{}");
+  ASSERT_TRUE(trigger_resp.has_value());
+  ASSERT_EQ(trigger_resp->status, http::HttpStatus::Created);
+
+  auto trigger_json = parse_json(response_body_string(*trigger_resp));
+  ASSERT_TRUE(trigger_json.has_value());
+  const auto run_id = (*trigger_json)["dag_run_id"].as<std::string>();
+
+  ASSERT_TRUE(assert_all_tasks_terminal_or_expected(
+      app, port, run_id,
+      {{"wait_http", "success"}, {"verify", "success"}}, true,
+      std::chrono::seconds(20)));
+
+  auto health = http_get(app, port, "/api/health");
+  ASSERT_TRUE(health.has_value());
+  EXPECT_EQ(health->status, http::HttpStatus::Ok);
+
+  app.stop();
+}
+
+TEST(ApiE2EIntegrationTest, CommandSensorDagDoesNotCrashServer) {
+  const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
+  ASSERT_NE(port, 0);
+
+  const auto dag_dir = dagforge::test::make_temp_dir("dagforge_sensor_cmd_");
+  ASSERT_FALSE(dag_dir.empty());
+  const auto dag_path = std::filesystem::path(dag_dir) / "sensor_command.toml";
+  ASSERT_TRUE(write_dag_file(dag_path,
+                             R"(id = "sensor_command_test"
+
+[[tasks]]
+id = "setup"
+command = "echo 'ready' > /tmp/sensor_command_ready.txt"
+
+[[tasks]]
+id = "wait_command"
+executor = "sensor"
+sensor_type = "command"
+command = "test -f /tmp/sensor_command_ready.txt"
+sensor_interval = 2
+timeout = 10
+dependencies = ["setup"]
+
+[[tasks]]
+id = "verify"
+command = "echo 'Command sensor passed'"
+dependencies = ["wait_command"]
+)"));
+
+  auto cfg = make_test_config(port);
+  cfg.dag_source.directory = dag_dir;
+
+  Application app(cfg);
+  ASSERT_TRUE(app.init().has_value());
+  auto start_res = app.start();
+  if (!start_res) {
+    GTEST_SKIP() << "MySQL unavailable for command-sensor E2E: "
+                 << start_res.error().message();
+  }
+
+  ASSERT_TRUE(wait_api_ready(app, port));
+
+  auto trigger_resp =
+      http_post_json(app, port, "/api/dags/sensor_command_test/trigger", "{}");
+  ASSERT_TRUE(trigger_resp.has_value());
+  ASSERT_EQ(trigger_resp->status, http::HttpStatus::Created);
+
+  auto trigger_json = parse_json(response_body_string(*trigger_resp));
+  ASSERT_TRUE(trigger_json.has_value());
+  const auto run_id = (*trigger_json)["dag_run_id"].as<std::string>();
+
+  ASSERT_TRUE(assert_all_tasks_terminal_or_expected(
+      app, port, run_id,
+      {{"setup", "success"}, {"wait_command", "success"}, {"verify", "success"}},
+      true, std::chrono::seconds(20)));
+
+  auto health = http_get(app, port, "/api/health");
+  ASSERT_TRUE(health.has_value());
+  EXPECT_EQ(health->status, http::HttpStatus::Ok);
 
   app.stop();
 }
@@ -527,6 +1102,56 @@ dependencies = ["step_a"]
     }
   }
   EXPECT_TRUE(step_a_success);
+
+  app.stop();
+  std::filesystem::remove_all(dag_dir);
+}
+
+TEST(ApiE2EIntegrationTest, StartPreloadsDagRowidsForFileLoadedDags) {
+  const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
+  ASSERT_NE(port, 0);
+
+  const auto dag_dir = dagforge::test::make_temp_dir("dagforge_preload_dags_");
+  ASSERT_FALSE(dag_dir.empty());
+
+  const auto dag_path = std::filesystem::path(dag_dir) / "preload_rowids.toml";
+  ASSERT_TRUE(write_dag_file(dag_path,
+                             R"(id = "preload_rowids"
+name = "Preload Rowids"
+description = "rowid preload"
+
+[[tasks]]
+id = "step_a"
+name = "Step A"
+command = "echo a"
+
+[[tasks]]
+id = "step_b"
+name = "Step B"
+command = "echo b"
+dependencies = ["step_a"]
+)"));
+
+  auto cfg = make_test_config(port);
+  cfg.dag_source.directory = dag_dir;
+
+  Application app(cfg);
+  ASSERT_TRUE(app.init().has_value());
+  auto start_res = app.start();
+  if (!start_res) {
+    GTEST_SKIP() << "MySQL unavailable for preload-rowids E2E: "
+                 << start_res.error().message();
+  }
+
+  auto dag_res = app.dag_manager().get_dag(DAGId{"preload_rowids"});
+  ASSERT_TRUE(dag_res.has_value());
+  EXPECT_GT(dag_res->dag_rowid, 0);
+  ASSERT_EQ(dag_res->tasks.size(), 2U);
+  EXPECT_GT(dag_res->tasks[0].task_rowid, 0);
+  EXPECT_GT(dag_res->tasks[1].task_rowid, 0);
+  ASSERT_TRUE(dag_res->compiled_indexed_task_configs);
+  EXPECT_GT((*dag_res->compiled_indexed_task_configs)[0].task_rowid, 0);
+  EXPECT_GT((*dag_res->compiled_indexed_task_configs)[1].task_rowid, 0);
 
   app.stop();
   std::filesystem::remove_all(dag_dir);
@@ -1002,6 +1627,9 @@ TEST(ApiE2EIntegrationTest,
   router->xcom_push.push_back(XComPushConfig{
       .key = "branch",
       .source = XComSource::Json,
+      .json_path = "",
+      .regex_pattern = "",
+      .regex_group = 0,
   });
 
   auto left = TaskConfig::builder()
@@ -1183,8 +1811,8 @@ TEST(ApiE2EIntegrationTest, ChaosRecoveryMarksOrphanRunsAndTasksFailed) {
   auto tasks = tasks_fut.get();
   ASSERT_TRUE(tasks.has_value());
   ASSERT_EQ(tasks->size(), 1U);
-  for (const auto &ti : *tasks) {
-    EXPECT_EQ(ti.state, TaskState::Failed);
+  for (const auto &task_info : *tasks) {
+    EXPECT_EQ(task_info.state, TaskState::Failed);
   }
 
   restarted.stop();

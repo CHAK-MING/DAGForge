@@ -7,6 +7,10 @@
 #include <chrono>
 #include <thread>
 
+#ifdef __linux__
+#include <sched.h>
+#endif
+
 namespace dagforge::test {
 namespace {
 
@@ -61,5 +65,48 @@ TEST(ShardAffinityTest, CrossShardPostsStayOnTargetShard) {
 
   runtime.stop();
 }
+
+#ifdef __linux__
+TEST(ShardAffinityTest, RuntimeCanPinShardThreadsToAllowedCpus) {
+  constexpr unsigned kPinnedShardCount = 4;
+  Runtime runtime(kPinnedShardCount, true);
+  ASSERT_TRUE(runtime.start().has_value());
+
+  std::array<std::atomic<int>, kPinnedShardCount> observed_cpu{};
+  for (auto &cpu : observed_cpu) {
+    cpu.store(-1, std::memory_order_relaxed);
+  }
+
+  for (unsigned target = 0; target < kPinnedShardCount; ++target) {
+    runtime.post_to(target, [&observed_cpu, target]() {
+      observed_cpu[target].store(sched_getcpu(), std::memory_order_relaxed);
+    });
+  }
+
+  const auto deadline = std::chrono::steady_clock::now() + kTimeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    bool done = true;
+    for (const auto &cpu : observed_cpu) {
+      if (cpu.load(std::memory_order_relaxed) < 0) {
+        done = false;
+        break;
+      }
+    }
+    if (done) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  for (unsigned target = 0; target < kPinnedShardCount; ++target) {
+    const auto expected_cpu = runtime.pinned_cpu_for_shard(target);
+    ASSERT_GE(expected_cpu, 0);
+    EXPECT_EQ(observed_cpu[target].load(std::memory_order_relaxed),
+              expected_cpu);
+  }
+
+  runtime.stop();
+}
+#endif
 
 } // namespace dagforge::test

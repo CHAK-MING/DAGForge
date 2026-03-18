@@ -2,6 +2,7 @@
 
 #include "dagforge/dag/dag_manager.hpp"
 #include "dagforge/scheduler/cron.hpp"
+#include "dagforge/util/hash.hpp"
 #include "dagforge/util/log.hpp"
 
 #include <algorithm>
@@ -11,43 +12,85 @@
 
 namespace dagforge {
 
-SchedulerService::SchedulerService(Runtime &runtime)
-    : runtime_(runtime), engine_(runtime) {}
+SchedulerService::SchedulerService(Runtime &runtime, unsigned scheduler_shards)
+    : runtime_(runtime) {
+  const auto runtime_shards = std::max(1U, runtime_.shard_count());
+  const auto shard_count = std::clamp(
+      scheduler_shards == 0 ? runtime_shards : scheduler_shards, 1U,
+      runtime_shards);
+  engines_.reserve(shard_count);
+  engine_shards_.reserve(shard_count);
+  for (unsigned sid = 0; sid < shard_count; ++sid) {
+    auto engine_shard = static_cast<shard_id>(sid);
+    engines_.emplace_back(std::make_unique<Engine>(
+        runtime_, runtime_.shard(engine_shard).ctx()));
+    engine_shards_.push_back(engine_shard);
+  }
+  refresh_engine_callbacks();
+}
 
 auto SchedulerService::set_on_dag_trigger(DAGTriggerCallback callback) -> void {
+  if (!can_update_callbacks("set_on_dag_trigger")) {
+    return;
+  }
   on_dag_trigger_ = std::move(callback);
-  engine_.set_on_dag_trigger(
-      [this](const DAGId &dag_id,
-             std::chrono::system_clock::time_point execution_date) {
-        if (on_dag_trigger_) {
-          on_dag_trigger_(dag_id, execution_date);
-        }
-      });
+  refresh_engine_callbacks();
 }
 
 auto SchedulerService::set_run_exists_callback(RunExistsCallback callback)
     -> void {
-  engine_.set_run_exists_callback(std::move(callback));
+  if (!can_update_callbacks("set_run_exists_callback")) {
+    return;
+  }
+  run_exists_callback_ = std::move(callback);
+  refresh_engine_callbacks();
+}
+
+auto SchedulerService::set_list_run_execution_dates_callback(
+    ListRunExecutionDatesCallback callback) -> void {
+  if (!can_update_callbacks("set_list_run_execution_dates_callback")) {
+    return;
+  }
+  list_run_execution_dates_callback_ = std::move(callback);
+  refresh_engine_callbacks();
 }
 
 auto SchedulerService::set_get_watermark_callback(GetWatermarkCallback callback)
     -> void {
-  engine_.set_get_watermark_callback(std::move(callback));
+  if (!can_update_callbacks("set_get_watermark_callback")) {
+    return;
+  }
+  get_watermark_callback_ = std::move(callback);
+  refresh_engine_callbacks();
 }
 
 auto SchedulerService::set_save_watermark_callback(
     SaveWatermarkCallback callback) -> void {
-  engine_.set_save_watermark_callback(std::move(callback));
+  if (!can_update_callbacks("set_save_watermark_callback")) {
+    return;
+  }
+  save_watermark_callback_ = std::move(callback);
+  refresh_engine_callbacks();
 }
 
 auto SchedulerService::set_zombie_reaper_callback(ZombieReaperCallback callback)
     -> void {
+  if (is_running()) {
+    log::warn(
+        "SchedulerService::set_zombie_reaper_callback ignored while running");
+    return;
+  }
   zombie_reaper_callback_ = std::move(callback);
 }
 
 auto SchedulerService::set_zombie_reaper_config(int interval_sec,
                                                 int heartbeat_timeout_sec)
     -> void {
+  if (is_running()) {
+    log::warn("SchedulerService::set_zombie_reaper_config ignored while "
+              "running");
+    return;
+  }
   zombie_reaper_interval_sec_ = interval_sec;
   zombie_heartbeat_timeout_sec_ = heartbeat_timeout_sec;
 }
@@ -57,7 +100,7 @@ auto SchedulerService::register_dag(DAGId dag_id, const DAGInfo &dag_info)
   if (dag_info.cron.empty()) {
     return;
   }
-  if (!engine_.is_running()) {
+  if (!is_running()) {
     return;
   }
 
@@ -78,7 +121,8 @@ auto SchedulerService::register_dag(DAGId dag_id, const DAGInfo &dag_info)
       .catchup = dag_info.catchup,
   };
 
-  engine_.add_task(std::move(info))
+  owner_engine(dag_id)
+      .add_task(std::move(info))
       .and_then([&]() -> Result<void> {
         log::info("Registered DAG schedule: {} with cron: {}", dag_id,
                   dag_info.cron);
@@ -98,7 +142,8 @@ auto SchedulerService::unregister_dag(const DAGId &dag_id) -> void {
     return;
   }
 
-  engine_.remove_task(dag_id, it->second)
+  owner_engine(dag_id)
+      .remove_task(dag_id, it->second)
       .and_then([&]() -> Result<void> {
         log::info("Unregistered DAG schedule: {}", dag_id);
         return ok();
@@ -112,7 +157,9 @@ auto SchedulerService::unregister_dag(const DAGId &dag_id) -> void {
 }
 
 auto SchedulerService::start() -> void {
-  engine_.start();
+  for (auto &engine : engines_) {
+    engine->start();
+  }
 
   if (zombie_reaper_interval_sec_ <= 0 || zombie_heartbeat_timeout_sec_ <= 0) {
     zombie_reaper_running_.store(false, std::memory_order_release);
@@ -125,8 +172,8 @@ auto SchedulerService::start() -> void {
       try {
         co_await async_sleep(
             std::chrono::seconds(self->zombie_reaper_interval_sec_));
-      } catch (const std::exception &) {
-        // Runtime shutdown cancels pending timers; exit quietly.
+      } catch (const std::exception &e) {
+        log::debug("Zombie reaper sleep cancelled/stopped: {}", e.what());
         break;
       }
       if (!self->zombie_reaper_running_.load(std::memory_order_acquire)) {
@@ -142,8 +189,13 @@ auto SchedulerService::start() -> void {
       self->zombie_reaper_inflight_.fetch_add(1, std::memory_order_acq_rel);
       try {
         reaped = co_await self->zombie_reaper_callback_(timeout_ms);
-      } catch (const std::exception &) {
+      } catch (const std::exception &e) {
         self->zombie_reaper_inflight_.fetch_sub(1, std::memory_order_acq_rel);
+        log::error("Zombie reaper callback threw exception: {}", e.what());
+        break;
+      } catch (...) {
+        self->zombie_reaper_inflight_.fetch_sub(1, std::memory_order_acq_rel);
+        log::error("Zombie reaper callback threw non-standard exception");
         break;
       }
       self->zombie_reaper_inflight_.fetch_sub(1, std::memory_order_acq_rel);
@@ -172,13 +224,104 @@ auto SchedulerService::stop() -> void {
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
 
-  engine_.stop();
+  for (auto &engine : engines_) {
+    engine->stop();
+  }
 }
 
 auto SchedulerService::is_running() const -> bool {
-  return engine_.is_running();
+  return std::ranges::any_of(
+      engines_, [](const std::unique_ptr<Engine> &engine) {
+        return engine->is_running();
+      });
 }
 
-auto SchedulerService::engine() -> Engine & { return engine_; }
+auto SchedulerService::engine() -> Engine & { return *engines_.front(); }
+
+auto SchedulerService::owner_engine_index(const DAGId &dag_id) const noexcept
+    -> std::size_t {
+  const auto engine_count = std::max<std::size_t>(1, engines_.size());
+  return util::shard_of(std::hash<std::string_view>{}(dag_id.value()),
+                        engine_count);
+}
+
+auto SchedulerService::owner_shard(const DAGId &dag_id) const noexcept
+    -> shard_id {
+  return engine_shards_[owner_engine_index(dag_id)];
+}
+
+auto SchedulerService::owner_engine(const DAGId &dag_id) -> Engine & {
+  return *engines_[owner_engine_index(dag_id)];
+}
+
+auto SchedulerService::can_update_callbacks(std::string_view callback_name) const
+    -> bool {
+  if (is_running()) {
+    log::warn("SchedulerService::{} ignored while running", callback_name);
+    return false;
+  }
+  return true;
+}
+
+auto SchedulerService::refresh_engine_callbacks() -> void {
+  for (auto &engine : engines_) {
+    engine->set_on_dag_trigger(
+        [this](
+            const DAGId &dag_id,
+            std::chrono::system_clock::time_point execution_date) {
+          if (on_dag_trigger_) {
+            on_dag_trigger_(dag_id, execution_date);
+          }
+        });
+
+    if (run_exists_callback_) {
+      engine->set_run_exists_callback(
+          [this](
+              const DAGId &dag_id,
+              std::chrono::system_clock::time_point execution_date)
+              -> task<Result<bool>> {
+            co_return co_await run_exists_callback_(dag_id, execution_date);
+          });
+    } else {
+      engine->set_run_exists_callback({});
+    }
+
+    if (list_run_execution_dates_callback_) {
+      engine->set_list_run_execution_dates_callback(
+          [this](const DAGId &dag_id,
+                 std::chrono::system_clock::time_point start,
+                 std::chrono::system_clock::time_point end)
+              -> task<Result<std::vector<std::chrono::system_clock::time_point>>> {
+            co_return co_await list_run_execution_dates_callback_(dag_id, start,
+                                                                  end);
+          });
+    } else {
+      engine->set_list_run_execution_dates_callback({});
+    }
+
+    if (get_watermark_callback_) {
+      engine->set_get_watermark_callback(
+          [this](const DAGId &dag_id)
+              -> task<
+              Result<std::optional<std::chrono::system_clock::time_point>>> {
+            co_return co_await get_watermark_callback_(dag_id);
+          });
+    } else {
+      engine->set_get_watermark_callback({});
+    }
+
+    if (save_watermark_callback_) {
+      engine->set_save_watermark_callback(
+          [this](
+              const DAGId &dag_id,
+              std::chrono::system_clock::time_point watermark)
+              -> task<Result<void>> {
+            co_return co_await save_watermark_callback_(dag_id, watermark);
+          });
+    } else {
+      engine->set_save_watermark_callback({});
+    }
+  }
+}
 
 } // namespace dagforge

@@ -2,6 +2,7 @@
 #include "dagforge/core/coroutine.hpp"
 #include "dagforge/core/runtime.hpp"
 #include "dagforge/executor/executor.hpp"
+#include "dagforge/executor/executor_state.hpp"
 #include "dagforge/executor/executor_utils.hpp"
 #include "dagforge/util/log.hpp"
 
@@ -14,50 +15,49 @@
 
 namespace dagforge {
 
-struct DockerShardState {
-  struct ContainerInfo {
-    std::string container_id;
-    std::string socket_path;
-  };
-  std::unordered_map<InstanceId, ContainerInfo> containers;
-  std::unordered_set<InstanceId> cancelled_instances;
+struct ContainerHandle {
+  std::string container_id;
+  std::string socket_path;
 };
+
+using DockerShardState = ExecutorShardState<ContainerHandle>;
 
 struct DockerExecutionContext {
   DockerShardState *state{};
 
   auto register_container(const InstanceId &id, std::string container_id,
                           std::string socket_path) -> void {
-    state->containers[id] =
-        DockerShardState::ContainerInfo{.container_id = std::move(container_id),
-                                        .socket_path = std::move(socket_path)};
+    state->register_active(
+        id, ContainerHandle{.container_id = std::move(container_id),
+                            .socket_path = std::move(socket_path)});
   }
 
   auto unregister_container(const InstanceId &id) -> void {
-    state->containers.erase(id);
+    state->unregister_active(id);
   }
 
-  [[nodiscard]] auto get_container(const InstanceId &id) const
-      -> Result<DockerShardState::ContainerInfo> {
-    auto it = state->containers.find(id);
-    if (it != state->containers.end()) {
-      return ok(it->second);
+  [[nodiscard]] auto get_container(const InstanceId &id) const -> Result<ContainerHandle> {
+    if (auto handle = state->find_active(id)) {
+      return ok(std::move(*handle));
     }
     return fail(Error::NotFound);
   }
 
-  auto mark_cancelled(const InstanceId &id) -> void {
-    state->cancelled_instances.insert(id);
-  }
+  auto mark_cancelled(const InstanceId &id) -> void { state->mark_cancelled(id); }
 
   [[nodiscard]] auto is_cancelled(const InstanceId &id) const -> bool {
-    return state->cancelled_instances.contains(id);
+    return state->is_cancelled(id);
   }
 };
 
 namespace {
 
 using RealDockerClient = docker::DockerClient<http::HttpClient>;
+
+[[nodiscard]] auto docker_error_message(const std::error_code &error)
+    -> std::string {
+  return error.message();
+}
 
 auto generate_container_name(const InstanceId &id) -> std::string {
   std::string name = "dagforge_" + std::string(id.value());
@@ -75,8 +75,9 @@ auto finish(ExecutionSink &sink, const InstanceId &id, ExecutorResult res)
 
 auto execute_docker_task(Runtime &runtime, DockerExecutorConfig config,
                          InstanceId inst_id, ExecutionSink sink,
+                         pmr::memory_resource *resource,
                          DockerExecutionContext ctx) -> spawn_task {
-  ExecutorResult result;
+  ExecutorResult result = make_executor_result(resource);
 
   auto client_result = co_await RealDockerClient::connect(
       runtime.current_context(), config.docker_socket);
@@ -102,7 +103,7 @@ auto execute_docker_task(Runtime &runtime, DockerExecutorConfig config,
     auto pull_result = co_await client->pull_image(config.image);
     if (!pull_result) {
       result.error = std::format("Failed to pull image: {}",
-                                 docker::to_string_view(pull_result.error()));
+                                 docker_error_message(pull_result.error()));
       result.exit_code = -1;
       finish(sink, inst_id, std::move(result));
       co_return;
@@ -113,13 +114,13 @@ auto execute_docker_task(Runtime &runtime, DockerExecutorConfig config,
       co_await client->create_container(container_config, container_name);
 
   if (!create_result &&
-      create_result.error() == docker::DockerError::ImageNotFound &&
+      create_result.error() == make_error_code(docker::DockerError::ImageNotFound) &&
       config.pull_policy == ImagePullPolicy::IfNotPresent) {
     log::info("DockerExecutor: image not found, pulling {}", config.image);
     auto pull_result = co_await client->pull_image(config.image);
     if (!pull_result) {
       result.error = std::format("Failed to pull image: {}",
-                                 docker::to_string_view(pull_result.error()));
+                                 docker_error_message(pull_result.error()));
       result.exit_code = -1;
       finish(sink, inst_id, std::move(result));
       co_return;
@@ -129,8 +130,9 @@ auto execute_docker_task(Runtime &runtime, DockerExecutorConfig config,
   }
 
   if (!create_result.has_value()) {
-    result.error = std::format("Failed to create container: {}",
-                               static_cast<int>(create_result.error()));
+    result.error = std::format(
+        "Failed to create container: {}",
+        docker_error_message(create_result.error()));
     result.exit_code = -1;
     finish(sink, inst_id, std::move(result));
     co_return;
@@ -142,7 +144,7 @@ auto execute_docker_task(Runtime &runtime, DockerExecutorConfig config,
 
   ctx.register_container(inst_id, container_id, config.docker_socket);
   std::experimental::scope_exit unregister{
-      [state = ctx.state, inst_id] { state->containers.erase(inst_id); }};
+      [state = ctx.state, inst_id] { state->unregister_active(inst_id); }};
 
   auto start_result = co_await client->start_container(container_id);
   if (!start_result) {
@@ -201,17 +203,15 @@ public:
   DockerExecutorImpl &operator=(const DockerExecutorImpl &) = delete;
 
   auto start(ExecutorRequest req, ExecutionSink sink) -> Result<void> override {
-
-    const auto *docker_config = std::get_if<DockerExecutorConfig>(&req.config);
+    const auto *docker_config = req.config.as<DockerExecutorConfig>();
     if (!docker_config) {
       if (sink.on_complete) {
-        sink.on_complete(
-            req.instance_id,
-            ExecutorResult{.exit_code = -1,
-                           .stdout_output = "",
-                           .stderr_output = "",
-                           .error = "Invalid configuration for Docker executor",
-                           .timed_out = false});
+        ExecutorResult result = make_executor_result(req.resource());
+        result.exit_code = -1;
+        result.error =
+            pmr::string("Invalid configuration for Docker executor",
+                             req.resource());
+        sink.on_complete(req.instance_id, std::move(result));
       }
       return fail(Error::InvalidArgument);
     }
@@ -220,73 +220,79 @@ public:
               req.instance_id, docker_config->image,
               cmd_preview(docker_config->command));
 
-    auto owner = owner_shard(req.instance_id);
+    auto sid = runtime_->is_current_shard() ? runtime_->current_shard() : 0;
     auto t = execute_docker_task(
         *runtime_, *docker_config, req.instance_id, std::move(sink),
-        DockerExecutionContext{.state = &shard_states_[owner]});
-    runtime_->spawn_on(owner, std::move(t));
+        req.resource(),
+        DockerExecutionContext{.state = &shard_states_[sid]});
+    runtime_->spawn(std::move(t));
     return ok();
   }
 
   auto cancel(const InstanceId &instance_id) -> void override {
-    auto owner = owner_shard(instance_id);
-    runtime_->post_to(owner, [this, owner, instance_id] {
-      DockerExecutionContext ctx{.state = &shard_states_[owner]};
-      ctx.mark_cancelled(instance_id);
-      auto container_res = ctx.get_container(instance_id);
-      if (!container_res) {
-        if (container_res.error() == make_error_code(Error::NotFound)) {
-          log::warn("DockerExecutor: no active container for instance {}",
-                    instance_id);
-        } else {
-          log::error(
-              "DockerExecutor: error retrieving container for instance {}: {}",
-              instance_id, container_res.error().message());
-        }
-        return;
-      }
+    cancel_on_all_shards(*runtime_, shard_states_, instance_id,
+                         [this, instance_id](DockerShardState &state,
+                                             const InstanceId &id) {
+                           DockerExecutionContext ctx{.state = &state};
+                           ctx.mark_cancelled(id);
+                           auto container_res = ctx.get_container(id);
+                           if (!container_res) {
+                             if (container_res.error() !=
+                                 make_error_code(Error::NotFound)) {
+                               log::error(
+                                   "DockerExecutor: error retrieving container for instance {}: {}",
+                                   instance_id, container_res.error().message());
+                             }
+                             return;
+                           }
 
-      log::info("DockerExecutor: cancelling container {} for instance {}",
-                container_res->container_id, instance_id);
+                           log::info(
+                               "DockerExecutor: cancelling container {} for instance {}",
+                               container_res->container_id, id);
 
-      auto cancel_task = [](Runtime &runtime, std::string container_id,
-                            std::string socket_path) -> spawn_task {
-        auto client_result = co_await RealDockerClient::connect(
-            runtime.current_context(), socket_path);
-        if (client_result) {
-          auto stop_result =
-              co_await (*client_result)
-                  ->stop_container(container_id, std::chrono::seconds{5});
-          if (!stop_result) {
-            log::error(
-                "Failed to stop container {}: {}", container_id,
-                std::string{docker::to_string_view(stop_result.error())});
-          }
+                           auto cancel_task = [](Runtime &runtime,
+                                                 std::string container_id,
+                                                 std::string socket_path)
+                               -> spawn_task {
+                             auto client_result = co_await RealDockerClient::connect(
+                                 runtime.current_context(), socket_path);
+                             if (client_result) {
+                               auto stop_result =
+                                   co_await (*client_result)
+                                       ->stop_container(container_id,
+                                                        std::chrono::seconds{5});
+                               if (!stop_result) {
+                                 log::error("Failed to stop container {}: {}",
+                                            container_id,
+                                            docker_error_message(
+                                                stop_result.error()));
+                               }
 
-          auto remove_result =
-              co_await (*client_result)->remove_container(container_id, true);
-          if (!remove_result) {
-            log::error(
-                "Failed to remove container {}: {}", container_id,
-                std::string{docker::to_string_view(remove_result.error())});
-          }
-        }
-        co_return;
-      };
+                               auto remove_result = co_await (*client_result)
+                                                        ->remove_container(
+                                                            container_id, true);
+                               if (!remove_result) {
+                                 log::error(
+                                     "Failed to remove container {}: {}",
+                                     container_id,
+                                     docker_error_message(
+                                         remove_result.error()));
+                               }
+                             }
+                             co_return;
+                           };
 
-      runtime_->spawn_on(owner,
-                         cancel_task(*runtime_, container_res->container_id,
-                                     container_res->socket_path));
-    });
+                           auto sid = runtime_->is_current_shard()
+                                          ? runtime_->current_shard()
+                                          : 0;
+                           runtime_->spawn_on(
+                               sid, cancel_task(*runtime_,
+                                                container_res->container_id,
+                                                container_res->socket_path));
+                         });
   }
 
 private:
-  [[nodiscard]] auto owner_shard(const InstanceId &instance_id) const noexcept
-      -> shard_id {
-    const auto shards = std::max(1U, runtime_->shard_count());
-    return static_cast<shard_id>(std::hash<InstanceId>{}(instance_id) % shards);
-  }
-
   Runtime *runtime_;
   std::vector<DockerShardState> shard_states_;
 };

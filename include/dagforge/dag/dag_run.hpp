@@ -1,5 +1,6 @@
 #pragma once
 
+#include "dagforge/core/memory.hpp"
 #include "dagforge/dag/dag.hpp"
 #include "dagforge/scheduler/task.hpp"
 #include "dagforge/util/enum.hpp"
@@ -71,10 +72,10 @@ public:
   [[nodiscard]] auto state() const noexcept -> DAGRunState;
   [[nodiscard]] auto dag() const noexcept -> const DAG &;
 
-  [[nodiscard]] auto get_ready_tasks(std::pmr::memory_resource *resource =
-                                         std::pmr::get_default_resource()) const
-      -> std::pmr::vector<NodeIndex>;
-  auto copy_ready_tasks(std::pmr::vector<NodeIndex> &out) const -> void;
+  [[nodiscard]] auto get_ready_tasks(pmr::memory_resource *resource =
+                                         pmr::get_default_resource()) const
+      -> pmr::vector<NodeIndex>;
+  auto copy_ready_tasks(pmr::vector<NodeIndex> &out) const -> void;
   [[nodiscard]] auto is_task_ready(NodeIndex task_idx) const noexcept -> bool;
   [[nodiscard]] auto ready_task_stream() const
       -> std::generator<Result<NodeIndex>>;

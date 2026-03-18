@@ -24,7 +24,7 @@ auto increment_counter(std::atomic<int> *count_ptr) -> spawn_task {
 TEST(RuntimeTest, BasicStartStop) {
   Runtime rt(1);
   EXPECT_FALSE(rt.is_running());
-  rt.start();
+  ASSERT_TRUE(rt.start().has_value());
   EXPECT_TRUE(rt.is_running());
   rt.stop();
   EXPECT_FALSE(rt.is_running());
@@ -32,7 +32,7 @@ TEST(RuntimeTest, BasicStartStop) {
 
 TEST(RuntimeTest, MultiShard) {
   Runtime rt(4);
-  rt.start();
+  ASSERT_TRUE(rt.start().has_value());
   EXPECT_TRUE(rt.is_running());
   rt.stop();
   EXPECT_FALSE(rt.is_running());
@@ -48,7 +48,7 @@ TEST(RuntimeTest, ShardCount) {
 
 TEST(RuntimeTest, StopStopsRuntime) {
   Runtime rt(1);
-  rt.start();
+  ASSERT_TRUE(rt.start().has_value());
   EXPECT_TRUE(rt.is_running());
 
   rt.stop();
@@ -60,7 +60,7 @@ TEST(RuntimeTest, StopStopsRuntime) {
 
 TEST(RuntimeTest, CurrentShardReturnsInvalidOutsideContext) {
   Runtime rt(2);
-  rt.start();
+  ASSERT_TRUE(rt.start().has_value());
 
   auto shard_id = rt.current_shard();
   EXPECT_EQ(shard_id, kInvalidShard);
@@ -70,7 +70,7 @@ TEST(RuntimeTest, CurrentShardReturnsInvalidOutsideContext) {
 
 TEST(RuntimeTest, IsCurrentShardFalseOutsideContext) {
   Runtime rt(1);
-  rt.start();
+  ASSERT_TRUE(rt.start().has_value());
 
   EXPECT_FALSE(rt.is_current_shard());
 
@@ -79,7 +79,7 @@ TEST(RuntimeTest, IsCurrentShardFalseOutsideContext) {
 
 TEST(RuntimeTest, ZeroShardsDefaultsToOne) {
   Runtime rt(0);
-  rt.start();
+  ASSERT_TRUE(rt.start().has_value());
   EXPECT_GE(rt.shard_count(), 1);
   rt.stop();
 }
@@ -87,12 +87,12 @@ TEST(RuntimeTest, ZeroShardsDefaultsToOne) {
 TEST(RuntimeTest, MultipleStartStops) {
   Runtime rt(1);
 
-  rt.start();
+  ASSERT_TRUE(rt.start().has_value());
   EXPECT_TRUE(rt.is_running());
   rt.stop();
   EXPECT_FALSE(rt.is_running());
 
-  rt.start();
+  ASSERT_TRUE(rt.start().has_value());
   EXPECT_TRUE(rt.is_running());
   rt.stop();
   EXPECT_FALSE(rt.is_running());
@@ -100,7 +100,7 @@ TEST(RuntimeTest, MultipleStartStops) {
 
 TEST(RuntimeTest, GetShardIdValid) {
   Runtime rt(1);
-  rt.start();
+  ASSERT_TRUE(rt.start().has_value());
 
   // Inside a shard coroutine, current_shard() returns the shard index.
   std::atomic<uint32_t> observed{kInvalidShard};
@@ -122,7 +122,7 @@ TEST(RuntimeTest, GetShardIdValid) {
 
 TEST(RuntimeTest, ScheduleExternalRunsTask) {
   Runtime rt(2);
-  rt.start();
+  ASSERT_TRUE(rt.start().has_value());
 
   std::atomic<int> count = 0;
   auto t = increment_counter(&count);
@@ -142,7 +142,7 @@ TEST(RuntimeTest, RunningFlagSetCorrectly) {
 
   EXPECT_FALSE(rt.is_running());
 
-  rt.start();
+  ASSERT_TRUE(rt.start().has_value());
   EXPECT_TRUE(rt.is_running());
 
   std::this_thread::sleep_for(kRunningCheckDelay);
@@ -155,7 +155,7 @@ TEST(RuntimeTest, RunningFlagSetCorrectly) {
 
 TEST(RuntimeTest, ScheduleAfterStop_IsNoOp) {
   Runtime rt(1);
-  rt.start();
+  ASSERT_TRUE(rt.start().has_value());
   rt.stop();
 
   std::atomic<int> count = 0;
@@ -168,7 +168,7 @@ TEST(RuntimeTest, ScheduleAfterStop_IsNoOp) {
 
 TEST(RuntimeTest, SpawnOnTargetShard_FromExternalContext) {
   Runtime rt(2);
-  rt.start();
+  ASSERT_TRUE(rt.start().has_value());
 
   std::atomic<uint32_t> target_observed{kInvalidShard};
 

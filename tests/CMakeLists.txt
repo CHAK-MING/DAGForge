@@ -35,11 +35,14 @@ find_package(Threads REQUIRED)
 
   # Executor tests
   executor_test.cpp
+  execution_service_test.cpp
   docker_executor_test.cpp
   sensor_executor_test.cpp
+  process_management_test.cpp
 
   # HTTP/Docker client tests
   http_client_test.cpp
+  http_server_test.cpp
   docker_client_test.cpp
 
   # I/O tests
@@ -142,6 +145,9 @@ add_executable(dagforge_benchmarks
 
   # Dimension 8: Arena/memory behavior
   bench_memory_arena.cpp
+
+  # Dimension 9: Scheduler sharding
+  bench_scheduler_service.cpp
 
 )
 

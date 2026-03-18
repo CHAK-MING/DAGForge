@@ -177,4 +177,42 @@ TEST_F(BranchingTest, SkippedBranchPropagatesSkipToDownstream) {
   EXPECT_TRUE(is_skipped(run, *after_a));
 }
 
+TEST_F(BranchingTest, MarkCompletedWithBranch_DoesNotSkipRunningDownstream) {
+  auto branch = dag_.add_node(TaskId("branch"), TriggerRule::AllSuccess, true);
+  auto gate = dag_.add_node(TaskId("gate"));
+  auto downstream = dag_.add_node(TaskId("downstream"), TriggerRule::OneSuccess);
+
+  ASSERT_TRUE(branch.has_value());
+  ASSERT_TRUE(gate.has_value());
+  ASSERT_TRUE(downstream.has_value());
+
+  ASSERT_TRUE(dag_.add_edge(*branch, *downstream).has_value());
+  ASSERT_TRUE(dag_.add_edge(*gate, *downstream).has_value());
+
+  auto run_result =
+      DAGRun::create(DAGRunId("run_running_downstream"), std::make_shared<DAG>(dag_));
+  ASSERT_TRUE(run_result.has_value());
+  auto &run = *run_result;
+
+  ASSERT_TRUE(run.mark_task_started(*branch, InstanceId("inst_branch")));
+  ASSERT_TRUE(run.mark_task_started(*gate, InstanceId("inst_gate")));
+  ASSERT_TRUE(run.mark_task_completed(*gate, 0));
+  ASSERT_TRUE(run.mark_task_started(*downstream, InstanceId("inst_downstream")));
+
+  auto info = run.get_task_info(*downstream);
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->state, TaskState::Running);
+
+  std::array<TaskId, 1> selected{TaskId("other_branch")};
+  ASSERT_TRUE(run.mark_task_completed_with_branch(*branch, 0, selected));
+
+  info = run.get_task_info(*downstream);
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->state, TaskState::Running);
+
+  ASSERT_TRUE(run.mark_task_completed(*downstream, 0));
+  EXPECT_TRUE(run.is_complete());
+  EXPECT_EQ(run.state(), DAGRunState::Success);
+}
+
 } // namespace dagforge

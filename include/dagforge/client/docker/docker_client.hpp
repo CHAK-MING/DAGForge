@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dagforge/client/http/http_client.hpp"
+#include "dagforge/core/error.hpp"
 #include "dagforge/core/coroutine.hpp"
 #include "dagforge/executor/executor_utils.hpp"
 #include "dagforge/io/context.hpp"
@@ -87,7 +88,50 @@ enum class DockerError : std::uint8_t {
   return "unknown error";
 }
 
-template <typename T> using DockerResult = std::expected<T, DockerError>;
+class DockerErrorCategory final : public std::error_category {
+public:
+  [[nodiscard]] auto name() const noexcept -> const char * override {
+    return "dagforge.docker";
+  }
+
+  [[nodiscard]] auto message(int ev) const -> std::string override {
+    return std::string{
+        to_string_view(static_cast<DockerError>(static_cast<std::uint8_t>(ev)))};
+  }
+
+  using std::error_category::equivalent;
+
+  [[nodiscard]] auto equivalent(int code,
+                                const std::error_condition &condition) const noexcept
+      -> bool override {
+    if (condition.category() != std::generic_category()) {
+      return false;
+    }
+
+    switch (static_cast<DockerError>(static_cast<std::uint8_t>(code))) {
+    case DockerError::ConnectionFailed:
+      return condition == std::errc::connection_refused ||
+             condition == std::errc::not_connected;
+    case DockerError::Timeout:
+      return condition == std::errc::timed_out;
+    case DockerError::InvalidInput:
+      return condition == std::errc::invalid_argument;
+    default:
+      return false;
+    }
+  }
+};
+
+[[nodiscard]] inline auto docker_error_category() noexcept
+    -> const DockerErrorCategory & {
+  static const DockerErrorCategory instance;
+  return instance;
+}
+
+[[nodiscard]] inline auto make_error_code(DockerError error) noexcept
+    -> std::error_code {
+  return {std::to_underlying(error), docker_error_category()};
+}
 
 namespace detail {
 inline auto is_valid_container_id(std::string_view id) -> bool {
@@ -132,6 +176,9 @@ inline auto read_json_body(const std::vector<std::uint8_t> &body) -> Result<T> {
 
 } // namespace dagforge::docker
 
+template <>
+struct std::is_error_code_enum<dagforge::docker::DockerError> : std::true_type {};
+
 namespace glz {
 
 template <> struct meta<dagforge::docker::detail::CreateContainerResponseJson> {
@@ -171,7 +218,7 @@ public:
   static auto connect(io::IoContext &ctx,
                       std::string_view socket_path = "/var/run/docker.sock",
                       DockerClientConfig config = {})
-      -> task<DockerResult<std::unique_ptr<DockerClient<Connector>>>> {
+      -> task<Result<std::unique_ptr<DockerClient<Connector>>>> {
     http::HttpClientConfig http_config{
         .connect_timeout = config.connect_timeout,
         .read_timeout = config.read_timeout,
@@ -184,7 +231,7 @@ public:
 
     if (!http_client_res) {
       log::error("Failed to connect to Docker socket: {}", socket_path);
-      co_return std::unexpected(DockerError::ConnectionFailed);
+      co_return fail(make_error_code(DockerError::ConnectionFailed));
     }
 
     co_return std::make_unique<DockerClient<Connector>>(
@@ -193,7 +240,7 @@ public:
 
   auto create_container(const ContainerConfig &config,
                         std::string_view name = "")
-      -> task<DockerResult<CreateContainerResponse>> {
+      -> task<Result<CreateContainerResponse>> {
     json body;
     body["Image"] = config.image;
     body["AttachStdout"] = true;
@@ -213,7 +260,7 @@ public:
       for (const auto &[key, value] : config.env) {
         if (!::dagforge::is_valid_env_key(key)) {
           log::error("Invalid environment variable key: {}", key);
-          co_return std::unexpected(DockerError::InvalidInput);
+          co_return fail(make_error_code(DockerError::InvalidInput));
         }
         env_array.get_array().push_back(std::format("{}={}", key, value));
       }
@@ -231,25 +278,25 @@ public:
 
     if (response.status == http::HttpStatus::NotFound) {
       log::error("Docker image not found: {}", config.image);
-      co_return std::unexpected(DockerError::ImageNotFound);
+      co_return fail(make_error_code(DockerError::ImageNotFound));
     }
 
     if (response.status == http::HttpStatus::Conflict) {
       log::error("Container name conflict: {}", name);
-      co_return std::unexpected(DockerError::Conflict);
+      co_return fail(make_error_code(DockerError::Conflict));
     }
 
     if (response.status != http::HttpStatus::Created) {
       log::error("Failed to create container: status={}",
                  static_cast<int>(response.status));
-      co_return std::unexpected(DockerError::ApiError);
+      co_return fail(make_error_code(DockerError::ApiError));
     }
 
     auto parsed = detail::read_json_body<detail::CreateContainerResponseJson>(
         response.body);
     if (!parsed) {
       log::error("Failed to parse create container response");
-      co_return std::unexpected(DockerError::ParseError);
+      co_return fail(make_error_code(DockerError::ParseError));
     }
     co_return CreateContainerResponse{
         .id = std::move(parsed->Id),
@@ -257,10 +304,10 @@ public:
     };
   }
 
-  auto pull_image(std::string_view image) -> task<DockerResult<void>> {
+  auto pull_image(std::string_view image) -> task<Result<void>> {
     if (image.empty()) {
       log::error("Empty image name");
-      co_return std::unexpected(DockerError::InvalidInput);
+      co_return fail(make_error_code(DockerError::InvalidInput));
     }
 
     std::string image_name{image};
@@ -284,24 +331,24 @@ public:
 
     if (response.status == http::HttpStatus::NotFound) {
       log::error("Image not found: {}:{}", image_name, tag);
-      co_return std::unexpected(DockerError::ImageNotFound);
+      co_return fail(make_error_code(DockerError::ImageNotFound));
     }
 
     if (response.status != http::HttpStatus::Ok) {
       log::error("Failed to pull image {}:{}: status={}", image_name, tag,
                  static_cast<int>(response.status));
-      co_return std::unexpected(DockerError::ApiError);
+      co_return fail(make_error_code(DockerError::ApiError));
     }
 
     log::info("DockerClient: successfully pulled image {}:{}", image_name, tag);
-    co_return DockerResult<void>{};
+    co_return ok();
   }
 
   auto start_container(std::string_view container_id)
-      -> task<DockerResult<void>> {
+      -> task<Result<void>> {
     if (!detail::is_valid_container_id(container_id)) {
       log::error("Invalid container ID: {}", container_id);
-      co_return std::unexpected(DockerError::InvalidInput);
+      co_return fail(make_error_code(DockerError::InvalidInput));
     }
 
     std::string path = std::format("/{}/containers/{}/start",
@@ -310,24 +357,24 @@ public:
 
     if (response.status == http::HttpStatus::NotFound) {
       log::error("Container not found: {}", container_id);
-      co_return std::unexpected(DockerError::ContainerNotFound);
+      co_return fail(make_error_code(DockerError::ContainerNotFound));
     }
 
     if (response.status != http::HttpStatus::NoContent &&
         response.status != http::HttpStatus::NotModified) {
       log::error("Failed to start container {}: status={}", container_id,
                  static_cast<int>(response.status));
-      co_return std::unexpected(DockerError::ApiError);
+      co_return fail(make_error_code(DockerError::ApiError));
     }
 
-    co_return DockerResult<void>{};
+    co_return ok();
   }
 
   auto wait_container(std::string_view container_id)
-      -> task<DockerResult<WaitContainerResponse>> {
+      -> task<Result<WaitContainerResponse>> {
     if (!detail::is_valid_container_id(container_id)) {
       log::error("Invalid container ID: {}", container_id);
-      co_return std::unexpected(DockerError::InvalidInput);
+      co_return fail(make_error_code(DockerError::InvalidInput));
     }
 
     std::string path = std::format("/{}/containers/{}/wait",
@@ -336,20 +383,20 @@ public:
 
     if (response.status == http::HttpStatus::NotFound) {
       log::error("Container not found: {}", container_id);
-      co_return std::unexpected(DockerError::ContainerNotFound);
+      co_return fail(make_error_code(DockerError::ContainerNotFound));
     }
 
     if (response.status != http::HttpStatus::Ok) {
       log::error("Failed to wait for container {}: status={}", container_id,
                  static_cast<int>(response.status));
-      co_return std::unexpected(DockerError::ApiError);
+      co_return fail(make_error_code(DockerError::ApiError));
     }
 
     auto parsed = detail::read_json_body<detail::WaitContainerResponseJson>(
         response.body);
     if (!parsed) {
       log::error("Failed to parse wait container response");
-      co_return std::unexpected(DockerError::ParseError);
+      co_return fail(make_error_code(DockerError::ParseError));
     }
     co_return WaitContainerResponse{
         .status_code = static_cast<int>(parsed->StatusCode),
@@ -359,10 +406,10 @@ public:
   }
 
   auto get_logs(std::string_view container_id)
-      -> task<DockerResult<ContainerLogs>> {
+      -> task<Result<ContainerLogs>> {
     if (!detail::is_valid_container_id(container_id)) {
       log::error("Invalid container ID: {}", container_id);
-      co_return std::unexpected(DockerError::InvalidInput);
+      co_return fail(make_error_code(DockerError::InvalidInput));
     }
 
     std::string path =
@@ -372,13 +419,13 @@ public:
 
     if (response.status == http::HttpStatus::NotFound) {
       log::error("Container not found: {}", container_id);
-      co_return std::unexpected(DockerError::ContainerNotFound);
+      co_return fail(make_error_code(DockerError::ContainerNotFound));
     }
 
     if (response.status != http::HttpStatus::Ok) {
       log::error("Failed to get logs for container {}: status={}", container_id,
                  static_cast<int>(response.status));
-      co_return std::unexpected(DockerError::ApiError);
+      co_return fail(make_error_code(DockerError::ApiError));
     }
 
     std::string_view raw_logs(
@@ -389,10 +436,10 @@ public:
 
   auto stop_container(std::string_view container_id,
                       std::chrono::seconds timeout = std::chrono::seconds{10})
-      -> task<DockerResult<void>> {
+      -> task<Result<void>> {
     if (!detail::is_valid_container_id(container_id)) {
       log::error("Invalid container ID: {}", container_id);
-      co_return std::unexpected(DockerError::InvalidInput);
+      co_return fail(make_error_code(DockerError::InvalidInput));
     }
 
     std::string path =
@@ -402,24 +449,24 @@ public:
 
     if (response.status == http::HttpStatus::NotFound) {
       log::error("Container not found: {}", container_id);
-      co_return std::unexpected(DockerError::ContainerNotFound);
+      co_return fail(make_error_code(DockerError::ContainerNotFound));
     }
 
     if (response.status != http::HttpStatus::NoContent &&
         response.status != http::HttpStatus::NotModified) {
       log::error("Failed to stop container {}: status={}", container_id,
                  static_cast<int>(response.status));
-      co_return std::unexpected(DockerError::ApiError);
+      co_return fail(make_error_code(DockerError::ApiError));
     }
 
-    co_return DockerResult<void>{};
+    co_return ok();
   }
 
   auto remove_container(std::string_view container_id, bool force = false)
-      -> task<DockerResult<void>> {
+      -> task<Result<void>> {
     if (!detail::is_valid_container_id(container_id)) {
       log::error("Invalid container ID: {}", container_id);
-      co_return std::unexpected(DockerError::InvalidInput);
+      co_return fail(make_error_code(DockerError::InvalidInput));
     }
 
     std::string path =
@@ -428,16 +475,16 @@ public:
     auto response = co_await connector_->delete_(path);
 
     if (response.status == http::HttpStatus::NotFound) {
-      co_return DockerResult<void>{};
+      co_return ok();
     }
 
     if (response.status != http::HttpStatus::NoContent) {
       log::error("Failed to remove container {}: status={}", container_id,
                  static_cast<int>(response.status));
-      co_return std::unexpected(DockerError::ApiError);
+      co_return fail(make_error_code(DockerError::ApiError));
     }
 
-    co_return DockerResult<void>{};
+    co_return ok();
   }
 
   [[nodiscard]] auto is_connected() const noexcept -> bool {

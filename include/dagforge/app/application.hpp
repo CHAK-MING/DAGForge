@@ -19,6 +19,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace dagforge {
 
@@ -78,6 +79,15 @@ public:
   [[nodiscard]] auto mysql_batch_write_ops() const -> std::uint64_t;
   [[nodiscard]] auto dropped_persistence_events() const -> std::uint64_t;
   [[nodiscard]] auto event_bus_queue_length() const -> std::size_t;
+  [[nodiscard]] auto trigger_batch_queue_depth() const -> std::size_t;
+  [[nodiscard]] auto trigger_batch_last_size() const -> std::size_t;
+  [[nodiscard]] auto trigger_batch_last_linger_us() const -> std::uint64_t;
+  [[nodiscard]] auto trigger_batch_last_flush_ms() const -> std::uint64_t;
+  [[nodiscard]] auto trigger_batch_requests_total() const -> std::uint64_t;
+  [[nodiscard]] auto trigger_batch_commits_total() const -> std::uint64_t;
+  [[nodiscard]] auto trigger_batch_fallback_total() const -> std::uint64_t;
+  [[nodiscard]] auto trigger_batch_rejected_total() const -> std::uint64_t;
+  [[nodiscard]] auto trigger_batch_wakeup_lag_us() const -> std::uint64_t;
   [[nodiscard]] auto shard_stall_age_ms(shard_id id) const -> std::uint64_t;
   [[nodiscard]] auto get_run_state(const DAGRunId &dag_run_id) const
       -> Result<DAGRunState>;
@@ -116,11 +126,74 @@ public:
   auto show_status() const -> void;
 
 private:
+  struct RunLaunchPlan {
+    DAGId dag_id;
+    int64_t dag_rowid{0};
+    int version{1};
+    std::shared_ptr<const DAG> graph;
+    std::shared_ptr<const std::vector<ExecutorConfig>> executor_configs;
+    std::shared_ptr<const std::vector<TaskConfig>> indexed_task_configs;
+  };
+
+  struct DagOwnerState {
+    int active_runs{0};
+  };
+
+  struct DagOwnerShardState {
+    ankerl::unordered_dense::map<DAGId, DagOwnerState> dags;
+  };
+
   auto setup_callbacks() -> void;
-  auto cache_run_dag_mapping(const DAGRunId &dag_run_id,
-                             const DAGId &dag_id) const -> void;
-  [[nodiscard]] auto resolve_dag_id_cached(const DAGRunId &dag_run_id) const
+  [[nodiscard]] auto owner_shard(const DAGId &dag_id) const noexcept
+      -> shard_id;
+  [[nodiscard]] auto owner_shard(const DAGRunId &dag_run_id) const noexcept
+      -> shard_id;
+  auto trigger_scheduled_on_owner_shard(
+      DAGId dag_id,
+      std::chrono::system_clock::time_point execution_date) -> spawn_task;
+  auto trigger_run_on_dag_owner_shard(
+      DAGId dag_id, TriggerType trigger,
+      std::optional<std::chrono::system_clock::time_point> execution_date,
+      std::chrono::system_clock::time_point request_now)
+      -> task<Result<DAGRunId>>;
+  auto trigger_run_on_owner_shard(
+      RunLaunchPlan plan, TriggerType trigger,
+      std::optional<std::chrono::system_clock::time_point> execution_date,
+      DAGRunId dag_run_id, std::chrono::system_clock::time_point request_now)
+      -> task<Result<DAGRunId>>;
+  [[nodiscard]] auto try_acquire_dag_run_slot(const DAGInfo &info)
+      -> Result<void>;
+  auto release_dag_run_slot(const DAGId &dag_id) -> void;
+  auto on_run_finished(const DAGRunId &dag_run_id, DAGRunState status) -> void;
+  [[nodiscard]] auto resolve_dag_id(const DAGRunId &dag_run_id) const
       -> std::optional<DAGId>;
+  auto spawn_persistence_task(spawn_task task) -> void;
+  template <typename OpFactory>
+  auto run_persistence_factory(std::shared_ptr<OpFactory> factory,
+                               bool count_mysql_write) -> spawn_task {
+    auto res = co_await (*factory)();
+    record_persistence_result(res, count_mysql_write);
+    co_return;
+  }
+  template <typename OpFactory>
+  auto enqueue_persistence(OpFactory &&factory,
+                           bool count_mysql_write = true) -> void {
+    auto shared_factory =
+        std::make_shared<std::decay_t<OpFactory>>(std::forward<OpFactory>(factory));
+    spawn_persistence_task(run_persistence_factory(std::move(shared_factory),
+                                                  count_mysql_write));
+  }
+  template <typename T>
+  auto record_persistence_result(const Result<T> &result,
+                                 bool count_mysql_write = true) -> void {
+    if (!result) {
+      dropped_persistence_events_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    if (count_mysql_write) {
+      mysql_batch_write_ops_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
   auto setup_config_watcher() -> void;
   auto handle_file_change(const std::string &filename) -> void;
   auto get_max_retries(const DAGRunId &dag_run_id, NodeIndex idx) const -> int;
@@ -147,16 +220,13 @@ private:
   std::unique_ptr<ExecutionService> execution_;
 
   DAGManager dag_manager_;
+  std::vector<DagOwnerShardState> dag_owner_states_;
 
   std::unique_ptr<ApiServer> api_;
 
   // Config file watching
   std::unique_ptr<ConfigWatcher> config_watcher_;
 
-  using RunDagCache = ankerl::unordered_dense::map<DAGRunId, DAGId>;
-  mutable std::atomic<std::shared_ptr<const RunDagCache>> run_dag_cache_state_{
-      std::make_shared<RunDagCache>()};
-  static constexpr std::size_t kMaxRunDagCacheEntries = 65536;
 };
 
 } // namespace dagforge

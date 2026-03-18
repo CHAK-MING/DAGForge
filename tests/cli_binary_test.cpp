@@ -120,4 +120,30 @@ TEST(CLIBinarySmokeTest, ServeHelpHasLogLevelOverride) {
   auto r = run_cmd(kBin + " serve start --help");
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_NE(r.output.find("--log-level"), std::string::npos);
+  EXPECT_NE(r.output.find("--pid-file"), std::string::npos);
+}
+
+TEST(CLIBinarySmokeTest, ServeStartRejectsZeroShards) {
+  auto r = run_cmd(kBin + " serve start -c /nonexistent.toml --shards 0");
+  EXPECT_NE(r.exit_code, 0);
+}
+
+TEST(CLIBinarySmokeTest, ServeStopRejectsZeroTimeout) {
+  auto r = run_cmd(kBin + " serve stop -c /nonexistent.toml --timeout 0");
+  EXPECT_NE(r.exit_code, 0);
+}
+
+TEST(CLIBinarySmokeTest, LogsRejectsZeroAttempt) {
+  auto r = run_cmd(kBin + " logs -c /nonexistent.toml my_dag --attempt 0");
+  EXPECT_NE(r.exit_code, 0);
+}
+
+TEST(CLIBinarySmokeTest, ListDagsRejectsZeroLimit) {
+  auto r = run_cmd(kBin + " list dags -c /nonexistent.toml --limit 0");
+  EXPECT_NE(r.exit_code, 0);
+}
+
+TEST(CLIBinarySmokeTest, ListRunsRejectsZeroLimit) {
+  auto r = run_cmd(kBin + " list runs -c /nonexistent.toml --limit 0");
+  EXPECT_NE(r.exit_code, 0);
 }

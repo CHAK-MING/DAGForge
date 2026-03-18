@@ -18,6 +18,7 @@
 #include <optional>
 #include <system_error>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 
@@ -63,28 +64,23 @@ auto Engine::stop() -> void {
       work_guard_->reset();
     }
 
-    stopped_.store(true, std::memory_order_release);
-    stopped_.notify_all();
+    {
+      std::lock_guard lock(stop_mutex_);
+      stopped_.store(true, std::memory_order_release);
+    }
+    stop_cv_.notify_all();
   });
 
   constexpr auto kStopTimeout = std::chrono::seconds(5);
   const auto deadline = std::chrono::steady_clock::now() + kStopTimeout;
-  while (!stopped_.load(std::memory_order_acquire)) {
-    if (std::chrono::steady_clock::now() >= deadline) {
-      log::warn("Engine stop timed out waiting for scheduler loop shutdown");
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  std::unique_lock lock(stop_mutex_);
+  if (!stop_cv_.wait_until(lock, deadline, [this] {
+        return stopped_.load(std::memory_order_acquire);
+      })) {
+    log::warn("Engine stop timed out waiting for scheduler loop shutdown");
   }
 
   log::info("Engine stopped");
-}
-
-auto Engine::run_loop() -> void {
-  // Compatibility shim: Engine is now driven by Runtime's io_context threads.
-  while (running_.load(std::memory_order_acquire)) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
 }
 
 auto Engine::run_cron_task(DAGTaskId dag_task_id, TimePoint first_time)
@@ -219,6 +215,11 @@ auto Engine::set_run_exists_callback(RunExistsCallback cb) -> void {
   run_exists_ = std::move(cb);
 }
 
+auto Engine::set_list_run_execution_dates_callback(
+    ListRunExecutionDatesCallback cb) -> void {
+  list_run_execution_dates_ = std::move(cb);
+}
+
 auto Engine::set_get_watermark_callback(GetWatermarkCallback cb) -> void {
   get_watermark_ = std::move(cb);
 }
@@ -255,16 +256,52 @@ auto Engine::handle_event(AddTaskEvent e) -> boost::asio::awaitable<void> {
     TimePoint effective_baseline = baseline_time;
 
     if (e.exec_info.catchup) {
+      std::vector<TimePoint> catchup_runs;
       auto next_run = cron.next_after(effective_baseline);
       while (next_run <= now) {
+        if (!running_.load(std::memory_order_acquire)) {
+          co_return;
+        }
         if (e.exec_info.end_date.has_value() &&
             next_run > *e.exec_info.end_date) {
           break;
         }
+        catchup_runs.push_back(next_run);
+        effective_baseline = next_run;
+        next_run = cron.next_after(effective_baseline);
+      }
 
+      std::unordered_set<std::int64_t> existing_runs;
+      bool use_batched_existence = false;
+      if (list_run_execution_dates_ && !catchup_runs.empty()) {
+        auto existing_res =
+            co_await list_run_execution_dates_(e.exec_info.dag_id,
+                                               catchup_runs.front(),
+                                               catchup_runs.back());
+        if (!existing_res) {
+          log::error("Failed to batch load run existence for DAG {}: {}",
+                     e.exec_info.dag_id, existing_res.error().message());
+        } else {
+          existing_runs.reserve(existing_res->size());
+          for (const auto execution_date : *existing_res) {
+            existing_runs.insert(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    execution_date.time_since_epoch())
+                    .count());
+          }
+          use_batched_existence = true;
+        }
+      }
+
+      for (const auto execution_date : catchup_runs) {
         bool exists = false;
-        if (run_exists_) {
-          auto res = co_await run_exists_(e.exec_info.dag_id, next_run);
+        if (use_batched_existence) {
+          exists = existing_runs.contains(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  execution_date.time_since_epoch())
+                  .count());
+        } else if (run_exists_) {
+          auto res = co_await run_exists_(e.exec_info.dag_id, execution_date);
           if (!res) {
             log::error("Failed to check run existence for DAG {}: {}",
                        e.exec_info.dag_id, res.error().message());
@@ -275,16 +312,19 @@ auto Engine::handle_event(AddTaskEvent e) -> boost::asio::awaitable<void> {
         }
 
         if (!exists && on_dag_trigger_) {
+          if (!running_.load(std::memory_order_acquire)) {
+            co_return;
+          }
           log::info("Catchup triggering DAG: {} for execution_date: {}",
                     e.exec_info.dag_id,
                     std::chrono::duration_cast<std::chrono::seconds>(
-                        next_run.time_since_epoch())
+                        execution_date.time_since_epoch())
                         .count());
-          on_dag_trigger_(e.exec_info.dag_id, next_run);
+          on_dag_trigger_(e.exec_info.dag_id, execution_date);
 
           if (save_watermark_) {
             auto wm_res =
-                co_await save_watermark_(e.exec_info.dag_id, next_run);
+                co_await save_watermark_(e.exec_info.dag_id, execution_date);
             wm_res.or_else([&](std::error_code ec) -> Result<void> {
               log::error("Failed to save watermark for DAG {}: {}",
                          e.exec_info.dag_id, ec.message());
@@ -292,9 +332,6 @@ auto Engine::handle_event(AddTaskEvent e) -> boost::asio::awaitable<void> {
             });
           }
         }
-
-        effective_baseline = next_run;
-        next_run = cron.next_after(effective_baseline);
       }
     }
 

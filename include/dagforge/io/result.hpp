@@ -8,6 +8,11 @@
 namespace dagforge::io {
 
 // I/O Error Codes
+//
+// This category intentionally groups transport-facing failures under one
+// project category. We still map common cases back to `std::errc` via
+// equivalent(), but callers also rely on the stable DAGForge-specific domain
+// for API/status translation and cross-module error handling.
 
 enum class IoError : std::uint8_t {
   Success = 0,

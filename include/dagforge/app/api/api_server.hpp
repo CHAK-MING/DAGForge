@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dagforge/app/http/websocket.hpp"
+#include "dagforge/io/result.hpp"
 #include "dagforge/util/id.hpp"
 
 #include <memory>
@@ -19,7 +20,7 @@ public:
   explicit ApiServer(Application &app);
   ~ApiServer();
 
-  void start();
+  [[nodiscard]] auto start() -> Result<void>;
   void stop();
   [[nodiscard]] bool is_running() const;
   http::WebSocketHub &websocket_hub();

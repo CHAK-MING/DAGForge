@@ -123,6 +123,10 @@ struct TaskLogsResponseDto {
   std::vector<TaskLogEntryDto> logs;
 };
 
+struct TriggerRequestDto {
+  std::optional<std::string_view> execution_date;
+};
+
 } // namespace api_dto
 
 } // namespace dagforge
@@ -203,6 +207,11 @@ template <> struct meta<dagforge::api_dto::TaskLogsResponseDto> {
                                        &T::task_id, "logs", &T::logs);
 };
 
+template <> struct meta<dagforge::api_dto::TriggerRequestDto> {
+  using T = dagforge::api_dto::TriggerRequestDto;
+  static constexpr auto value = object("execution_date", &T::execution_date);
+};
+
 template <> struct meta<dagforge::api_dto::TaskInstanceDto> {
   using T = dagforge::api_dto::TaskInstanceDto;
   static constexpr auto value =
@@ -254,6 +263,8 @@ auto status_from_error(const std::error_code &ec) -> HttpStatus {
     case Error::Cancelled:
       return HttpStatus::ServiceUnavailable;
     case Error::AlreadyExists:
+    case Error::HasActiveRuns:
+    case Error::InvalidState:
       return HttpStatus::Conflict;
     case Error::ReadOnly:
       return HttpStatus::Forbidden;
@@ -591,6 +602,60 @@ struct ApiServer::Impl : std::enable_shared_from_this<Impl> {
       out << "dagforge_dropped_persistence_events_total "
           << self->app_.dropped_persistence_events() << "\n";
 
+      out << "# HELP dagforge_trigger_batch_queue_depth Current trigger batch "
+             "queue depth\n";
+      out << "# TYPE dagforge_trigger_batch_queue_depth gauge\n";
+      out << "dagforge_trigger_batch_queue_depth "
+          << self->app_.trigger_batch_queue_depth() << "\n";
+
+      out << "# HELP dagforge_trigger_batch_last_size Last committed trigger "
+             "batch size\n";
+      out << "# TYPE dagforge_trigger_batch_last_size gauge\n";
+      out << "dagforge_trigger_batch_last_size "
+          << self->app_.trigger_batch_last_size() << "\n";
+
+      out << "# HELP dagforge_trigger_batch_last_linger_us Last trigger batch "
+             "linger duration in microseconds\n";
+      out << "# TYPE dagforge_trigger_batch_last_linger_us gauge\n";
+      out << "dagforge_trigger_batch_last_linger_us "
+          << self->app_.trigger_batch_last_linger_us() << "\n";
+
+      out << "# HELP dagforge_trigger_batch_last_flush_ms Last trigger batch "
+             "flush duration in milliseconds\n";
+      out << "# TYPE dagforge_trigger_batch_last_flush_ms gauge\n";
+      out << "dagforge_trigger_batch_last_flush_ms "
+          << self->app_.trigger_batch_last_flush_ms() << "\n";
+
+      out << "# HELP dagforge_trigger_batch_requests_total Total trigger "
+             "requests accepted into the batch queue\n";
+      out << "# TYPE dagforge_trigger_batch_requests_total counter\n";
+      out << "dagforge_trigger_batch_requests_total "
+          << self->app_.trigger_batch_requests_total() << "\n";
+
+      out << "# HELP dagforge_trigger_batch_commits_total Total trigger "
+             "batches committed\n";
+      out << "# TYPE dagforge_trigger_batch_commits_total counter\n";
+      out << "dagforge_trigger_batch_commits_total "
+          << self->app_.trigger_batch_commits_total() << "\n";
+
+      out << "# HELP dagforge_trigger_batch_fallback_total Total trigger "
+             "requests processed via fallback path\n";
+      out << "# TYPE dagforge_trigger_batch_fallback_total counter\n";
+      out << "dagforge_trigger_batch_fallback_total "
+          << self->app_.trigger_batch_fallback_total() << "\n";
+
+      out << "# HELP dagforge_trigger_batch_rejected_total Total trigger "
+             "requests rejected from batch queue\n";
+      out << "# TYPE dagforge_trigger_batch_rejected_total counter\n";
+      out << "dagforge_trigger_batch_rejected_total "
+          << self->app_.trigger_batch_rejected_total() << "\n";
+
+      out << "# HELP dagforge_trigger_batch_wakeup_lag_us Last trigger batch "
+             "wake-up lag in microseconds\n";
+      out << "# TYPE dagforge_trigger_batch_wakeup_lag_us gauge\n";
+      out << "dagforge_trigger_batch_wakeup_lag_us "
+          << self->app_.trigger_batch_wakeup_lag_us() << "\n";
+
       out << "# HELP dagforge_shard_stall_age_ms Milliseconds since shard "
              "heartbeat was last observed\n";
       out << "# TYPE dagforge_shard_stall_age_ms gauge\n";
@@ -696,24 +761,16 @@ struct ApiServer::Impl : std::enable_shared_from_this<Impl> {
           std::optional<std::chrono::system_clock::time_point> execution_date;
           auto body = req.body_as_string();
           if (!body.empty()) {
-            auto parsed = parse_json(body);
-            if (!parsed) {
+            api_dto::TriggerRequestDto trigger_req{};
+            if (auto ec =
+                    glz::read<glz::opts{.error_on_unknown_keys = false}>(
+                        trigger_req, body);
+                ec) {
               co_return error_response(400, "Invalid JSON body");
             }
-            if (!parsed->is_object()) {
-              co_return error_response(400,
-                                       "Request body must be a JSON object");
-            }
-
-            const auto &obj = parsed->get_object();
-            if (auto it = obj.find("execution_date"); it != obj.end()) {
-              if (!it->second.is_string()) {
-                co_return error_response(
-                    400, "execution_date must be a string (now | YYYY-MM-DD | "
-                         "YYYY-MM-DDTHH:MM:SSZ)");
-              }
+            if (trigger_req.execution_date) {
               auto parsed_execution_date =
-                  parse_execution_date_arg(it->second.as<std::string>());
+                  parse_execution_date_arg(*trigger_req.execution_date);
               if (!parsed_execution_date) {
                 co_return error_response(400,
                                          "Invalid execution_date, expected now "
@@ -723,8 +780,22 @@ struct ApiServer::Impl : std::enable_shared_from_this<Impl> {
             }
           }
 
+          const auto request_started_at = std::chrono::steady_clock::now();
           auto res = co_await self->app_.trigger_run(
               DAGId{*dag_id}, TriggerType::Manual, execution_date);
+          const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::steady_clock::now() -
+                                      request_started_at)
+                                      .count();
+          if (res) {
+            dagforge::log::info(
+                "HTTP trigger completed dag_id={} dag_run_id={} latency_ms={}",
+                *dag_id, *res, elapsed_ms);
+          } else {
+            dagforge::log::warn(
+                "HTTP trigger failed dag_id={} latency_ms={} error={}", *dag_id,
+                elapsed_ms, res.error().message());
+          }
           co_return res
               .transform([](const auto &run_id) {
                 return json_response(
@@ -990,7 +1061,10 @@ struct ApiServer::Impl : std::enable_shared_from_this<Impl> {
                  if (auto lim = qp.get("limit"); lim) {
                    try {
                      limit = static_cast<std::size_t>(std::stoul(*lim));
-                   } catch (...) {
+                   } catch (const std::exception &e) {
+                     log::warn("Ignoring invalid /api/runs/{{dag_run_id}}/logs "
+                               "limit '{}': {}",
+                               *lim, e.what());
                    }
                  }
 
@@ -1031,14 +1105,20 @@ struct ApiServer::Impl : std::enable_shared_from_this<Impl> {
                  if (auto att = qp.get("attempt"); att) {
                    try {
                      attempt = std::stoi(*att);
-                   } catch (...) {
+                   } catch (const std::exception &e) {
+                     log::warn("Ignoring invalid /api/runs/{{dag_run_id}}/"
+                               "tasks/{{task_id}}/logs attempt '{}': {}",
+                               *att, e.what());
                    }
                  }
                  std::size_t limit = 5000;
                  if (auto lim = qp.get("limit"); lim) {
                    try {
                      limit = static_cast<std::size_t>(std::stoul(*lim));
-                   } catch (...) {
+                   } catch (const std::exception &e) {
+                     log::warn("Ignoring invalid /api/runs/{{dag_run_id}}/"
+                               "tasks/{{task_id}}/logs limit '{}': {}",
+                               *lim, e.what());
                    }
                  }
 
@@ -1064,18 +1144,17 @@ struct ApiServer::Impl : std::enable_shared_from_this<Impl> {
                });
   }
 
-  void start() {
+  auto start() -> Result<void> {
     const auto &api_cfg = app_.config().api;
     if (api_cfg.tls_enabled) {
       auto tls_res = server_->set_tls_credentials(api_cfg.tls_cert_file,
                                                   api_cfg.tls_key_file);
       if (!tls_res) {
         log::error("API TLS setup failed: {}", tls_res.error().message());
-        return;
+        return fail(tls_res.error());
       }
     }
-    app_.runtime().spawn_external(
-        server_->start(api_cfg.host, api_cfg.port, api_cfg.reuse_port));
+    return server_->start(api_cfg.host, api_cfg.port, api_cfg.reuse_port);
   }
 
   void stop() {
@@ -1107,9 +1186,9 @@ ApiServer::ApiServer(Application &app) : impl_(std::make_shared<Impl>(app)) {
 }
 ApiServer::~ApiServer() = default;
 
-void ApiServer::start() {
+auto ApiServer::start() -> Result<void> {
   const auto impl = impl_;
-  impl->start();
+  return impl->start();
 }
 
 void ApiServer::stop() {

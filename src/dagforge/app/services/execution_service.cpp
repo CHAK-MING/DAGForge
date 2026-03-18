@@ -8,11 +8,14 @@
 #include "dagforge/xcom/xcom_extractor.hpp"
 
 #include <boost/asio/post.hpp>
+#include <boost/asio/this_coro.hpp>
 
+#include <array>
 #include <algorithm>
 #include <boost/system/error_code.hpp>
 #include <chrono>
 #include <functional>
+#include <memory_resource>
 #include <ranges>
 #include <unordered_map>
 #include <unordered_set>
@@ -21,7 +24,8 @@ namespace dagforge {
 
 ExecutionService::ExecutionService(Runtime &runtime, IExecutor &executor)
     : runtime_(runtime), executor_(executor), template_resolver_(),
-      shard_states_(runtime_.shard_count()) {}
+      shard_states_(runtime_.shard_count()),
+      ready_run_queue_sizes_(runtime_.shard_count()) {}
 
 ExecutionService::~ExecutionService() = default;
 
@@ -46,14 +50,107 @@ auto ExecutionService::post_to_owner(const DAGRunId &dag_run_id,
                     std::move(fn));
 }
 
-auto ExecutionService::dispatch_pending_on_shard(shard_id sid) -> void {
-  auto &state = shard_states_[sid];
-  for (const auto &[id, run_state] : state.runs) {
-    if (running_tasks_ >= max_concurrency_)
-      break;
-    if (run_state.run && !run_state.run->is_complete()) {
-      runtime_.spawn_on(sid, dispatch(id));
+auto ExecutionService::schedule_dispatch_on_owner(ShardState &state,
+                                                  const DAGRunId &dag_run_id)
+    -> void {
+  auto it = state.runs.find(dag_run_id);
+  if (it == state.runs.end() || !it->second.run || it->second.run->is_complete()) {
+    return;
+  }
+
+  if (it->second.dispatch_scheduled) {
+    it->second.redispatch_requested = true;
+    return;
+  }
+
+  it->second.dispatch_scheduled = true;
+  runtime_.spawn_on(owner_shard(dag_run_id), dispatch(dag_run_id.clone()));
+}
+
+auto ExecutionService::schedule_dispatch(const DAGRunId &dag_run_id) -> void {
+  post_to_owner(dag_run_id, [this, id = dag_run_id.clone()]() mutable {
+    auto &state = shard_state(id);
+    enqueue_ready_run(state, id);
+    schedule_dispatch_scan(owner_shard(id));
+  });
+}
+
+auto ExecutionService::schedule_dispatch_scan(shard_id sid) -> void {
+  boost::asio::post(runtime_.shard(sid).ctx(), [this, sid]() {
+    auto &state = shard_states_[sid];
+    if (state.dispatch_scan_scheduled) {
+      state.dispatch_scan_requested = true;
+      return;
     }
+    state.dispatch_scan_scheduled = true;
+    dispatch_pending_on_shard(sid);
+  });
+}
+
+auto ExecutionService::enqueue_ready_run(ShardState &state,
+                                         const DAGRunId &dag_run_id) -> void {
+  auto it = state.runs.find(dag_run_id);
+  if (it == state.runs.end() || !it->second.run || it->second.run->is_complete()) {
+    return;
+  }
+  if (it->second.run->ready_count() == 0) {
+    return;
+  }
+  if (it->second.queued_for_dispatch) {
+    return;
+  }
+  it->second.queued_for_dispatch = true;
+  state.ready_run_queue.push_back(dag_run_id.clone());
+  ready_run_queue_sizes_[owner_shard(dag_run_id)].value.fetch_add(
+      1, std::memory_order_relaxed);
+}
+
+auto ExecutionService::finish_dispatch_cycle(shard_id sid,
+                                             const DAGRunId &dag_run_id)
+    -> void {
+  auto &state = shard_states_[sid];
+  auto it = state.runs.find(dag_run_id);
+  if (it == state.runs.end()) {
+    return;
+  }
+
+  if (it->second.redispatch_requested) {
+    it->second.redispatch_requested = false;
+    enqueue_ready_run(state, dag_run_id);
+    schedule_dispatch_scan(sid);
+  }
+
+  it->second.dispatch_scheduled = false;
+  if (it->second.run && !it->second.run->is_complete() &&
+      it->second.run->ready_count() > 0) {
+    enqueue_ready_run(state, dag_run_id);
+    schedule_dispatch_scan(sid);
+  }
+}
+
+auto ExecutionService::dispatch_pending_on_shard(shard_id sid) -> void {
+  dispatch_scan_invocations_.fetch_add(1, std::memory_order_relaxed);
+  auto &state = shard_states_[sid];
+  while (running_tasks_ < max_concurrency_ && !state.ready_run_queue.empty()) {
+    auto dag_run_id = std::move(state.ready_run_queue.front());
+    state.ready_run_queue.pop_front();
+    ready_run_queue_sizes_[sid].value.fetch_sub(1, std::memory_order_relaxed);
+
+    auto it = state.runs.find(dag_run_id);
+    if (it == state.runs.end()) {
+      continue;
+    }
+    it->second.queued_for_dispatch = false;
+    if (!it->second.run || it->second.run->is_complete()) {
+      continue;
+    }
+    schedule_dispatch_on_owner(state, dag_run_id);
+  }
+
+  state.dispatch_scan_scheduled = false;
+  if (state.dispatch_scan_requested) {
+    state.dispatch_scan_requested = false;
+    schedule_dispatch_scan(sid);
   }
 }
 
@@ -65,10 +162,21 @@ auto ExecutionService::dispatch_pending() -> void {
 }
 
 auto ExecutionService::notify_capacity_available() -> void {
-  for (unsigned i = 0; i < runtime_.shard_count(); ++i) {
-    boost::asio::post(runtime_.shard(i).ctx(), [this, i]() {
-      dispatch_pending_on_shard(static_cast<shard_id>(i));
-    });
+  const auto shard_count = runtime_.shard_count();
+  if (shard_count == 0) {
+    return;
+  }
+
+  const auto start =
+      notify_rr_.fetch_add(1, std::memory_order_relaxed) % shard_count;
+  for (unsigned offset = 0; offset < shard_count; ++offset) {
+    const auto sid = static_cast<shard_id>((start + offset) % shard_count);
+    if (ready_run_queue_sizes_[sid].value.load(std::memory_order_relaxed) ==
+        0) {
+      continue;
+    }
+    schedule_dispatch_scan(sid);
+    break;
   }
 }
 
@@ -92,7 +200,20 @@ auto ExecutionService::start_run(const DAGRunId &dag_run_id, RunContext ctx)
                        .task_configs = std::move(ctx.task_configs),
                        .dag_id = std::move(ctx.dag_id),
                        .xcom_cache = {}});
-    runtime_.spawn_on(owner_shard(id), dispatch(id));
+    auto it = state.runs.find(id);
+    if (it == state.runs.end() || !it->second.run || it->second.run->is_complete()) {
+      return;
+    }
+
+    // Fast path for root-task release: avoid queue+scan if we can dispatch now.
+    if (it->second.run->ready_count() > 0 &&
+        running_tasks_.load(std::memory_order_relaxed) < max_concurrency_) {
+      schedule_dispatch_on_owner(state, id);
+      return;
+    }
+
+    enqueue_ready_run(state, id);
+    schedule_dispatch_scan(owner_shard(id));
   });
 }
 
@@ -174,6 +295,23 @@ auto ExecutionService::wait_for_completion_async(int timeout_ms) -> task<void> {
 
 auto ExecutionService::coro_count() const -> int { return coro_count_.load(); }
 
+auto ExecutionService::emit_log_chunk(const DAGRunId &dag_run_id,
+                                      const TaskId &task_id, int attempt,
+                                      std::string_view stream,
+                                      std::string_view msg) -> void {
+  if (callbacks_.on_log) {
+    callbacks_.on_log(dag_run_id, task_id, attempt, stream, msg);
+  }
+}
+
+auto ExecutionService::dispatch_invocations() const -> std::uint64_t {
+  return dispatch_invocations_.load(std::memory_order_relaxed);
+}
+
+auto ExecutionService::dispatch_scan_invocations() const -> std::uint64_t {
+  return dispatch_scan_invocations_.load(std::memory_order_relaxed);
+}
+
 auto ExecutionService::maybe_persist_task(const DAGRunId &dag_run_id,
                                           const TaskInstanceInfo &info)
     -> void {
@@ -198,33 +336,39 @@ auto ExecutionService::dispatch(DAGRunId dag_run_id) -> task<Result<void>> {
 
   // If not on owner shard, schedule a coroutine on the owner and return.
   if (!runtime_.is_current_shard() || runtime_.current_shard() != target) {
-    auto coro = dispatch(dag_run_id.clone());
-    runtime_.spawn_on(target, std::move(coro));
+    schedule_dispatch(dag_run_id);
     co_return ok();
   }
 
   // --- We are on the owner shard; direct access, no locks ---
+  dispatch_invocations_.fetch_add(1, std::memory_order_relaxed);
+  struct DispatchCycleGuard {
+    ExecutionService &service;
+    shard_id sid;
+    DAGRunId dag_run_id;
+    ~DispatchCycleGuard() { service.finish_dispatch_cycle(sid, dag_run_id); }
+  } guard{*this, target, dag_run_id.clone()};
+
   auto &state = shard_states_[target];
 
   struct ReadyCandidate {
     NodeIndex idx{kInvalidNode};
-    TaskId task_id;
-    InstanceId inst_id;
-    ExecutorConfig cfg;
-    std::vector<XComPushConfig> xcom_push;
-    std::vector<XComPullConfig> xcom_pull;
     int attempt{1};
     bool depends_on_past{false};
     std::chrono::system_clock::time_point execution_date;
   };
 
-  std::vector<TaskJob> jobs;
-  std::vector<NodeIndex> depends_on_past_blocked;
-  std::vector<ReadyCandidate> candidates;
-  std::vector<TaskInstanceInfo> blocked_to_persist;
-  std::vector<std::pair<TaskId, TaskState>> blocked_status_updates;
-  bool persist_after_dispatch{false};
-  std::shared_ptr<DAGRun> run_snapshot;
+  std::array<std::byte, 8192> dispatch_storage{};
+  pmr::monotonic_buffer_resource dispatch_resource(
+      dispatch_storage.data(), dispatch_storage.size(),
+      current_memory_resource_or_default());
+
+  pmr::vector<TaskJob> jobs{&dispatch_resource};
+  pmr::vector<NodeIndex> depends_on_past_blocked{&dispatch_resource};
+  pmr::vector<ReadyCandidate> candidates{&dispatch_resource};
+  pmr::vector<TaskInstanceInfo> blocked_to_persist{&dispatch_resource};
+  pmr::vector<std::pair<TaskId, TaskState>> blocked_status_updates{
+      &dispatch_resource};
   std::shared_ptr<DAGRun> completed_snapshot;
   bool completed{false};
 
@@ -242,11 +386,18 @@ auto ExecutionService::dispatch(DAGRunId dag_run_id) -> task<Result<void>> {
     }
 
     auto &run = *run_state.run;
-    const auto &g = run.dag();
-    const auto &task_cfgs = run_state.executor_configs;
-    const auto &task_configs = run_state.task_configs;
+    if (!run_state.executor_configs || !run_state.task_configs) [[unlikely]] {
+      log::error("dispatch: missing configs for run {}", dag_run_id);
+      co_return fail(Error::InvalidState);
+    }
+    const auto &task_cfgs = *run_state.executor_configs;
+    const auto &task_configs = *run_state.task_configs;
 
-    std::pmr::vector<NodeIndex> ready_tasks(current_memory_resource());
+    std::array<std::byte, 2048> ready_storage{};
+    pmr::monotonic_buffer_resource ready_resource(
+        ready_storage.data(), ready_storage.size(),
+        current_memory_resource_or_default());
+    pmr::vector<NodeIndex> ready_tasks(&ready_resource);
     run.copy_ready_tasks(ready_tasks);
     for (NodeIndex idx : ready_tasks) {
       if (static_cast<int>(candidates.size()) + running_tasks_.load() >=
@@ -266,26 +417,13 @@ auto ExecutionService::dispatch(DAGRunId dag_run_id) -> task<Result<void>> {
         depends_on_past = task_configs[idx].depends_on_past;
       }
 
-      std::vector<XComPushConfig> xcom_push;
-      std::vector<XComPullConfig> xcom_pull;
-      if (idx < task_configs.size()) {
-        xcom_push = task_configs[idx].xcom_push;
-        xcom_pull = task_configs[idx].xcom_pull;
-      }
-
       int attempt = 1;
       if (auto info = run.get_task_info(idx)) {
         attempt = info->attempt + 1;
       }
 
-      TaskId task_id{std::string{g.get_key(idx)}};
       candidates.emplace_back(
           ReadyCandidate{.idx = idx,
-                         .task_id = task_id,
-                         .inst_id = generate_instance_id(dag_run_id, task_id),
-                         .cfg = task_cfgs[idx],
-                         .xcom_push = std::move(xcom_push),
-                         .xcom_pull = std::move(xcom_pull),
                          .attempt = attempt,
                          .depends_on_past = depends_on_past,
                          .execution_date = run.execution_date()});
@@ -338,8 +476,14 @@ auto ExecutionService::dispatch(DAGRunId dag_run_id) -> task<Result<void>> {
     if (it == state.runs.end()) [[unlikely]] {
       co_return ok();
     }
+    auto &run_state = it->second;
     auto &run = *it->second.run;
-    std::unordered_set<NodeIndex> blocked_set;
+    if (!run_state.executor_configs || !run_state.task_configs) [[unlikely]] {
+      co_return fail(Error::InvalidState);
+    }
+    const auto &task_cfgs = *run_state.executor_configs;
+    const auto &task_configs = *run_state.task_configs;
+    pmr::unordered_set<NodeIndex> blocked_set(&dispatch_resource);
     blocked_set.reserve(depends_on_past_blocked.size());
     for (const auto idx : depends_on_past_blocked) {
       blocked_set.insert(idx);
@@ -358,18 +502,34 @@ auto ExecutionService::dispatch(DAGRunId dag_run_id) -> task<Result<void>> {
         continue;
       }
 
-      if (auto r = run.mark_task_started(candidate.idx, candidate.inst_id);
+      TaskId task_id{std::string{run.dag().get_key(candidate.idx)}};
+      auto inst_id = generate_instance_id(dag_run_id, task_id);
+      if (auto r = run.mark_task_started(candidate.idx, inst_id);
           !r) {
         log::error("dispatch: failed to mark task {} started: {}",
                    candidate.idx, r.error().message());
-        co_return fail(r.error());
+        co_return r;
+      }
+
+      std::vector<XComPushConfig> xcom_push;
+      std::vector<XComPullConfig> xcom_pull;
+      if (candidate.idx < task_configs.size()) {
+        xcom_push = task_configs[candidate.idx].xcom_push;
+        for (auto &push : xcom_push) {
+          if (auto compiled = push.compile_regex(); !compiled) {
+            log::error("dispatch: invalid xcom regex for task {}: {}",
+                       task_configs[candidate.idx].task_id,
+                       compiled.error().message());
+            co_return fail(compiled.error());
+          }
+        }
+        xcom_pull = task_configs[candidate.idx].xcom_pull;
       }
 
       jobs.emplace_back(
-          TaskJob{candidate.idx, std::move(candidate.task_id),
-                  std::move(candidate.inst_id), std::move(candidate.cfg),
-                  std::move(candidate.xcom_push),
-                  std::move(candidate.xcom_pull), candidate.attempt});
+          TaskJob{candidate.idx, std::move(task_id), std::move(inst_id),
+                  task_cfgs[candidate.idx], std::move(xcom_push),
+                  std::move(xcom_pull), candidate.attempt});
       running_tasks_++;
       const auto &scheduled = jobs.back();
       log::debug("dispatch: scheduled task {} (idx={}, attempt={})",
@@ -380,32 +540,30 @@ auto ExecutionService::dispatch(DAGRunId dag_run_id) -> task<Result<void>> {
       if (!run.is_task_ready(idx)) {
         continue;
       }
-      auto candidate_it = std::ranges::find_if(
-          candidates, [idx](const ReadyCandidate &c) { return c.idx == idx; });
-      if (candidate_it == candidates.end()) {
-        log::error("dispatch: blocked task {} missing candidate metadata", idx);
+      if (idx >= task_cfgs.size()) [[unlikely]] {
+        log::error("dispatch: blocked task {} missing executor config", idx);
         continue;
       }
 
-      if (auto r = run.mark_task_started(idx, candidate_it->inst_id); !r) {
+      TaskId task_id{std::string{run.dag().get_key(idx)}};
+      auto inst_id = generate_instance_id(dag_run_id, task_id);
+      if (auto r = run.mark_task_started(idx, inst_id); !r) {
         log::error("dispatch: failed to mark blocked task {} started: {}", idx,
                    r.error().message());
-        co_return fail(r.error());
+        co_return r;
       }
       if (auto r = run.mark_task_failed(idx, "depends_on_past blocked", 0,
                                         kExitCodeImmediateFail);
           !r) {
         log::error("dispatch: failed to fail blocked task {}: {}", idx,
                    r.error().message());
-        co_return fail(r.error());
+        co_return r;
       }
     }
 
-    persist_after_dispatch = !jobs.empty();
-
     if (!depends_on_past_blocked.empty()) {
       const auto all_infos = run.all_task_info();
-      std::unordered_set<NodeIndex> seen;
+      pmr::unordered_set<NodeIndex> seen(&dispatch_resource);
       seen.reserve(all_infos.size());
       for (const auto &info : all_infos) {
         if (info.state != TaskState::Failed &&
@@ -420,20 +578,11 @@ auto ExecutionService::dispatch(DAGRunId dag_run_id) -> task<Result<void>> {
         blocked_status_updates.emplace_back(
             TaskId{std::string(run.dag().get_key(info.task_idx))}, info.state);
       }
-      persist_after_dispatch = true;
-
       if (run.is_complete()) {
-        if (persist_after_dispatch && !run_snapshot) {
-          run_snapshot = std::make_shared<DAGRun>(run);
-        }
         completed_snapshot = std::make_shared<DAGRun>(run);
         state.runs.erase(it);
         completed = true;
       }
-    }
-
-    if (persist_after_dispatch && !completed) {
-      run_snapshot = std::make_shared<DAGRun>(run);
     }
   }
 
@@ -441,11 +590,6 @@ auto ExecutionService::dispatch(DAGRunId dag_run_id) -> task<Result<void>> {
   if (!blocked_status_updates.empty() && callbacks_.on_task_status) {
     for (const auto &[task_id, task_state] : blocked_status_updates) {
       callbacks_.on_task_status(dag_run_id, task_id, task_state);
-    }
-  }
-  if (persist_after_dispatch && callbacks_.on_persist_run) {
-    if (run_snapshot) {
-      callbacks_.on_persist_run(run_snapshot);
     }
   }
   if (completed_snapshot) {
@@ -466,11 +610,6 @@ auto ExecutionService::dispatch(DAGRunId dag_run_id) -> task<Result<void>> {
     runtime_.spawn_on(target, std::move(coro));
   }
 
-  if (!depends_on_past_blocked.empty()) {
-    auto redispatch = dispatch_after_yield(dag_run_id.clone());
-    runtime_.spawn_on(target, std::move(redispatch));
-  }
-
   co_return ok();
 }
 
@@ -483,29 +622,94 @@ struct ExecutionVisitor {
   const DAGRunId &dag_run_id;
   ExecutionService::TaskJob &job;
   DAGId dag_id; // pre-fetched by run_task via co_await get_dag_id_by_run
-  shard_id resume_shard;
+  pmr::memory_resource *task_resource;
 
-  auto operator()(ShellExecutorConfig &cfg) const -> task<ExecutorResult> {
-    apply_templates(cfg.command);
-    apply_xcom_pull(cfg.env);
-    co_return co_await execute_async(service.runtime(), service.executor(),
-                                     job.inst_id, job.cfg, resume_shard);
-  }
-
-  auto operator()(DockerExecutorConfig &cfg) const -> task<ExecutorResult> {
-    apply_templates(cfg.command);
-    apply_xcom_pull(cfg.env);
-    co_return co_await execute_async(service.runtime(), service.executor(),
-                                     job.inst_id, job.cfg, resume_shard);
-  }
-
-  auto operator()(SensorExecutorConfig &cfg) const -> task<ExecutorResult> {
-    apply_templates(cfg.target);
-    co_return co_await execute_async(service.runtime(), service.executor(),
-                                     job.inst_id, job.cfg, resume_shard);
+  auto operator()() const -> task<ExecutorResult> {
+    switch (job.cfg.type()) {
+    case ExecutorType::Shell:
+      co_return co_await execute_shell();
+    case ExecutorType::Docker:
+      co_return co_await execute_docker();
+    case ExecutorType::Sensor:
+      co_return co_await execute_sensor();
+    case ExecutorType::Noop:
+      co_return co_await execute_noop();
+    }
+    ExecutorResult result = make_executor_result(task_resource);
+    result.exit_code = 1;
+    result.error = pmr::string("Unknown executor type", task_resource);
+    co_return result;
   }
 
 private:
+  auto execute_shell() const -> task<ExecutorResult> {
+    auto *cfg = job.cfg.as<ShellExecutorConfig>();
+    if (cfg == nullptr) {
+      co_return invalid_config("shell");
+    }
+    apply_templates(cfg->command);
+    apply_xcom_pull(cfg->env);
+    co_return co_await execute_async(service.runtime(), service.executor(),
+                                     job.inst_id, job.cfg,
+                                     make_task_memory_resource(),
+                                     [this](std::string_view chunk) {
+                                       service.emit_log_chunk(
+                                           dag_run_id, job.task_id,
+                                           job.attempt, "stdout", chunk);
+                                     },
+                                     [this](std::string_view chunk) {
+                                       service.emit_log_chunk(
+                                           dag_run_id, job.task_id,
+                                           job.attempt, "stderr", chunk);
+                                     });
+  }
+
+  auto execute_docker() const -> task<ExecutorResult> {
+    auto *cfg = job.cfg.as<DockerExecutorConfig>();
+    if (cfg == nullptr) {
+      co_return invalid_config("docker");
+    }
+    apply_templates(cfg->command);
+    apply_xcom_pull(cfg->env);
+    co_return co_await execute_async(service.runtime(), service.executor(),
+                                     job.inst_id, job.cfg,
+                                     make_task_memory_resource());
+  }
+
+  auto execute_sensor() const -> task<ExecutorResult> {
+    auto *cfg = job.cfg.as<SensorExecutorConfig>();
+    if (cfg == nullptr) {
+      co_return invalid_config("sensor");
+    }
+    apply_templates(cfg->target);
+    co_return co_await execute_async(service.runtime(), service.executor(),
+                                     job.inst_id, job.cfg,
+                                     make_task_memory_resource());
+  }
+
+  auto execute_noop() const -> task<ExecutorResult> {
+    co_return co_await execute_async(service.runtime(), service.executor(),
+                                     job.inst_id, job.cfg,
+                                     make_task_memory_resource());
+  }
+
+  [[nodiscard]] auto make_task_memory_resource() const
+      -> std::shared_ptr<pmr::memory_resource> {
+    return std::make_shared<pmr::monotonic_buffer_resource>(
+        task_resource != nullptr ? task_resource
+                                 : current_memory_resource_or_default());
+  }
+
+  [[nodiscard]] auto invalid_config(std::string_view executor_name) const
+      -> ExecutorResult {
+    ExecutorResult result = make_executor_result(task_resource);
+    result.exit_code = 1;
+    result.error = pmr::string(
+        std::format("Invalid configuration for {} executor", executor_name),
+        task_resource);
+    return result;
+  }
+
   [[nodiscard]] auto make_template_ctx() const -> TemplateContext {
     auto *run = service.get_run(dag_run_id);
     return TemplateContext{
@@ -522,26 +726,28 @@ private:
   }
 
   void apply_templates(std::string &target) const {
+    ScopedMemoryResourceOverride scoped_resource(task_resource);
     auto ctx = make_template_ctx();
     auto result = service.template_resolver().resolve_template(target, ctx,
                                                                job.xcom_pull);
-    if (result) {
-      target = std::move(*result);
-    } else {
-      log::error("template resolution failed: {}", result.error().message());
+    if (!result) {
+      log_result_error(result, "template resolution failed");
+      return;
     }
+    target = std::move(*result);
   }
 
   void apply_xcom_pull(std::flat_map<std::string, std::string> &env) const {
     if (job.xcom_pull.empty())
       return;
 
+    ScopedMemoryResourceOverride scoped_resource(task_resource);
     auto ctx = make_template_ctx();
     auto resolved_env =
         service.template_resolver().resolve_env_vars(ctx, job.xcom_pull);
     if (!resolved_env) {
-      log::error("xcom_pull resolution failed for task {}: {}",
-                 job.task_id.value(), resolved_env.error().message());
+      log_result_error(resolved_env, "xcom_pull resolution failed for task {}",
+                       job.task_id.value());
       return;
     }
 
@@ -619,7 +825,8 @@ auto ExecutionService::run_task(DAGRunId dag_run_id, TaskJob job)
     // Fast path: owner-shard local XCom cache (same-run produced values).
     auto &state = shard_state(dag_run_id);
     if (auto run_it = state.runs.find(dag_run_id); run_it != state.runs.end()) {
-      std::vector<std::pair<std::string, std::string>> cache_hits;
+      pmr::vector<std::pair<std::string, std::string>> cache_hits{
+          current_memory_resource_or_default()};
       cache_hits.reserve(job.xcom_pull.size());
       for (const auto &[task_id_str, keys] : missing_keys_by_task) {
         for (const auto &key : keys) {
@@ -666,7 +873,8 @@ auto ExecutionService::run_task(DAGRunId dag_run_id, TaskJob job)
 
     // Fallback path: fetch task-level sets.
     if (!missing_keys_by_task.empty() && callbacks_.get_task_xcoms) {
-      std::vector<std::string> source_tasks;
+      pmr::vector<std::string> source_tasks{
+          current_memory_resource_or_default()};
       source_tasks.reserve(missing_keys_by_task.size());
       for (const auto &[task_id_str, _] : missing_keys_by_task) {
         source_tasks.emplace_back(task_id_str);
@@ -717,15 +925,15 @@ auto ExecutionService::run_task(DAGRunId dag_run_id, TaskJob job)
   }
 
   const auto target = owner_shard(dag_run_id);
-  auto result =
-      co_await std::visit(ExecutionVisitor{.service = *this,
-                                           .dag_run_id = dag_run_id,
-                                           .job = job,
-                                           .dag_id = std::move(dag_id),
-                                           .resume_shard = target},
-                          job.cfg);
-  // After co_await, we are guaranteed to be on owner shard (target)
-  // because execute_async uses schedule_on(target) to resume.
+  auto task_resource = std::make_shared<pmr::monotonic_buffer_resource>(
+      current_memory_resource_or_default());
+  auto result = co_await ExecutionVisitor{.service = *this,
+                                          .dag_run_id = dag_run_id,
+                                          .job = job,
+                                          .dag_id = std::move(dag_id),
+                                          .task_resource = task_resource.get()}();
+  // Execution is started from the run owner shard and executors no longer
+  // perform their own routing, so state remains local to this shard.
 
   running_tasks_--;
   log::info("run_task: completed dag_run_id={} task={} inst_id={} exit_code={} "
@@ -733,13 +941,13 @@ auto ExecutionService::run_task(DAGRunId dag_run_id, TaskJob job)
             dag_run_id, job.task_id, job.inst_id, result.exit_code,
             result.error);
 
-  if (!result.stdout_output.empty()) {
+  if (!result.stdout_output.empty() && !result.stdout_streamed) {
     if (callbacks_.on_log) {
       callbacks_.on_log(dag_run_id, job.task_id, job.attempt, "stdout",
                         result.stdout_output);
     }
   }
-  if (!result.stderr_output.empty()) {
+  if (!result.stderr_output.empty() && !result.stderr_streamed) {
     if (callbacks_.on_log) {
       callbacks_.on_log(dag_run_id, job.task_id, job.attempt, "stderr",
                         result.stderr_output);
@@ -824,7 +1032,8 @@ auto ExecutionService::run_task(DAGRunId dag_run_id, TaskJob job)
                         error_msg);
     }
     auto retry_result =
-        on_task_failure(dag_run_id, job.idx, result.error, result.exit_code)
+        on_task_failure(dag_run_id, job.idx, result.error, result.exit_code,
+                        result.timed_out)
             .or_else([](std::error_code ec) {
               log::error("run_task: on_task_failure failed: {}", ec.message());
               return ok(false);
@@ -871,22 +1080,71 @@ auto ExecutionService::dispatch_after_delay(DAGRunId dag_run_id,
     co_return;
   }
 
-  auto coro = dispatch(dag_run_id.clone());
-  runtime_.spawn_on(target, std::move(coro));
+  enqueue_ready_run(state, dag_run_id);
+  schedule_dispatch_scan(target);
 }
 
 auto ExecutionService::dispatch_after_yield(DAGRunId dag_run_id) -> spawn_task {
-  co_await async_yield();
+  auto executor = co_await boost::asio::this_coro::executor;
+  co_await boost::asio::post(executor, boost::asio::use_awaitable);
   auto coro = dispatch(dag_run_id.clone());
   runtime_.spawn_on(owner_shard(dag_run_id), std::move(coro));
 }
 
+auto ExecutionService::record_task_snapshot(const DAGRun &run, NodeIndex idx,
+                                            TransitionEffects &effects) const
+    -> void {
+  if (auto info = run.get_task_info(idx); info) {
+    effects.persisted_task_info = *info;
+  }
+}
+
+auto ExecutionService::collect_propagated_terminal_updates(
+    const DAGRun &run, TransitionEffects &effects) const -> void {
+  for (const auto &info : run.all_task_info()) {
+    if (info.state == TaskState::Skipped ||
+        info.state == TaskState::UpstreamFailed) {
+      effects.persisted_infos.emplace_back(info);
+      effects.status_updates.emplace_back(
+          TaskId{std::string(run.dag().get_key(info.task_idx))}, info.state);
+    }
+  }
+}
+
+auto ExecutionService::collect_failure_updates(const DAGRun &run,
+                                               TransitionEffects &effects) const
+    -> void {
+  for (const auto &info : run.all_task_info()) {
+    if (info.state == TaskState::Failed ||
+        info.state == TaskState::Retrying ||
+        info.state == TaskState::UpstreamFailed ||
+        info.state == TaskState::Skipped ||
+        info.state == TaskState::Pending) {
+      effects.persisted_infos.emplace_back(info);
+      if (info.state == TaskState::Retrying ||
+          info.state == TaskState::UpstreamFailed ||
+          info.state == TaskState::Skipped) {
+        effects.status_updates.emplace_back(
+            TaskId{std::string(run.dag().get_key(info.task_idx))}, info.state);
+      }
+    }
+  }
+}
+
+auto ExecutionService::complete_transition_if_needed(ShardState &state,
+                                                     RunMap::iterator it,
+                                                     TransitionEffects &effects)
+    -> void {
+  if (!it->second.run->is_complete()) {
+    return;
+  }
+  effects.completed_snapshot = std::make_shared<DAGRun>(*it->second.run);
+  state.runs.erase(it);
+}
+
 auto ExecutionService::on_task_success(const DAGRunId &dag_run_id,
                                        NodeIndex idx) -> task<Result<void>> {
-  std::optional<TaskInstanceInfo> persisted_task_info;
-  std::vector<TaskInstanceInfo> propagated_terminal_infos;
-  std::vector<std::pair<TaskId, TaskState>> propagated_status_updates;
-  std::shared_ptr<DAGRun> completed_snapshot;
+  TransitionEffects effects;
   auto &state = shard_state(dag_run_id);
   log::info("on_task_success: dag_run_id={} idx={}", dag_run_id, idx);
 
@@ -902,10 +1160,12 @@ auto ExecutionService::on_task_success(const DAGRunId &dag_run_id,
     task_id_for_branch = TaskId{std::string(run.dag().get_key(idx))};
 
     {
-      const auto &task_cfgs = it->second.task_configs;
-      if (idx < task_cfgs.size()) {
-        is_branch = task_cfgs[idx].is_branch;
-        branch_key = task_cfgs[idx].branch_xcom_key;
+      if (it->second.task_configs) {
+        const auto &task_cfgs = *it->second.task_configs;
+        if (idx < task_cfgs.size()) {
+          is_branch = task_cfgs[idx].is_branch;
+          branch_key = task_cfgs[idx].branch_xcom_key;
+        }
       }
     }
   }
@@ -955,54 +1215,36 @@ auto ExecutionService::on_task_success(const DAGRunId &dag_run_id,
           !r) {
         log::error("on_task_success: failed to mark branch task {}: {}", idx,
                    r.error().message());
-        co_return fail(r.error());
+        co_return r;
       }
     } else {
       if (auto r = run.mark_task_completed(idx, 0); !r) {
         log::error("on_task_success: failed to mark task {}: {}", idx,
                    r.error().message());
-        co_return fail(r.error());
+        co_return r;
       }
     }
 
-    if (auto info = run.get_task_info(idx); info) {
-      persisted_task_info = *info;
-    }
-
-    for (const auto &info : run.all_task_info()) {
-      if (info.state == TaskState::Skipped ||
-          info.state == TaskState::UpstreamFailed) {
-        propagated_terminal_infos.emplace_back(info);
-        propagated_status_updates.emplace_back(
-            TaskId{std::string(run.dag().get_key(info.task_idx))}, info.state);
-      }
-    }
-
-    if (run.is_complete()) {
-      completed_snapshot = std::make_shared<DAGRun>(run);
-      state.runs.erase(it);
-    }
+    record_task_snapshot(run, idx, effects);
+    collect_propagated_terminal_updates(run, effects);
+    complete_transition_if_needed(state, it, effects);
   }
 
-  finalize_task_transition(dag_run_id, std::move(persisted_task_info),
-                           std::move(propagated_terminal_infos),
-                           std::move(propagated_status_updates),
-                           std::move(completed_snapshot));
+  finalize_task_transition(dag_run_id, std::move(effects));
 
   co_return ok();
 }
 
 auto ExecutionService::on_task_failure(const DAGRunId &dag_run_id,
                                        NodeIndex idx, std::string_view error,
-                                       int exit_code) -> Result<bool> {
+                                       int exit_code, bool timed_out)
+    -> Result<bool> {
 
   log::info("on_task_failure: dag_run_id={} idx={} err='{}'", dag_run_id, idx,
             error);
 
   bool needs_retry = false;
-  std::vector<TaskInstanceInfo> persisted_infos;
-  std::vector<std::pair<TaskId, TaskState>> status_updates;
-  std::shared_ptr<DAGRun> completed_snapshot;
+  TransitionEffects effects;
   auto &state = shard_state(dag_run_id);
 
   {
@@ -1016,16 +1258,27 @@ auto ExecutionService::on_task_failure(const DAGRunId &dag_run_id,
     if (callbacks_.get_max_retries) {
       max_retries = callbacks_.get_max_retries(dag_run_id, idx);
     }
-    if (idx < it->second.task_configs.size()) {
-      const auto &task_cfg = it->second.task_configs[idx];
-      // Sensor tasks already perform internal polling until timeout.
-      // Applying default DAG-level retries multiplies wait time and looks
-      // like a stall in UI. Keep explicit user overrides, but disable retries
-      // for sensors when still using project default.
-      if (task_cfg.executor == ExecutorType::Sensor &&
-          max_retries == task_defaults::kMaxRetries) {
-        max_retries = 0;
+    if (it->second.task_configs) {
+      const auto &task_cfgs = *it->second.task_configs;
+      if (idx < task_cfgs.size()) {
+        const auto &task_cfg = task_cfgs[idx];
+        // Sensor tasks already perform internal polling until timeout.
+        // Applying default DAG-level retries multiplies wait time and looks
+        // like a stall in UI. Keep explicit user overrides, but disable retries
+        // for sensors when still using project default.
+        if (task_cfg.executor == ExecutorType::Sensor &&
+            max_retries == task_defaults::kMaxRetries) {
+          max_retries = 0;
+        }
+        if (task_cfg.executor == ExecutorType::Shell &&
+            (exit_code == 126 || exit_code == 127)) {
+          max_retries = 0;
+        }
       }
+    }
+
+    if (timed_out) {
+      max_retries = 0;
     }
 
     run.mark_task_failed(idx, std::string(error), max_retries, exit_code)
@@ -1039,32 +1292,16 @@ auto ExecutionService::on_task_failure(const DAGRunId &dag_run_id,
       needs_retry = (info->state == TaskState::Retrying);
     }
 
-    for (const auto &info : run.all_task_info()) {
-      if (info.state == TaskState::Failed ||
-          info.state == TaskState::UpstreamFailed ||
-          info.state == TaskState::Skipped ||
-          info.state == TaskState::Pending) {
-        persisted_infos.emplace_back(info);
-        if (info.state == TaskState::UpstreamFailed ||
-            info.state == TaskState::Skipped) {
-          status_updates.emplace_back(
-              TaskId{std::string(run.dag().get_key(info.task_idx))},
-              info.state);
-        }
-      }
-    }
+    collect_failure_updates(run, effects);
+    complete_transition_if_needed(state, it, effects);
 
-    if (run.is_complete()) {
-      completed_snapshot = std::make_shared<DAGRun>(run);
-      state.runs.erase(it);
+    if (effects.completed_snapshot) {
       needs_retry = false;
     }
   }
 
-  const bool run_complete = static_cast<bool>(completed_snapshot);
-  finalize_task_transition(dag_run_id, std::nullopt, std::move(persisted_infos),
-                           std::move(status_updates),
-                           std::move(completed_snapshot));
+  const bool run_complete = static_cast<bool>(effects.completed_snapshot);
+  finalize_task_transition(dag_run_id, std::move(effects));
   return ok(run_complete ? false : needs_retry);
 }
 
@@ -1086,10 +1323,7 @@ auto ExecutionService::on_task_skipped(const DAGRunId &dag_run_id,
                                        NodeIndex idx) -> Result<void> {
   log::info("on_task_skipped: dag_run_id={} idx={}", dag_run_id, idx);
 
-  std::optional<TaskInstanceInfo> persisted_task_info;
-  std::vector<TaskInstanceInfo> propagated_terminal_infos;
-  std::vector<std::pair<TaskId, TaskState>> status_updates;
-  std::shared_ptr<DAGRun> completed_snapshot;
+  TransitionEffects effects;
   auto &state = shard_state(dag_run_id);
 
   {
@@ -1104,29 +1338,12 @@ auto ExecutionService::on_task_skipped(const DAGRunId &dag_run_id,
       return ok();
     });
 
-    if (auto info = run.get_task_info(idx); info) {
-      persisted_task_info = *info;
-    }
-
-    for (const auto &info : run.all_task_info()) {
-      if (info.state == TaskState::Skipped ||
-          info.state == TaskState::UpstreamFailed) {
-        propagated_terminal_infos.emplace_back(info);
-        status_updates.emplace_back(
-            TaskId{std::string(run.dag().get_key(info.task_idx))}, info.state);
-      }
-    }
-
-    if (run.is_complete()) {
-      completed_snapshot = std::make_shared<DAGRun>(run);
-      state.runs.erase(it);
-    }
+    record_task_snapshot(run, idx, effects);
+    collect_propagated_terminal_updates(run, effects);
+    complete_transition_if_needed(state, it, effects);
   }
 
-  finalize_task_transition(dag_run_id, std::move(persisted_task_info),
-                           std::move(propagated_terminal_infos),
-                           std::move(status_updates),
-                           std::move(completed_snapshot));
+  finalize_task_transition(dag_run_id, std::move(effects));
 
   return ok();
 }
@@ -1139,10 +1356,7 @@ auto ExecutionService::on_task_fail_immediately(const DAGRunId &dag_run_id,
   log::info("on_task_fail_immediately: dag_run_id={} idx={} err='{}'",
             dag_run_id, idx, error);
 
-  std::optional<TaskInstanceInfo> persisted_task_info;
-  std::vector<TaskInstanceInfo> propagated_terminal_infos;
-  std::vector<std::pair<TaskId, TaskState>> status_updates;
-  std::shared_ptr<DAGRun> completed_snapshot;
+  TransitionEffects effects;
   auto &state = shard_state(dag_run_id);
 
   {
@@ -1158,59 +1372,41 @@ auto ExecutionService::on_task_fail_immediately(const DAGRunId &dag_run_id,
           return ok();
         });
 
-    if (auto info = run.get_task_info(idx); info) {
-      persisted_task_info = *info;
-    }
-
-    for (const auto &info : run.all_task_info()) {
-      if (info.state == TaskState::UpstreamFailed ||
-          info.state == TaskState::Skipped) {
-        propagated_terminal_infos.emplace_back(info);
-        status_updates.emplace_back(
-            TaskId{std::string(run.dag().get_key(info.task_idx))}, info.state);
-      }
-    }
-
-    if (run.is_complete()) {
-      completed_snapshot = std::make_shared<DAGRun>(run);
-      state.runs.erase(it);
-    }
+    record_task_snapshot(run, idx, effects);
+    collect_propagated_terminal_updates(run, effects);
+    complete_transition_if_needed(state, it, effects);
   }
 
-  finalize_task_transition(dag_run_id, std::move(persisted_task_info),
-                           std::move(propagated_terminal_infos),
-                           std::move(status_updates),
-                           std::move(completed_snapshot));
+  finalize_task_transition(dag_run_id, std::move(effects));
 
   return ok();
 }
 
 auto ExecutionService::finalize_task_transition(
-    const DAGRunId &dag_run_id, std::optional<TaskInstanceInfo> persisted_info,
-    std::vector<TaskInstanceInfo> persisted_infos,
-    std::vector<std::pair<TaskId, TaskState>> status_updates,
-    std::shared_ptr<DAGRun> completed_snapshot) -> void {
-  if (persisted_info) {
-    maybe_persist_task(dag_run_id, *persisted_info);
+    const DAGRunId &dag_run_id, TransitionEffects effects) -> void {
+  if (effects.persisted_task_info) {
+    maybe_persist_task(dag_run_id, *effects.persisted_task_info);
   }
-  if (!persisted_infos.empty()) {
-    maybe_persist_tasks(dag_run_id, persisted_infos);
+  if (!effects.persisted_infos.empty()) {
+    maybe_persist_tasks(dag_run_id, effects.persisted_infos);
   }
-  if (!status_updates.empty() && callbacks_.on_task_status) {
-    for (const auto &[task_id, task_state] : status_updates) {
+  if (!effects.status_updates.empty() && callbacks_.on_task_status) {
+    for (const auto &[task_id, task_state] : effects.status_updates) {
       if (!task_id.value().empty()) {
         callbacks_.on_task_status(dag_run_id, task_id, task_state);
       }
     }
   }
-  if (completed_snapshot) {
-    on_run_complete(*completed_snapshot, dag_run_id)
+  if (effects.completed_snapshot) {
+    on_run_complete(*effects.completed_snapshot, dag_run_id)
         .or_else([](std::error_code ec) {
           log::error("finalize_task_transition: on_run_complete failed: {}",
                      ec.message());
           return ok();
         });
     --active_run_count_;
+  } else {
+    schedule_dispatch(dag_run_id);
   }
   notify_capacity_available();
 }

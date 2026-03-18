@@ -11,10 +11,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
+#include <mutex>
 #include <memory>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 namespace dagforge {
 
@@ -31,6 +34,9 @@ public:
   using RunExistsCallback =
       std::move_only_function<boost::asio::awaitable<Result<bool>>(
           const DAGId &, TimePoint)>;
+  using ListRunExecutionDatesCallback =
+      std::move_only_function<boost::asio::awaitable<Result<std::vector<TimePoint>>>(
+          const DAGId &, TimePoint, TimePoint)>;
   using GetWatermarkCallback = std::move_only_function<
       boost::asio::awaitable<Result<std::optional<TimePoint>>>(const DAGId &)>;
   using SaveWatermarkCallback =
@@ -46,7 +52,6 @@ public:
 
   auto start() -> void;
   auto stop() -> void;
-  auto run_loop() -> void;
   [[nodiscard]] auto is_running() const noexcept -> bool {
     return running_.load();
   }
@@ -56,6 +61,8 @@ public:
 
   auto set_on_dag_trigger(DAGTriggerCallback cb) -> void;
   auto set_run_exists_callback(RunExistsCallback cb) -> void;
+  auto set_list_run_execution_dates_callback(ListRunExecutionDatesCallback cb)
+      -> void;
   auto set_get_watermark_callback(GetWatermarkCallback cb) -> void;
   auto set_save_watermark_callback(SaveWatermarkCallback cb) -> void;
 
@@ -71,6 +78,8 @@ private:
 
   alignas(64) std::atomic<bool> running_{false};
   alignas(64) std::atomic<bool> stopped_{true};
+  mutable std::mutex stop_mutex_;
+  std::condition_variable stop_cv_;
   boost::asio::io_context &io_;
   std::optional<
       boost::asio::executor_work_guard<boost::asio::io_context::executor_type>>
@@ -86,6 +95,7 @@ private:
 
   DAGTriggerCallback on_dag_trigger_;
   RunExistsCallback run_exists_;
+  ListRunExecutionDatesCallback list_run_execution_dates_;
   GetWatermarkCallback get_watermark_;
   SaveWatermarkCallback save_watermark_;
 };

@@ -398,11 +398,13 @@ auto WebSocketConnection::handle_frames(
     try {
       on_message(opcode, payload);
     } catch (const std::exception &e) {
-      log::warn("WebSocket on_message threw exception: {}", e.what());
+      log::error("WebSocket on_message threw exception fd={}: {}", impl->fd_num,
+                 e.what());
       impl->closed.store(true, std::memory_order_release);
       break;
     } catch (...) {
-      log::warn("WebSocket on_message threw non-standard exception");
+      log::error("WebSocket on_message threw non-standard exception fd={}",
+                 impl->fd_num);
       impl->closed.store(true, std::memory_order_release);
       break;
     }
@@ -600,11 +602,13 @@ auto TlsWebSocketConnection::handle_frames(
     try {
       on_message(opcode, payload);
     } catch (const std::exception &e) {
-      log::warn("TLS WebSocket on_message threw exception: {}", e.what());
+      log::error("TLS WebSocket on_message threw exception fd={}: {}",
+                 impl->fd_num, e.what());
       impl->closed.store(true, std::memory_order_release);
       break;
     } catch (...) {
-      log::warn("TLS WebSocket on_message threw non-standard exception");
+      log::error("TLS WebSocket on_message threw non-standard exception fd={}",
+                 impl->fd_num);
       impl->closed.store(true, std::memory_order_release);
       break;
     }

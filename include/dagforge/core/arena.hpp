@@ -1,9 +1,11 @@
 #pragma once
 
+#include "dagforge/core/memory.hpp"
+
 #include <array>
 #include <cstddef>
-#include <memory_resource>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -16,33 +18,33 @@ public:
   Arena(const Arena &) = delete;
   Arena &operator=(const Arena &) = delete;
 
-  template <typename T> [[nodiscard]] auto vector() -> std::pmr::vector<T> {
-    return std::pmr::vector<T>(&resource_);
+  template <typename T> [[nodiscard]] auto vector() -> pmr::vector<T> {
+    return pmr::vector<T>(&resource_);
   }
 
   template <typename T>
-  [[nodiscard]] auto vector(std::size_t reserve_size) -> std::pmr::vector<T> {
-    std::pmr::vector<T> v(&resource_);
+  [[nodiscard]] auto vector(std::size_t reserve_size) -> pmr::vector<T> {
+    pmr::vector<T> v(&resource_);
     v.reserve(reserve_size);
     return v;
   }
 
-  [[nodiscard]] auto string() -> std::pmr::string {
-    return std::pmr::string(&resource_);
+  [[nodiscard]] auto string() -> pmr::string {
+    return pmr::string(&resource_);
   }
 
-  [[nodiscard]] auto string(std::string_view s) -> std::pmr::string {
-    return std::pmr::string(s, &resource_);
+  [[nodiscard]] auto string(std::string_view s) -> pmr::string {
+    return pmr::string(s, &resource_);
   }
 
   template <typename K, typename V, typename Hash = std::hash<K>,
             typename Eq = std::equal_to<K>>
   [[nodiscard]] auto unordered_map()
-      -> std::pmr::unordered_map<K, V, Hash, Eq> {
-    return std::pmr::unordered_map<K, V, Hash, Eq>(&resource_);
+      -> pmr::unordered_map<K, V, Hash, Eq> {
+    return pmr::unordered_map<K, V, Hash, Eq>(&resource_);
   }
 
-  [[nodiscard]] auto resource() -> std::pmr::memory_resource * {
+  [[nodiscard]] auto resource() -> pmr::memory_resource * {
     return &resource_;
   }
 
@@ -50,16 +52,16 @@ public:
 
 private:
   std::array<std::byte, N> buffer_;
-  std::pmr::monotonic_buffer_resource resource_;
+  pmr::monotonic_buffer_resource resource_;
 };
 
 template <typename T>
-[[nodiscard]] auto to_std(std::pmr::vector<T> &&pmr_vec) -> std::vector<T> {
+[[nodiscard]] auto to_std(pmr::vector<T> &&pmr_vec) -> std::vector<T> {
   return std::vector<T>(std::make_move_iterator(pmr_vec.begin()),
                         std::make_move_iterator(pmr_vec.end()));
 }
 
-[[nodiscard]] inline auto to_std(std::pmr::string &&pmr_str) -> std::string {
+[[nodiscard]] inline auto to_std(pmr::string &&pmr_str) -> std::string {
   return std::string(pmr_str);
 }
 

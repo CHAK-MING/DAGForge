@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <unordered_map>
 
 namespace dagforge {
@@ -17,6 +18,7 @@ class DAGManager;
 using DAGTriggerCallback = std::move_only_function<void(
     const DAGId &, std::chrono::system_clock::time_point)>;
 using RunExistsCallback = Engine::RunExistsCallback;
+using ListRunExecutionDatesCallback = Engine::ListRunExecutionDatesCallback;
 using GetWatermarkCallback = Engine::GetWatermarkCallback;
 using SaveWatermarkCallback = Engine::SaveWatermarkCallback;
 using ZombieReaperCallback =
@@ -24,7 +26,7 @@ using ZombieReaperCallback =
 
 class SchedulerService {
 public:
-  explicit SchedulerService(Runtime &runtime);
+  explicit SchedulerService(Runtime &runtime, unsigned scheduler_shards = 0);
   ~SchedulerService() = default;
 
   SchedulerService(const SchedulerService &) = delete;
@@ -32,6 +34,8 @@ public:
 
   auto set_on_dag_trigger(DAGTriggerCallback callback) -> void;
   auto set_run_exists_callback(RunExistsCallback callback) -> void;
+  auto set_list_run_execution_dates_callback(
+      ListRunExecutionDatesCallback callback) -> void;
   auto set_get_watermark_callback(GetWatermarkCallback callback) -> void;
   auto set_save_watermark_callback(SaveWatermarkCallback callback) -> void;
   auto set_zombie_reaper_callback(ZombieReaperCallback callback) -> void;
@@ -49,9 +53,22 @@ public:
   [[nodiscard]] auto engine() -> Engine &;
 
 private:
+  [[nodiscard]] auto owner_engine_index(const DAGId &dag_id) const noexcept
+      -> std::size_t;
+  [[nodiscard]] auto owner_shard(const DAGId &dag_id) const noexcept -> shard_id;
+  [[nodiscard]] auto owner_engine(const DAGId &dag_id) -> Engine &;
+  [[nodiscard]] auto can_update_callbacks(std::string_view callback_name) const
+      -> bool;
+  auto refresh_engine_callbacks() -> void;
+
   Runtime &runtime_;
-  Engine engine_;
+  std::vector<std::unique_ptr<Engine>> engines_;
+  std::vector<shard_id> engine_shards_;
   DAGTriggerCallback on_dag_trigger_;
+  RunExistsCallback run_exists_callback_;
+  ListRunExecutionDatesCallback list_run_execution_dates_callback_;
+  GetWatermarkCallback get_watermark_callback_;
+  SaveWatermarkCallback save_watermark_callback_;
   ZombieReaperCallback zombie_reaper_callback_;
   int zombie_reaper_interval_sec_{60};
   int zombie_heartbeat_timeout_sec_{75};

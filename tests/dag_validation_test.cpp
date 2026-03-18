@@ -108,6 +108,25 @@ command = "echo hello"
   EXPECT_EQ(result->name, "invalid_dag");
 }
 
+TEST_F(DAGValidationTest, ParseStartAndEndDate) {
+  std::string toml = R"(
+id = "dated_dag"
+name = "dated_dag"
+start_date = "2025-03-01"
+end_date = "2025-03-15"
+
+[[tasks]]
+id = "task1"
+command = "echo hello"
+)";
+
+  auto result = DAGDefinitionLoader::load_from_string(toml);
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->start_date.has_value());
+  ASSERT_TRUE(result->end_date.has_value());
+  EXPECT_LT(*result->start_date, *result->end_date);
+}
+
 TEST_F(DAGValidationTest, RejectEmptyTasks) {
   std::string invalid_toml = R"(
 id = "test_dag"
@@ -516,6 +535,22 @@ timeout = 120
   EXPECT_EQ(result->tasks[1].max_retries, 3);
 }
 
+TEST_F(DefaultArgsTest, LoadFromString_AcceptsWorkingDirectoryAlias) {
+  std::string toml = R"(
+id = "test_dag"
+name = "test_dag"
+
+[[tasks]]
+id = "task1"
+command = "pwd"
+working_directory = "/tmp"
+)";
+
+  auto result = DAGDefinitionLoader::load_from_string(toml);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->tasks[0].working_dir, "/tmp");
+}
+
 class DependencyLabelTest : public ::testing::Test {};
 
 TEST_F(DependencyLabelTest, LoadFromString_ScalarFormParsesAsEmptyLabel) {
@@ -558,6 +593,97 @@ label = "success_branch"
 
   auto result = DAGDefinitionLoader::load_from_string(toml);
   EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(DAGValidationTest, ToStringRoundTripsTaskMetadata) {
+  TaskConfig upstream_a;
+  upstream_a.task_id = TaskId{"upstream_a"};
+  upstream_a.name = "upstream_a";
+  upstream_a.command = "echo upstream_a";
+
+  TaskConfig upstream_b;
+  upstream_b.task_id = TaskId{"upstream_b"};
+  upstream_b.name = "upstream_b";
+  upstream_b.command = "echo upstream_b";
+
+  TaskConfig task;
+  task.task_id = TaskId{"task1"};
+  task.name = "task1";
+  task.command = "curl http://example.com";
+  task.executor = ExecutorType::Sensor;
+  task.execution_timeout = std::chrono::seconds(90);
+  task.retry_interval = std::chrono::seconds(15);
+  task.max_retries = 2;
+  task.trigger_rule = TriggerRule::AllDone;
+  task.is_branch = true;
+  task.branch_xcom_key = "next_branch";
+  task.depends_on_past = true;
+  task.dependencies = {
+      TaskDependency{.task_id = TaskId{"upstream_a"}, .label = "success"},
+      TaskDependency{.task_id = TaskId{"upstream_b"}, .label = ""},
+  };
+  task.xcom_push.push_back(XComPushConfig{
+      .key = "payload",
+      .source = XComSource::Json,
+      .json_path = "$.items[0]",
+      .regex_pattern = "",
+      .regex_group = 0,
+  });
+  task.xcom_pull.push_back(XComPullConfig{
+      .ref = XComRef{.task_id = TaskId{"upstream_a"}, .key = "payload"},
+      .env_var = "PAYLOAD",
+      .required = true,
+      .default_value = std::nullopt,
+  });
+  task.executor_config = SensorExecutorConfig{
+      .type = SensorType::Http,
+      .target = "http://example.com/health",
+      .poke_interval = std::chrono::seconds(45),
+      .execution_timeout = std::chrono::seconds(90),
+      .soft_fail = true,
+      .expected_status = 204,
+      .http_method = "HEAD",
+  };
+
+  DAGInfo dag;
+  dag.dag_id = DAGId{"roundtrip_dag"};
+  dag.name = "roundtrip_dag";
+  dag.description = "roundtrip";
+  dag.cron = "0 * * * *";
+  dag.catchup = true;
+  dag.max_concurrent_runs = 3;
+  dag.start_date = std::chrono::system_clock::time_point{
+      std::chrono::days{20148}}; // 2025-03-01 UTC
+  dag.end_date = std::chrono::system_clock::time_point{
+      std::chrono::days{20162}}; // 2025-03-15 UTC
+  dag.tasks.push_back(upstream_a);
+  dag.tasks.push_back(upstream_b);
+  dag.tasks.push_back(task);
+  dag.rebuild_task_index();
+
+  auto serialized = DAGDefinitionLoader::to_string(dag);
+  auto reparsed = DAGDefinitionLoader::load_from_string(serialized);
+
+  ASSERT_TRUE(reparsed.has_value());
+  ASSERT_EQ(reparsed->tasks.size(), 3);
+  const auto &task_out = reparsed->tasks[2];
+  EXPECT_EQ(reparsed->dag_id, dag.dag_id);
+  EXPECT_EQ(reparsed->start_date, dag.start_date);
+  EXPECT_EQ(reparsed->end_date, dag.end_date);
+  EXPECT_EQ(task_out.branch_xcom_key, "next_branch");
+  EXPECT_TRUE(task_out.is_branch);
+  EXPECT_TRUE(task_out.depends_on_past);
+  ASSERT_EQ(task_out.dependencies.size(), 2);
+  EXPECT_TRUE(task_out.dependencies[0].label.empty());
+  EXPECT_TRUE(task_out.dependencies[1].label.empty());
+  EXPECT_TRUE(task_out.xcom_push.empty());
+  EXPECT_TRUE(task_out.xcom_pull.empty());
+  const auto *sensor = task_out.executor_config.as<SensorExecutorConfig>();
+  ASSERT_NE(sensor, nullptr);
+  EXPECT_EQ(sensor->type, SensorType::Http);
+  EXPECT_EQ(sensor->target, "http://example.com/health");
+  EXPECT_EQ(sensor->http_method, "HEAD");
+  EXPECT_EQ(sensor->expected_status, 204);
 }
 
 TEST_F(DependencyLabelTest, LoadFromString_MixedFormsParse) {

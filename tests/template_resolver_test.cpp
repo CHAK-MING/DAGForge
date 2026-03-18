@@ -34,6 +34,21 @@ protected:
   std::unique_ptr<TemplateResolver> resolver_;
 };
 
+auto make_template_context(
+    std::chrono::system_clock::time_point execution_date = {},
+    std::chrono::system_clock::time_point data_interval_start = {},
+    std::chrono::system_clock::time_point data_interval_end = {})
+    -> TemplateContext {
+  return TemplateContext{
+      .dag_run_id = DAGRunId("test_run"),
+      .dag_id = DAGId{},
+      .task_id = TaskId{},
+      .execution_date = execution_date,
+      .data_interval_start = data_interval_start,
+      .data_interval_end = data_interval_end,
+  };
+}
+
 TEST_P(DateTemplateTest, ResolvesDateVariables) {
   const auto &tc = GetParam();
 
@@ -46,10 +61,7 @@ TEST_P(DateTemplateTest, ResolvesDateVariables) {
   tm.tm_sec = 45;
   auto time_point = system_clock::from_time_t(timegm(&tm));
 
-  TemplateContext ctx{
-      .dag_run_id = DAGRunId("test_run"),
-      .execution_date = time_point,
-  };
+  auto ctx = make_template_context(time_point);
 
   auto result = resolver_->resolve_template(tc.input, ctx, {});
   ASSERT_TRUE(result.has_value()) << "Failed for: " << tc.name;
@@ -79,7 +91,7 @@ INSTANTIATE_TEST_SUITE_P(
             "command_with_ds",
             "echo 'Processing {{ds}}' && run --date={{ds_nodash}}",
             "echo 'Processing 2026-01-15' && run --date=20260115"}),
-    [](const auto &info) { return info.param.name; });
+    [](const auto &test_info) { return test_info.param.name; });
 
 class DateTemplateEdgeCaseTest : public ::testing::Test {
 protected:
@@ -95,10 +107,7 @@ protected:
 };
 
 TEST_F(DateTemplateEdgeCaseTest, EmptyExecutionDate_NoReplacement) {
-  TemplateContext ctx{
-      .dag_run_id = DAGRunId("test_run"),
-      .execution_date = {},
-  };
+  auto ctx = make_template_context();
 
   auto result = resolver_->resolve_template("date={{ds}}", ctx, {});
   ASSERT_TRUE(result.has_value());
@@ -112,10 +121,7 @@ TEST_F(DateTemplateEdgeCaseTest, EmptyTemplate_ReturnsEmpty) {
   tm.tm_mday = 1;
   auto time_point = system_clock::from_time_t(timegm(&tm));
 
-  TemplateContext ctx{
-      .dag_run_id = DAGRunId("test_run"),
-      .execution_date = time_point,
-  };
+  auto ctx = make_template_context(time_point);
 
   auto result = resolver_->resolve_template("", ctx, {});
   ASSERT_TRUE(result.has_value());
@@ -132,10 +138,7 @@ TEST_F(DateTemplateEdgeCaseTest, LeapYear_February29) {
   tm.tm_sec = 0;
   auto time_point = system_clock::from_time_t(timegm(&tm));
 
-  TemplateContext ctx{
-      .dag_run_id = DAGRunId("test_run"),
-      .execution_date = time_point,
-  };
+  auto ctx = make_template_context(time_point);
 
   auto result = resolver_->resolve_template("{{ds}}", ctx, {});
   ASSERT_TRUE(result.has_value());
@@ -152,10 +155,7 @@ TEST_F(DateTemplateEdgeCaseTest, YearBoundary_December31) {
   tm.tm_sec = 59;
   auto time_point = system_clock::from_time_t(timegm(&tm));
 
-  TemplateContext ctx{
-      .dag_run_id = DAGRunId("test_run"),
-      .execution_date = time_point,
-  };
+  auto ctx = make_template_context(time_point);
 
   auto result = resolver_->resolve_template("{{ds}} {{ts}}", ctx, {});
   ASSERT_TRUE(result.has_value());
@@ -172,10 +172,7 @@ TEST_F(DateTemplateEdgeCaseTest, Midnight_ZeroTime) {
   tm.tm_sec = 0;
   auto time_point = system_clock::from_time_t(timegm(&tm));
 
-  TemplateContext ctx{
-      .dag_run_id = DAGRunId("test_run"),
-      .execution_date = time_point,
-  };
+  auto ctx = make_template_context(time_point);
 
   auto result = resolver_->resolve_template("{{ts_nodash}}", ctx, {});
   ASSERT_TRUE(result.has_value());
@@ -193,10 +190,7 @@ TEST_F(DateTemplateEdgeCaseTest, EscapedBraces_ProducesLiteral) {
   tm.tm_mday = 15;
   auto time_point = system_clock::from_time_t(timegm(&tm));
 
-  TemplateContext ctx{
-      .dag_run_id = DAGRunId("test_run"),
-      .execution_date = time_point,
-  };
+  auto ctx = make_template_context(time_point);
 
   // \{{ should produce literal {{
   auto result = resolver_->resolve_template(R"(\{{ds}})", ctx, {});
@@ -211,10 +205,7 @@ TEST_F(DateTemplateEdgeCaseTest, MixedEscapedAndNormal) {
   tm.tm_mday = 15;
   auto time_point = system_clock::from_time_t(timegm(&tm));
 
-  TemplateContext ctx{
-      .dag_run_id = DAGRunId("test_run"),
-      .execution_date = time_point,
-  };
+  auto ctx = make_template_context(time_point);
 
   // Mix of escaped and actual template variables
   auto result =
@@ -230,10 +221,7 @@ TEST_F(DateTemplateEdgeCaseTest, UnclosedBraces_LeavesAsLiteral) {
   tm.tm_mday = 15;
   auto time_point = system_clock::from_time_t(timegm(&tm));
 
-  TemplateContext ctx{
-      .dag_run_id = DAGRunId("test_run"),
-      .execution_date = time_point,
-  };
+  auto ctx = make_template_context(time_point);
 
   auto result = resolver_->resolve_template("start={{no_close", ctx, {});
   ASSERT_TRUE(result.has_value());
@@ -247,10 +235,7 @@ TEST_F(DateTemplateEdgeCaseTest, WhitespaceInToken_Trimmed) {
   tm.tm_mday = 15;
   auto time_point = system_clock::from_time_t(timegm(&tm));
 
-  TemplateContext ctx{
-      .dag_run_id = DAGRunId("test_run"),
-      .execution_date = time_point,
-  };
+  auto ctx = make_template_context(time_point);
 
   auto result = resolver_->resolve_template("{{  ds  }}", ctx, {});
   ASSERT_TRUE(result.has_value());
@@ -264,10 +249,7 @@ TEST_F(DateTemplateEdgeCaseTest, DoubleBraceRun_UnknownTokenStaysLiteral) {
   tm.tm_mday = 15;
   auto time_point = system_clock::from_time_t(timegm(&tm));
 
-  TemplateContext ctx{
-      .dag_run_id = DAGRunId("test_run"),
-      .execution_date = time_point,
-  };
+  auto ctx = make_template_context(time_point);
 
   auto result = resolver_->resolve_template("{{{{ds}}", ctx, {});
   ASSERT_TRUE(result.has_value());
@@ -281,10 +263,7 @@ TEST_F(DateTemplateEdgeCaseTest, ManyUnclosedBraces_LinearTime) {
   tm.tm_mday = 15;
   auto time_point = system_clock::from_time_t(timegm(&tm));
 
-  TemplateContext ctx{
-      .dag_run_id = DAGRunId("test_run"),
-      .execution_date = time_point,
-  };
+  auto ctx = make_template_context(time_point);
 
   std::string many_unclosed;
   for (int i = 0; i < 50; ++i) {
@@ -302,10 +281,7 @@ TEST_F(DateTemplateEdgeCaseTest, ManyUnclosedBraces_LinearTime) {
 }
 
 TEST_F(DateTemplateEdgeCaseTest, MalformedXComToken_StaysLiteral) {
-  TemplateContext ctx{
-      .dag_run_id = DAGRunId("test_run"),
-      .execution_date = {},
-  };
+  auto ctx = make_template_context();
 
   auto result1 = resolver_->resolve_template("{{xcom.}}", ctx, {});
   ASSERT_TRUE(result1.has_value());
@@ -330,11 +306,7 @@ TEST_F(DateTemplateEdgeCaseTest, DataIntervalStart_Resolves) {
   tm.tm_sec = 0;
   auto time_point = system_clock::from_time_t(timegm(&tm));
 
-  TemplateContext ctx{
-      .dag_run_id = DAGRunId("test_run"),
-      .execution_date = time_point,
-      .data_interval_start = time_point,
-  };
+  auto ctx = make_template_context(time_point, time_point);
 
   auto result = resolver_->resolve_template("{{data_interval_start}}", ctx, {});
   ASSERT_TRUE(result.has_value());
@@ -356,12 +328,7 @@ TEST_F(DateTemplateEdgeCaseTest, DataIntervalEnd_Resolves) {
   tm_end.tm_hour = 0;
   auto end = system_clock::from_time_t(timegm(&tm_end));
 
-  TemplateContext ctx{
-      .dag_run_id = DAGRunId("test_run"),
-      .execution_date = start,
-      .data_interval_start = start,
-      .data_interval_end = end,
-  };
+  auto ctx = make_template_context(start, start, end);
 
   auto result = resolver_->resolve_template("{{data_interval_end}}", ctx, {});
   ASSERT_TRUE(result.has_value());
@@ -375,10 +342,7 @@ TEST_F(DateTemplateEdgeCaseTest, DataInterval_EmptyLeavesLiteral) {
   tm.tm_mday = 15;
   auto time_point = system_clock::from_time_t(timegm(&tm));
 
-  TemplateContext ctx{
-      .dag_run_id = DAGRunId("test_run"),
-      .execution_date = time_point,
-  };
+  auto ctx = make_template_context(time_point);
 
   auto result = resolver_->resolve_template("{{data_interval_start}}", ctx, {});
   ASSERT_TRUE(result.has_value());
@@ -404,12 +368,7 @@ TEST_F(DateTemplateEdgeCaseTest, DataInterval_MixedWithOtherVariables) {
   tm_end.tm_sec = 0;
   auto end_point = system_clock::from_time_t(timegm(&tm_end));
 
-  TemplateContext ctx{
-      .dag_run_id = DAGRunId("test_run"),
-      .execution_date = time_point,
-      .data_interval_start = time_point,
-      .data_interval_end = end_point,
-  };
+  auto ctx = make_template_context(time_point, time_point, end_point);
 
   auto result = resolver_->resolve_template(
       "{{ds}} {{data_interval_start}} {{data_interval_end}}", ctx, {});
@@ -424,11 +383,7 @@ TEST_F(DateTemplateEdgeCaseTest, DataIntervalStart_WhitespaceTrimmed) {
   tm.tm_mday = 15;
   auto time_point = system_clock::from_time_t(timegm(&tm));
 
-  TemplateContext ctx{
-      .dag_run_id = DAGRunId("test_run"),
-      .execution_date = time_point,
-      .data_interval_start = time_point,
-  };
+  auto ctx = make_template_context(time_point, time_point);
 
   auto result =
       resolver_->resolve_template("{{  data_interval_start  }}", ctx, {});

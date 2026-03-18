@@ -5,6 +5,9 @@
 #include "dagforge/core/error.hpp"
 #include "dagforge/core/runtime.hpp"
 #include "dagforge/executor/executor.hpp"
+#include "dagforge/executor/executor_state.hpp"
+#include "dagforge/executor/process_launch.hpp"
+#include "dagforge/executor/process_management.hpp"
 #include "dagforge/util/log.hpp"
 #include "dagforge/util/url.hpp"
 
@@ -21,24 +24,16 @@
 #include <unordered_set>
 #include <vector>
 
-#include <signal.h>
-
 namespace dagforge {
 
 namespace {
 
 namespace bp = boost::process::v2;
 
-struct SensorContext {
-  struct SensorShardState *state{};
-};
+using SensorShardState = ExecutorShardState<ActiveProcess>;
 
-struct SensorShardState {
-  std::unordered_set<InstanceId> cancelled;
-  struct ActiveProcess {
-    pid_t pid{-1};
-  };
-  std::unordered_map<InstanceId, ActiveProcess> active_commands;
+struct SensorContext {
+  SensorShardState *state{};
 };
 
 auto check_file_sensor(const std::string &path) -> Result<bool> {
@@ -71,62 +66,41 @@ auto check_file_sensor(const std::string &path) -> Result<bool> {
 
 auto is_cancelled(const InstanceId &instance_id, const SensorContext &ctx)
     -> bool {
-  if (ctx.state->cancelled.contains(instance_id)) {
-    ctx.state->cancelled.erase(instance_id);
-    return true;
-  }
-  return false;
+  return ctx.state->consume_cancelled(instance_id);
 }
 
 auto complete_cancelled(const InstanceId &instance_id, ExecutionSink &sink)
     -> void {
   if (sink.on_complete) {
-    sink.on_complete(
-        instance_id,
-        ExecutorResult{.exit_code = 1,
-                       .stdout_output = std::pmr::string(""),
-                       .stderr_output = std::pmr::string(""),
-                       .error = std::pmr::string("Sensor cancelled"),
-                       .timed_out = false});
+    ExecutorResult result;
+    auto *resource = result.error.get_allocator().resource();
+    result.exit_code = 1;
+    result.error = pmr::string("Sensor cancelled", resource);
+    sink.on_complete(instance_id, std::move(result));
   }
 }
 
-struct CommandWaitResult {
-  int exit_code{-1};
-  bool timed_out{false};
-};
-
-auto wait_for_command_exit(bp::process &proc,
-                           std::chrono::steady_clock::duration timeout)
-    -> task<CommandWaitResult>;
-
-auto wait_for_command_exit(bp::process &proc) -> task<CommandWaitResult> {
-  auto [ec, exit_code] = co_await proc.async_wait(use_nothrow);
-  if (ec) {
-    co_return CommandWaitResult{.exit_code = -1, .timed_out = false};
-  }
-  co_return CommandWaitResult{.exit_code = exit_code, .timed_out = false};
+auto make_result(pmr::memory_resource *resource) -> ExecutorResult {
+  return make_executor_result(resource);
 }
 
 auto wait_for_command_exit(bp::process &proc,
                            std::chrono::steady_clock::duration timeout)
-    -> task<CommandWaitResult> {
+    -> task<ProcessWaitResult> {
   auto [ec, exit_code] =
       co_await proc.async_wait(boost::asio::cancel_after(timeout, use_nothrow));
   if (!ec) {
-    co_return CommandWaitResult{.exit_code = exit_code, .timed_out = false};
+    co_return ProcessWaitResult{.exit_code = exit_code};
   }
   if (ec == boost::asio::error::operation_aborted) {
-    (void)::kill(proc.id(), SIGKILL);
-    auto killed = co_await wait_for_command_exit(proc);
-    killed.timed_out = true;
-    co_return killed;
+    co_return co_await terminate_and_reap_process(proc, true);
   }
-  co_return CommandWaitResult{.exit_code = -1, .timed_out = false};
+  co_return ProcessWaitResult{.error = ec};
 }
 
 auto run_file_sensor(SensorExecutorConfig config, InstanceId instance_id,
-                     ExecutionSink sink, SensorContext ctx) -> spawn_task {
+                     ExecutionSink sink, SensorContext ctx,
+                     pmr::memory_resource *resource) -> spawn_task {
   auto start_time = std::chrono::steady_clock::now();
   auto deadline = start_time + config.execution_timeout;
 
@@ -143,13 +117,11 @@ auto run_file_sensor(SensorExecutorConfig config, InstanceId instance_id,
     auto exists_res = check_file_sensor(config.target);
     if (exists_res.value_or(false)) {
       if (sink.on_complete) {
-        sink.on_complete(instance_id,
-                         ExecutorResult{.exit_code = 0,
-                                        .stdout_output = std::pmr::string(
-                                            "File exists: " + config.target),
-                                        .stderr_output = std::pmr::string(""),
-                                        .error = std::pmr::string(""),
-                                        .timed_out = false});
+        auto result = make_result(resource);
+        result.exit_code = 0;
+        result.stdout_output =
+            pmr::string("File exists: " + config.target, resource);
+        sink.on_complete(instance_id, std::move(result));
       }
       co_return;
     } else if (!exists_res) {
@@ -161,18 +133,17 @@ auto run_file_sensor(SensorExecutorConfig config, InstanceId instance_id,
   }
 
   if (sink.on_complete) {
-    sink.on_complete(instance_id,
-                     ExecutorResult{.exit_code = config.soft_fail ? 100 : 1,
-                                    .stdout_output = std::pmr::string(""),
-                                    .stderr_output = std::pmr::string(""),
-                                    .error = std::pmr::string(
-                                        "File sensor execution_timeout"),
-                                    .timed_out = true});
+    auto result = make_result(resource);
+    result.exit_code = config.soft_fail ? 100 : 1;
+    result.error = pmr::string("File sensor execution_timeout", resource);
+    result.timed_out = true;
+    sink.on_complete(instance_id, std::move(result));
   }
 }
 
 auto run_command_sensor(SensorExecutorConfig config, InstanceId instance_id,
-                        ExecutionSink sink, SensorContext ctx) -> spawn_task {
+                        ExecutionSink sink, SensorContext ctx,
+                        pmr::memory_resource *resource) -> spawn_task {
   auto start_time = std::chrono::steady_clock::now();
   auto deadline = start_time + config.execution_timeout;
 
@@ -189,35 +160,49 @@ auto run_command_sensor(SensorExecutorConfig config, InstanceId instance_id,
     std::optional<bp::process> proc;
     try {
       auto &io_ctx = current_io_context();
-      proc.emplace(io_ctx, "/bin/sh",
-                   std::initializer_list<std::string>{"-c", config.target});
+      ProcessLaunchSpec spec{
+          .args = {"-c", config.target},
+          .stdio = std::nullopt,
+          .env = std::nullopt,
+          .working_dir = {}};
+      proc.emplace(launch_shell_process(io_ctx, std::move(spec)));
     } catch (const std::exception &ex) {
       log::error("Command sensor spawn failed for instance {}: {}", instance_id,
                  ex.what());
       if (sink.on_complete) {
-        sink.on_complete(
-            instance_id,
-            ExecutorResult{.exit_code = 1,
-                           .stdout_output = std::pmr::string(""),
-                           .stderr_output = std::pmr::string(""),
-                           .error = std::pmr::string(std::format(
-                               "Command sensor spawn failed: {}", ex.what())),
-                           .timed_out = false});
+        auto result = make_result(resource);
+        result.exit_code = 1;
+        result.error = pmr::string(
+            std::format("Command sensor spawn failed: {}", ex.what()),
+            resource);
+        sink.on_complete(instance_id, std::move(result));
       }
       co_return;
     }
 
-    ctx.state->active_commands[instance_id] = {.pid = proc->id()};
+    ctx.state->register_active(instance_id, ActiveProcess{.pid = proc->id()});
 
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) {
       break;
     }
     auto wait_result = co_await wait_for_command_exit(*proc, deadline - now);
-    ctx.state->active_commands.erase(instance_id);
+    ctx.state->unregister_active(instance_id);
 
     if (is_cancelled(instance_id, ctx)) {
       complete_cancelled(instance_id, sink);
+      co_return;
+    }
+    if (wait_result.error) {
+      if (sink.on_complete) {
+        auto result = make_result(resource);
+        result.exit_code = 1;
+        result.error = pmr::string(
+            std::format("Command sensor wait failed: {}",
+                        wait_result.error.message()),
+            resource);
+        sink.on_complete(instance_id, std::move(result));
+      }
       co_return;
     }
     if (wait_result.timed_out) {
@@ -226,13 +211,10 @@ auto run_command_sensor(SensorExecutorConfig config, InstanceId instance_id,
 
     if (wait_result.exit_code == 0) {
       if (sink.on_complete) {
-        sink.on_complete(instance_id,
-                         ExecutorResult{.exit_code = 0,
-                                        .stdout_output = std::pmr::string(
-                                            "Command succeeded"),
-                                        .stderr_output = std::pmr::string(""),
-                                        .error = std::pmr::string(""),
-                                        .timed_out = false});
+        auto result = make_result(resource);
+        result.exit_code = 0;
+        result.stdout_output = pmr::string("Command succeeded", resource);
+        sink.on_complete(instance_id, std::move(result));
       }
       co_return;
     }
@@ -241,32 +223,31 @@ auto run_command_sensor(SensorExecutorConfig config, InstanceId instance_id,
   }
 
   if (sink.on_complete) {
-    sink.on_complete(instance_id,
-                     ExecutorResult{.exit_code = config.soft_fail ? 100 : 1,
-                                    .stdout_output = std::pmr::string(""),
-                                    .stderr_output = std::pmr::string(""),
-                                    .error = std::pmr::string(
-                                        "Command sensor execution_timeout"),
-                                    .timed_out = true});
+    auto result = make_result(resource);
+    result.exit_code = config.soft_fail ? 100 : 1;
+    result.error =
+        pmr::string("Command sensor execution_timeout", resource);
+    result.timed_out = true;
+    sink.on_complete(instance_id, std::move(result));
   }
 }
 
 auto run_http_sensor(SensorExecutorConfig config, InstanceId instance_id,
-                     ExecutionSink sink, SensorContext ctx) -> spawn_task {
+                     ExecutionSink sink, SensorContext ctx,
+                     pmr::memory_resource *resource) -> spawn_task {
   auto start_time = std::chrono::steady_clock::now();
   auto deadline = start_time + config.execution_timeout;
 
   auto parsed_res = util::parse_http_url(config.target);
   if (!parsed_res) {
     if (sink.on_complete) {
-      sink.on_complete(instance_id,
-                       ExecutorResult{.exit_code = 1,
-                                      .stdout_output = std::pmr::string(""),
-                                      .stderr_output = std::pmr::string(""),
-                                      .error = std::pmr::string(std::format(
-                                          "Invalid http sensor url: {}",
-                                          parsed_res.error().message())),
-                                      .timed_out = false});
+      auto result = make_result(resource);
+      result.exit_code = 1;
+      result.error = pmr::string(
+          std::format("Invalid http sensor url: {}",
+                      parsed_res.error().message()),
+          resource);
+      sink.on_complete(instance_id, std::move(result));
     }
     co_return;
   }
@@ -322,15 +303,13 @@ auto run_http_sensor(SensorExecutorConfig config, InstanceId instance_id,
 
     if (!request_failed && static_cast<uint16_t>(resp.status) == expected) {
       if (sink.on_complete) {
-        sink.on_complete(
-            instance_id,
-            ExecutorResult{.exit_code = 0,
-                           .stdout_output = std::pmr::string(std::format(
-                               "HTTP {} {} returned {}", method, parsed.path,
-                               static_cast<uint16_t>(resp.status))),
-                           .stderr_output = std::pmr::string(""),
-                           .error = std::pmr::string(""),
-                           .timed_out = false});
+        auto result = make_result(resource);
+        result.exit_code = 0;
+        result.stdout_output = pmr::string(
+            std::format("HTTP {} {} returned {}", method, parsed.path,
+                        static_cast<uint16_t>(resp.status)),
+            resource);
+        sink.on_complete(instance_id, std::move(result));
       }
       co_return;
     }
@@ -339,13 +318,11 @@ auto run_http_sensor(SensorExecutorConfig config, InstanceId instance_id,
   }
 
   if (sink.on_complete) {
-    sink.on_complete(instance_id,
-                     ExecutorResult{.exit_code = config.soft_fail ? 100 : 1,
-                                    .stdout_output = std::pmr::string(""),
-                                    .stderr_output = std::pmr::string(""),
-                                    .error = std::pmr::string(
-                                        "HTTP sensor execution_timeout"),
-                                    .timed_out = true});
+    auto result = make_result(resource);
+    result.exit_code = config.soft_fail ? 100 : 1;
+    result.error = pmr::string("HTTP sensor execution_timeout", resource);
+    result.timed_out = true;
+    sink.on_complete(instance_id, std::move(result));
   }
 }
 
@@ -357,7 +334,7 @@ public:
       : runtime_(&runtime), shard_states_(runtime.shard_count()) {}
 
   auto start(ExecutorRequest req, ExecutionSink sink) -> Result<void> override {
-    auto *config = std::get_if<SensorExecutorConfig>(&req.config);
+    auto *config = req.config.as<SensorExecutorConfig>();
     if (!config) {
       return fail(Error::InvalidArgument);
     }
@@ -369,22 +346,22 @@ public:
                                                  : "command",
               config->target);
 
-    auto owner = owner_shard(req.instance_id);
-    SensorContext ctx{.state = &shard_states_[owner]};
+    auto sid = runtime_->is_current_shard() ? runtime_->current_shard() : 0;
+    SensorContext ctx{.state = &shard_states_[sid]};
     switch (config->type) {
     case SensorType::File: {
-      runtime_->spawn_on(owner, run_file_sensor(*config, req.instance_id,
-                                                std::move(sink), ctx));
+      runtime_->spawn(run_file_sensor(*config, req.instance_id, std::move(sink),
+                                      ctx, req.resource()));
       break;
     }
     case SensorType::Http: {
-      runtime_->spawn_on(owner, run_http_sensor(*config, req.instance_id,
-                                                std::move(sink), ctx));
+      runtime_->spawn(run_http_sensor(*config, req.instance_id, std::move(sink),
+                                      ctx, req.resource()));
       break;
     }
     case SensorType::Command: {
-      runtime_->spawn_on(owner, run_command_sensor(*config, req.instance_id,
-                                                   std::move(sink), ctx));
+      runtime_->spawn(run_command_sensor(*config, req.instance_id,
+                                         std::move(sink), ctx, req.resource()));
       break;
     }
     }
@@ -392,25 +369,18 @@ public:
   }
 
   auto cancel(const InstanceId &instance_id) -> void override {
-    auto owner = owner_shard(instance_id);
-    runtime_->post_to(owner, [this, owner, instance_id] {
-      auto &state = shard_states_[owner];
-      state.cancelled.insert(instance_id);
-      auto it = state.active_commands.find(instance_id);
-      if (it != state.active_commands.end() && it->second.pid > 0) {
-        (void)::kill(it->second.pid, SIGKILL);
-      }
-      log::info("SensorExecutor cancel: instance_id={}", instance_id);
-    });
+    cancel_on_all_shards(*runtime_, shard_states_, instance_id,
+                         [](SensorShardState &state, const InstanceId &id) {
+                           state.mark_cancelled(id);
+                           auto it = state.find_active_mut(id);
+                           if (it != state.active_end() && it->second.pid > 0) {
+                             kill_process_group_or_process(it->second.pid);
+                           }
+                           log::info("SensorExecutor cancel: instance_id={}", id);
+                         });
   }
 
 private:
-  [[nodiscard]] auto owner_shard(const InstanceId &instance_id) const noexcept
-      -> shard_id {
-    const auto shards = std::max(1U, runtime_->shard_count());
-    return static_cast<shard_id>(std::hash<InstanceId>{}(instance_id) % shards);
-  }
-
   Runtime *runtime_;
   std::vector<SensorShardState> shard_states_;
 };

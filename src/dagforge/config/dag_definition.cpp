@@ -7,9 +7,11 @@
 
 #include <glaze/toml.hpp>
 
-#include <charconv>
 #include <chrono>
+#include <algorithm>
 #include <format>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -17,341 +19,473 @@
 
 namespace dagforge {
 namespace detail {
-
-struct TaskDependencyToml {
-  std::string task;
-  std::string label;
-};
-
-struct XComPushToml {
-  std::string key;
-  std::string source{"stdout"};
-  std::string json_path;
-  std::string regex;
-  int regex_group{0};
-};
-
-struct XComPullToml {
-  std::string key;
-  std::string from;
-  std::string env;
-  bool required{false};
-};
-
-struct TaskDefaultsToml {
-  int timeout{0};
-  int retry_interval{0};
-  int max_retries{-1};
-  std::string trigger_rule{"all_success"};
-  std::string executor{"shell"};
-  std::string working_dir;
+struct TaskFieldPresence {
+  bool working_dir{false};
+  bool executor{false};
+  bool timeout{false};
+  bool retry_interval{false};
+  bool max_retries{false};
+  bool trigger_rule{false};
   bool depends_on_past{false};
 };
 
-struct TaskToml {
-  std::string id;
-  std::string name;
-  std::string command;
-  std::string working_dir;
-  std::string executor;
-  int timeout{0};
-  int retry_interval{0};
-  int max_retries{-1};
-  std::string trigger_rule;
-  bool is_branch{false};
-  std::string branch_xcom_key;
-  bool depends_on_past{false};
-
-  std::vector<std::variant<std::string, TaskDependencyToml>> dependencies;
-  std::vector<XComPushToml> xcom_push;
-  std::vector<XComPullToml> xcom_pull;
-
-  std::string docker_image;
-  std::string docker_socket;
-  std::string pull_policy;
-
-  std::string sensor_type;
-  int sensor_interval{30};
-  bool soft_fail{false};
-  int sensor_expected_status{200};
-  std::string sensor_http_method{"GET"};
-  std::string sensor_target;
+struct ParsedTaskConfig {
+  TaskConfig task{};
+  TaskFieldPresence presence{};
+  std::vector<std::variant<std::string, TaskDependency>> dependencies;
+  std::vector<XComPushConfig> xcom_push;
+  std::vector<XComPullConfig> xcom_pull;
 };
 
-struct DAGToml {
-  std::string id;
-  std::string name;
-  std::string description;
-  std::string cron;
-  std::string start_date;
-  std::string end_date;
-  int max_active_runs{16};
-  bool catchup{false};
-  TaskDefaultsToml default_args{};
-  std::vector<TaskToml> tasks;
+struct ParsedDagToml {
+  DAGInfo dag{};
+  TaskDefaults default_args{};
+  std::vector<ParsedTaskConfig> tasks;
+
+  ParsedDagToml() { dag.max_concurrent_runs = 16; }
 };
 
 } // namespace detail
 } // namespace dagforge
 
 namespace glz {
-template <> struct meta<dagforge::detail::TaskDependencyToml> {
-  using T = dagforge::detail::TaskDependencyToml;
-  static constexpr auto value = object("task", &T::task, "label", &T::label);
-};
-
-template <> struct meta<dagforge::detail::XComPushToml> {
-  using T = dagforge::detail::XComPushToml;
+template <> struct meta<dagforge::TaskDependency> {
+  using T = dagforge::TaskDependency;
+  static constexpr auto read_task = [](T &value, const std::string &input) {
+    value.task_id = dagforge::TaskId{input};
+  };
   static constexpr auto value =
-      object("key", &T::key, "source", &T::source, "json_path", &T::json_path,
-             "regex", &T::regex, "regex_group", &T::regex_group);
+      object("task", custom<read_task, nullptr>, "label", &T::label);
 };
 
-template <> struct meta<dagforge::detail::XComPullToml> {
-  using T = dagforge::detail::XComPullToml;
-  static constexpr auto value = object("key", &T::key, "from", &T::from, "env",
-                                       &T::env, "required", &T::required);
-};
-
-template <> struct meta<dagforge::detail::TaskDefaultsToml> {
-  using T = dagforge::detail::TaskDefaultsToml;
+template <> struct meta<dagforge::XComPushConfig> {
+  using T = dagforge::XComPushConfig;
+  static constexpr auto read_source = [](T &value, const std::string &input) {
+    value.source = dagforge::parse<dagforge::XComSource>(input);
+  };
   static constexpr auto value =
-      object("timeout", &T::timeout, "retry_interval", &T::retry_interval,
-             "max_retries", &T::max_retries, "trigger_rule", &T::trigger_rule,
-             "executor", &T::executor, "working_dir", &T::working_dir,
+      object("key", &T::key, "source", custom<read_source, nullptr>,
+             "json_path", &T::json_path, "regex", &T::regex_pattern,
+             "regex_group", &T::regex_group);
+};
+
+template <> struct meta<dagforge::XComPullConfig> {
+  using T = dagforge::XComPullConfig;
+  static constexpr auto read_key = [](T &value, const std::string &input) {
+    value.ref.key = input;
+  };
+  static constexpr auto read_from = [](T &value, const std::string &input) {
+    value.ref.task_id = dagforge::TaskId{input};
+  };
+  static constexpr auto value =
+      object("key", custom<read_key, nullptr>, "from",
+             custom<read_from, nullptr>, "env", &T::env_var, "required",
+             &T::required);
+};
+
+template <> struct meta<dagforge::TaskDefaults> {
+  using T = dagforge::TaskDefaults;
+  static constexpr auto read_timeout = [](T &value, const int input) {
+    value.execution_timeout = std::chrono::seconds(input);
+  };
+  static constexpr auto read_retry_interval = [](T &value, const int input) {
+    value.retry_interval = std::chrono::seconds(input);
+  };
+  static constexpr auto read_trigger_rule = [](T &value,
+                                               const std::string &input) {
+    value.trigger_rule = dagforge::parse<dagforge::TriggerRule>(input);
+  };
+  static constexpr auto read_executor = [](T &value, const std::string &input) {
+    value.executor = dagforge::parse<dagforge::ExecutorType>(input);
+  };
+  static constexpr auto value =
+      object("timeout", custom<read_timeout, nullptr>, "retry_interval",
+             custom<read_retry_interval, nullptr>, "max_retries",
+             &T::max_retries, "trigger_rule",
+             custom<read_trigger_rule, nullptr>, "executor",
+             custom<read_executor, nullptr>, "working_dir", &T::working_dir,
+             "working_directory", &T::working_dir,
              "depends_on_past", &T::depends_on_past);
 };
 
-template <> struct meta<dagforge::detail::TaskToml> {
-  using T = dagforge::detail::TaskToml;
+template <> struct meta<dagforge::detail::ParsedTaskConfig> {
+  using T = dagforge::detail::ParsedTaskConfig;
+  static constexpr auto read_id = [](T &value, const std::string &input) {
+    value.task.task_id = dagforge::TaskId{input};
+  };
+  static constexpr auto read_name = [](T &value, const std::string &input) {
+    value.task.name = input;
+  };
+  static constexpr auto read_command = [](T &value, const std::string &input) {
+    value.task.command = input;
+  };
+  static constexpr auto read_working_dir = [](T &value,
+                                              const std::string &input) {
+    value.task.working_dir = input;
+    value.presence.working_dir = true;
+  };
+  static constexpr auto read_executor = [](T &value, const std::string &input) {
+    value.task.executor = dagforge::parse<dagforge::ExecutorType>(input);
+    value.presence.executor = true;
+  };
+  static constexpr auto read_timeout = [](T &value, const int input) {
+    value.task.execution_timeout = std::chrono::seconds(input);
+    value.presence.timeout = true;
+  };
+  static constexpr auto read_retry_interval = [](T &value, const int input) {
+    value.task.retry_interval = std::chrono::seconds(input);
+    value.presence.retry_interval = true;
+  };
+  static constexpr auto read_max_retries = [](T &value, const int input) {
+    value.task.max_retries = input;
+    value.presence.max_retries = true;
+  };
+  static constexpr auto read_trigger_rule = [](T &value,
+                                               const std::string &input) {
+    value.task.trigger_rule = dagforge::parse<dagforge::TriggerRule>(input);
+    value.presence.trigger_rule = true;
+  };
+  static constexpr auto read_is_branch = [](T &value, const bool input) {
+    value.task.is_branch = input;
+  };
+  static constexpr auto read_branch_xcom_key = [](T &value,
+                                                  const std::string &input) {
+    value.task.branch_xcom_key = input;
+  };
+  static constexpr auto read_depends_on_past = [](T &value, const bool input) {
+    value.task.depends_on_past = input;
+    value.presence.depends_on_past = true;
+  };
+  static constexpr auto read_docker_image = [](T &value,
+                                               const std::string &input) {
+    auto cfg = value.task.executor_config.as<dagforge::DockerExecutorConfig>();
+    if (cfg == nullptr) {
+      value.task.executor_config = dagforge::DockerExecutorConfig{};
+      cfg = value.task.executor_config.as<dagforge::DockerExecutorConfig>();
+    }
+    cfg->image = input;
+  };
+  static constexpr auto read_docker_socket = [](T &value,
+                                                const std::string &input) {
+    auto cfg = value.task.executor_config.as<dagforge::DockerExecutorConfig>();
+    if (cfg == nullptr) {
+      value.task.executor_config = dagforge::DockerExecutorConfig{};
+      cfg = value.task.executor_config.as<dagforge::DockerExecutorConfig>();
+    }
+    cfg->docker_socket = input;
+  };
+  static constexpr auto read_pull_policy = [](T &value,
+                                              const std::string &input) {
+    auto cfg = value.task.executor_config.as<dagforge::DockerExecutorConfig>();
+    if (cfg == nullptr) {
+      value.task.executor_config = dagforge::DockerExecutorConfig{};
+      cfg = value.task.executor_config.as<dagforge::DockerExecutorConfig>();
+    }
+    cfg->pull_policy = dagforge::parse<dagforge::ImagePullPolicy>(input);
+  };
+  static constexpr auto read_sensor_type = [](T &value,
+                                              const std::string &input) {
+    auto cfg = value.task.executor_config.as<dagforge::SensorExecutorConfig>();
+    if (cfg == nullptr) {
+      value.task.executor_config = dagforge::SensorExecutorConfig{};
+      cfg = value.task.executor_config.as<dagforge::SensorExecutorConfig>();
+    }
+    cfg->type = dagforge::parse<dagforge::SensorType>(input);
+  };
+  static constexpr auto read_sensor_interval = [](T &value, const int input) {
+    auto cfg = value.task.executor_config.as<dagforge::SensorExecutorConfig>();
+    if (cfg == nullptr) {
+      value.task.executor_config = dagforge::SensorExecutorConfig{};
+      cfg = value.task.executor_config.as<dagforge::SensorExecutorConfig>();
+    }
+    cfg->poke_interval = std::chrono::seconds(input);
+  };
+  static constexpr auto read_soft_fail = [](T &value, const bool input) {
+    auto cfg = value.task.executor_config.as<dagforge::SensorExecutorConfig>();
+    if (cfg == nullptr) {
+      value.task.executor_config = dagforge::SensorExecutorConfig{};
+      cfg = value.task.executor_config.as<dagforge::SensorExecutorConfig>();
+    }
+    cfg->soft_fail = input;
+  };
+  static constexpr auto read_sensor_expected_status = [](T &value,
+                                                         const int input) {
+    auto cfg = value.task.executor_config.as<dagforge::SensorExecutorConfig>();
+    if (cfg == nullptr) {
+      value.task.executor_config = dagforge::SensorExecutorConfig{};
+      cfg = value.task.executor_config.as<dagforge::SensorExecutorConfig>();
+    }
+    cfg->expected_status = input;
+  };
+  static constexpr auto read_sensor_http_method = [](T &value,
+                                                     const std::string &input) {
+    auto cfg = value.task.executor_config.as<dagforge::SensorExecutorConfig>();
+    if (cfg == nullptr) {
+      value.task.executor_config = dagforge::SensorExecutorConfig{};
+      cfg = value.task.executor_config.as<dagforge::SensorExecutorConfig>();
+    }
+    cfg->http_method = input;
+  };
+  static constexpr auto read_sensor_target = [](T &value,
+                                                const std::string &input) {
+    auto cfg = value.task.executor_config.as<dagforge::SensorExecutorConfig>();
+    if (cfg == nullptr) {
+      value.task.executor_config = dagforge::SensorExecutorConfig{};
+      cfg = value.task.executor_config.as<dagforge::SensorExecutorConfig>();
+    }
+    cfg->target = input;
+  };
   static constexpr auto value = object(
-      "id", &T::id, "name", &T::name, "command", &T::command, "working_dir",
-      &T::working_dir, "executor", &T::executor, "timeout", &T::timeout,
-      "retry_interval", &T::retry_interval, "max_retries", &T::max_retries,
-      "trigger_rule", &T::trigger_rule, "is_branch", &T::is_branch,
-      "branch_xcom_key", &T::branch_xcom_key, "depends_on_past",
-      &T::depends_on_past, "dependencies", &T::dependencies, "xcom_push",
-      &T::xcom_push, "xcom_pull", &T::xcom_pull, "docker_image",
-      &T::docker_image, "docker_socket", &T::docker_socket, "pull_policy",
-      &T::pull_policy, "sensor_type", &T::sensor_type, "sensor_interval",
-      &T::sensor_interval, "soft_fail", &T::soft_fail, "sensor_expected_status",
-      &T::sensor_expected_status, "sensor_http_method", &T::sensor_http_method,
-      "sensor_target", &T::sensor_target);
+      "id", custom<read_id, nullptr>, "name", custom<read_name, nullptr>,
+      "command", custom<read_command, nullptr>, "working_dir",
+      custom<read_working_dir, nullptr>, "working_directory",
+      custom<read_working_dir, nullptr>, "executor",
+      custom<read_executor, nullptr>, "timeout",
+      custom<read_timeout, nullptr>, "retry_interval",
+      custom<read_retry_interval, nullptr>, "max_retries",
+      custom<read_max_retries, nullptr>, "trigger_rule",
+      custom<read_trigger_rule, nullptr>, "is_branch",
+      custom<read_is_branch, nullptr>, "branch_xcom_key",
+      custom<read_branch_xcom_key, nullptr>, "depends_on_past",
+      custom<read_depends_on_past, nullptr>, "dependencies", &T::dependencies,
+      "xcom_push", &T::xcom_push, "xcom_pull", &T::xcom_pull, "docker_image",
+      custom<read_docker_image, nullptr>, "docker_socket",
+      custom<read_docker_socket, nullptr>, "pull_policy",
+      custom<read_pull_policy, nullptr>, "sensor_type",
+      custom<read_sensor_type, nullptr>, "sensor_interval",
+      custom<read_sensor_interval, nullptr>, "soft_fail",
+      custom<read_soft_fail, nullptr>, "sensor_expected_status",
+      custom<read_sensor_expected_status, nullptr>, "sensor_http_method",
+      custom<read_sensor_http_method, nullptr>, "sensor_target",
+      custom<read_sensor_target, nullptr>);
 };
 
-template <> struct meta<dagforge::detail::DAGToml> {
-  using T = dagforge::detail::DAGToml;
+template <> struct meta<dagforge::detail::ParsedDagToml> {
+  using T = dagforge::detail::ParsedDagToml;
+  static constexpr auto read_id = [](T &value, const std::string &input) {
+    value.dag.dag_id = dagforge::DAGId{input};
+  };
+  static constexpr auto read_name = [](T &value, const std::string &input) {
+    value.dag.name = input;
+  };
+  static constexpr auto read_description = [](T &value,
+                                              const std::string &input) {
+    value.dag.description = input;
+  };
+  static constexpr auto read_cron = [](T &value, const std::string &input) {
+    value.dag.cron = input;
+  };
+  static constexpr auto read_start_date = [](T &value,
+                                             const std::string &input) {
+    value.dag.start_date = dagforge::toml_util::parse_date_yyyy_mm_dd(input);
+  };
+  static constexpr auto read_end_date = [](T &value, const std::string &input) {
+    value.dag.end_date = dagforge::toml_util::parse_date_yyyy_mm_dd(input);
+  };
+  static constexpr auto read_max_active_runs = [](T &value, const int input) {
+    value.dag.max_concurrent_runs = input;
+  };
+  static constexpr auto read_catchup = [](T &value, const bool input) {
+    value.dag.catchup = input;
+  };
   static constexpr auto value =
-      object("id", &T::id, "name", &T::name, "description", &T::description,
-             "cron", &T::cron, "start_date", &T::start_date, "end_date",
-             &T::end_date, "max_active_runs", &T::max_active_runs, "catchup",
-             &T::catchup, "default_args", &T::default_args, "tasks", &T::tasks);
+      object("id", custom<read_id, nullptr>, "name",
+             custom<read_name, nullptr>, "description",
+             custom<read_description, nullptr>, "cron",
+             custom<read_cron, nullptr>, "start_date",
+             custom<read_start_date, nullptr>, "end_date",
+             custom<read_end_date, nullptr>, "max_active_runs",
+             custom<read_max_active_runs, nullptr>, "catchup",
+             custom<read_catchup, nullptr>, "default_args", &T::default_args,
+             "tasks", &T::tasks);
 };
 } // namespace glz
 
 namespace dagforge {
 namespace {
 
-[[nodiscard]] auto parse_days_timepoint(std::string_view s)
-    -> std::optional<std::chrono::system_clock::time_point> {
-  if (s.empty()) {
-    return std::nullopt;
+auto apply_task_defaults(TaskConfig &task, const TaskDefaults &defaults,
+                         const detail::TaskFieldPresence &presence) -> void {
+  if (!presence.timeout) {
+    task.execution_timeout = defaults.execution_timeout;
   }
-  using namespace std::chrono;
-  int y_val = 0;
-  unsigned m_val = 0;
-  unsigned d_val = 0;
-
-  const char *p = s.data();
-  const char *end = p + s.size();
-
-  auto [p1, ec1] = std::from_chars(p, end, y_val);
-  if (ec1 != std::errc{} || p1 >= end || *p1 != '-')
-    return std::nullopt;
-
-  auto [p2, ec2] = std::from_chars(p1 + 1, end, m_val);
-  if (ec2 != std::errc{} || p2 >= end || *p2 != '-')
-    return std::nullopt;
-
-  auto [p3, ec3] = std::from_chars(p2 + 1, end, d_val);
-  if (ec3 != std::errc{})
-    return std::nullopt;
-
-  const year_month_day ymd{year{y_val}, month{m_val}, day{d_val}};
-  if (!ymd.ok()) {
-    return std::nullopt;
+  if (!presence.retry_interval) {
+    task.retry_interval = defaults.retry_interval;
   }
-  return sys_days{ymd};
+  if (!presence.max_retries) {
+    task.max_retries = defaults.max_retries;
+  }
+  if (!presence.trigger_rule) {
+    task.trigger_rule = defaults.trigger_rule;
+  }
+  if (!presence.executor) {
+    task.executor = defaults.executor;
+  }
+  if (!presence.depends_on_past) {
+    task.depends_on_past = defaults.depends_on_past;
+  }
+  if (!presence.working_dir) {
+    task.working_dir = defaults.working_dir;
+  }
 }
 
-[[nodiscard]] auto parse_dependencies(
-    const std::vector<std::variant<std::string, detail::TaskDependencyToml>>
-        &deps) -> std::vector<TaskDependency> {
-  std::vector<TaskDependency> out;
-  out.reserve(deps.size());
-
-  for (const auto &dep : deps) {
-    if (const auto *id = std::get_if<std::string>(&dep)) {
-      if (!id->empty()) {
-        out.emplace_back(TaskDependency{.task_id = TaskId(*id), .label = ""});
-      }
-      continue;
-    }
-    const auto &d = std::get<detail::TaskDependencyToml>(dep);
-    if (!d.task.empty()) {
-      out.emplace_back(
-          TaskDependency{.task_id = TaskId(d.task), .label = d.label});
-    }
+auto finalize_task(TaskConfig &task) -> void {
+  if (task.name.empty()) {
+    task.name = task.task_id.str();
   }
 
-  return out;
-}
-
-[[nodiscard]] auto
-parse_xcom_push(const std::vector<detail::XComPushToml> &push)
-    -> std::vector<XComPushConfig> {
-  std::vector<XComPushConfig> out;
-  out.reserve(push.size());
-  for (const auto &item : push) {
-    out.emplace_back(XComPushConfig{.key = item.key,
-                                    .source = parse<XComSource>(item.source),
-                                    .json_path = item.json_path,
-                                    .regex_pattern = item.regex,
-                                    .regex_group = item.regex_group});
-  }
-  return out;
-}
-
-[[nodiscard]] auto
-parse_xcom_pull(const std::vector<detail::XComPullToml> &pull)
-    -> std::vector<XComPullConfig> {
-  std::vector<XComPullConfig> out;
-  out.reserve(pull.size());
-  for (const auto &item : pull) {
-    out.emplace_back(XComPullConfig{
-        .ref = XComRef{.task_id = TaskId(item.from), .key = item.key},
-        .env_var = item.env,
-        .required = item.required,
-        .default_value = std::nullopt});
-  }
-  return out;
-}
-
-[[nodiscard]] auto parse_defaults(const detail::TaskDefaultsToml &raw)
-    -> TaskDefaults {
-  TaskDefaults defaults{};
-  const int timeout_sec =
-      raw.timeout > 0
-          ? raw.timeout
-          : static_cast<int>(task_defaults::kExecutionTimeout.count());
-  const int retry_interval_sec =
-      raw.retry_interval > 0
-          ? raw.retry_interval
-          : static_cast<int>(task_defaults::kRetryInterval.count());
-  const int max_retries =
-      raw.max_retries >= 0 ? raw.max_retries : task_defaults::kMaxRetries;
-  defaults.execution_timeout = std::chrono::seconds(timeout_sec);
-  defaults.retry_interval = std::chrono::seconds(retry_interval_sec);
-  defaults.max_retries = max_retries;
-  defaults.depends_on_past = raw.depends_on_past;
-  defaults.trigger_rule = parse<TriggerRule>(raw.trigger_rule);
-  defaults.executor = parse<ExecutorType>(raw.executor);
-  defaults.working_dir = raw.working_dir;
-  return defaults;
-}
-
-[[nodiscard]] auto parse_executor_config(const detail::TaskToml &raw,
-                                         ExecutorType executor,
-                                         std::string_view command_value)
-    -> ExecutorTaskConfig {
-  switch (executor) {
+  switch (task.executor) {
   case ExecutorType::Docker: {
-    DockerTaskConfig cfg{};
-    cfg.image = raw.docker_image;
-    if (!raw.docker_socket.empty()) {
-      cfg.socket = raw.docker_socket;
-    }
-    if (!raw.pull_policy.empty()) {
-      cfg.pull_policy = parse<ImagePullPolicy>(raw.pull_policy);
-    }
-    return cfg;
+    auto cfg = task.executor_config.as<DockerExecutorConfig>() != nullptr
+                   ? *task.executor_config.as<DockerExecutorConfig>()
+                   : DockerExecutorConfig{};
+    task.executor_config = std::move(cfg);
+    break;
   }
   case ExecutorType::Sensor: {
-    SensorTaskConfig cfg{};
-    if (!raw.sensor_type.empty()) {
-      cfg.type = parse<SensorType>(raw.sensor_type);
-    }
-    cfg.poke_interval = std::chrono::seconds(raw.sensor_interval);
-    cfg.soft_fail = raw.soft_fail;
-    cfg.expected_status = raw.sensor_expected_status;
-    if (!raw.sensor_http_method.empty()) {
-      cfg.http_method = raw.sensor_http_method;
-    }
-
-    cfg.target = raw.sensor_target;
+    auto cfg = task.executor_config.as<SensorExecutorConfig>() != nullptr
+                   ? *task.executor_config.as<SensorExecutorConfig>()
+                   : SensorExecutorConfig{};
+    cfg.execution_timeout = task.execution_timeout;
     if (cfg.target.empty()) {
-      cfg.target = std::string(command_value);
+      cfg.target = task.command;
     }
-    return cfg;
+    if (cfg.http_method.empty()) {
+      cfg.http_method = "GET";
+    }
+    task.executor_config = std::move(cfg);
+    break;
+  }
+  case ExecutorType::Noop: {
+    auto cfg = task.executor_config.as<NoopExecutorConfig>() != nullptr
+                   ? *task.executor_config.as<NoopExecutorConfig>()
+                   : NoopExecutorConfig{};
+    task.executor_config = std::move(cfg);
+    break;
   }
   case ExecutorType::Shell:
   default:
-    return ShellTaskConfig{};
+    task.executor_config = ShellExecutorConfig{};
+    break;
   }
 }
 
-[[nodiscard]] auto parse_task(const detail::TaskToml &raw,
-                              const TaskDefaults &defaults)
-    -> Result<TaskConfig> {
-  TaskConfig task{};
-  task.task_id = TaskId(raw.id);
-  task.name = raw.name.empty() ? raw.id : raw.name;
-  task.command = raw.command;
+auto materialize_task_dependencies(
+    const std::vector<std::variant<std::string, TaskDependency>> &input)
+    -> std::vector<TaskDependency> {
+  std::vector<TaskDependency> result;
+  result.reserve(input.size());
+  for (const auto &item : input) {
+    if (const auto *task_id = std::get_if<std::string>(&item)) {
+      if (!task_id->empty()) {
+        result.push_back(
+            TaskDependency{.task_id = TaskId{*task_id}, .label = ""});
+      }
+    } else {
+      result.push_back(std::get<TaskDependency>(item));
+    }
+  }
+  return result;
+}
 
-  task.execution_timeout = defaults.execution_timeout;
-  task.retry_interval = defaults.retry_interval;
-  task.max_retries = defaults.max_retries;
-  task.trigger_rule = defaults.trigger_rule;
-  task.executor = defaults.executor;
-  task.depends_on_past = defaults.depends_on_past;
-  task.working_dir = defaults.working_dir;
+[[nodiscard]] auto toml_quote(std::string_view value) -> std::string {
+  std::ostringstream out;
+  out << std::quoted(std::string(value));
+  return out.str();
+}
 
-  if (!raw.executor.empty()) {
-    task.executor = parse<ExecutorType>(raw.executor);
+auto append_toml_string(std::string &out, std::string_view key,
+                        std::string_view value) -> void {
+  out += std::format("{} = {}\n", key, toml_quote(value));
+}
+
+template <typename T>
+auto append_toml_scalar(std::string &out, std::string_view key, const T &value)
+    -> void {
+  out += std::format("{} = {}\n", key, value);
+}
+
+auto append_toml_bool(std::string &out, std::string_view key, bool value)
+    -> void {
+  out += std::format("{} = {}\n", key, value ? "true" : "false");
+}
+
+auto append_task_array(std::string &out, std::string_view key,
+                       const std::vector<std::string> &items) -> void {
+  if (items.empty()) {
+    return;
   }
-  if (!raw.working_dir.empty()) {
-    task.working_dir = raw.working_dir;
+  out += std::format("{} = [", key);
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    if (i > 0) {
+      out += ", ";
+    }
+    out += items[i];
   }
-  if (raw.timeout > 0) {
-    const int timeout_sec = raw.timeout;
-    task.execution_timeout = std::chrono::seconds(timeout_sec);
+  out += "]\n";
+}
+
+auto append_task_toml(std::string &out, const TaskConfig &task) -> void {
+  out += "\n[[tasks]]\n";
+  append_toml_string(out, "id", task.task_id.str());
+  if (!task.name.empty() && task.name != task.task_id.str()) {
+    append_toml_string(out, "name", task.name);
   }
-  if (raw.retry_interval > 0) {
-    const int retry_interval_sec = raw.retry_interval;
-    task.retry_interval = std::chrono::seconds(retry_interval_sec);
+  if (!task.command.empty()) {
+    append_toml_string(out, "command", task.command);
   }
-  if (raw.max_retries >= 0) {
-    task.max_retries = raw.max_retries;
+  if (!task.working_dir.empty()) {
+    append_toml_string(out, "working_dir", task.working_dir);
   }
-  if (!raw.trigger_rule.empty()) {
-    task.trigger_rule = parse<TriggerRule>(raw.trigger_rule);
+  append_toml_string(out, "executor", enum_to_string(task.executor));
+  append_toml_scalar(out, "timeout",
+                     static_cast<int>(task.execution_timeout.count()));
+  append_toml_scalar(out, "retry_interval",
+                     static_cast<int>(task.retry_interval.count()));
+  append_toml_scalar(out, "max_retries", task.max_retries);
+  append_toml_string(out, "trigger_rule", enum_to_string(task.trigger_rule));
+  if (task.is_branch) {
+    append_toml_bool(out, "is_branch", true);
+  }
+  if (!task.branch_xcom_key.empty() && task.branch_xcom_key != "branch") {
+    append_toml_string(out, "branch_xcom_key", task.branch_xcom_key);
+  }
+  if (task.depends_on_past) {
+    append_toml_bool(out, "depends_on_past", true);
   }
 
-  task.is_branch = raw.is_branch;
-  if (!raw.branch_xcom_key.empty()) {
-    task.branch_xcom_key = raw.branch_xcom_key;
+  if (!task.dependencies.empty()) {
+    std::vector<std::string> deps;
+    deps.reserve(task.dependencies.size());
+    for (const auto &dep : task.dependencies) {
+      deps.push_back(toml_quote(dep.task_id.str()));
+    }
+    append_task_array(out, "dependencies", deps);
   }
-  if (raw.depends_on_past) {
-    task.depends_on_past = true;
+  if (const auto *docker = task.executor_config.as<DockerExecutorConfig>()) {
+    if (!docker->image.empty()) {
+      append_toml_string(out, "docker_image", docker->image);
+    }
+    if (!docker->docker_socket.empty()) {
+      append_toml_string(out, "docker_socket", docker->docker_socket);
+    }
+    append_toml_string(out, "pull_policy", enum_to_string(docker->pull_policy));
+  } else if (const auto *sensor =
+                 task.executor_config.as<SensorExecutorConfig>()) {
+    append_toml_string(out, "sensor_type", enum_to_string(sensor->type));
+    append_toml_scalar(out, "sensor_interval",
+                       static_cast<int>(sensor->poke_interval.count()));
+    if (sensor->soft_fail) {
+      append_toml_bool(out, "soft_fail", true);
+    }
+    append_toml_scalar(out, "sensor_expected_status", sensor->expected_status);
+    if (!sensor->http_method.empty()) {
+      append_toml_string(out, "sensor_http_method", sensor->http_method);
+    }
+    if (!sensor->target.empty()) {
+      append_toml_string(out, "sensor_target", sensor->target);
+    }
   }
-
-  task.dependencies = parse_dependencies(raw.dependencies);
-  task.xcom_push = parse_xcom_push(raw.xcom_push);
-  task.xcom_pull = parse_xcom_pull(raw.xcom_pull);
-  task.executor_config =
-      parse_executor_config(raw, task.executor, task.command);
-
-  return ok(std::move(task));
 }
 
 [[nodiscard]] auto validate_definition(const DAGDefinition &def)
@@ -390,7 +524,8 @@ parse_xcom_pull(const std::vector<detail::XComPullToml> &pull)
       errors.emplace_back(std::format("Duplicate task ID: '{}'", task.task_id));
     }
 
-    if (task.command.empty()) {
+    if (task.command.empty() && task.executor != ExecutorType::Sensor &&
+        task.executor != ExecutorType::Noop) {
       errors.emplace_back(
           std::format("Task '{}': command cannot be empty", task.task_id));
     }
@@ -408,25 +543,7 @@ parse_xcom_pull(const std::vector<detail::XComPullToml> &pull)
           "Task '{}': negative max retries not allowed", task.task_id));
     }
 
-    if (task.executor == ExecutorType::Docker) {
-      if (const auto *docker =
-              std::get_if<DockerTaskConfig>(&task.executor_config)) {
-        if (docker->image.empty()) {
-          errors.emplace_back(std::format(
-              "Task '{}': docker image cannot be empty", task.task_id));
-        }
-      }
-    }
-
-    if (task.executor == ExecutorType::Sensor) {
-      if (const auto *sensor =
-              std::get_if<SensorTaskConfig>(&task.executor_config)) {
-        if (sensor->target.empty()) {
-          errors.emplace_back(std::format(
-              "Task '{}': sensor target cannot be empty", task.task_id));
-        }
-      }
-    }
+    ExecutorRegistry::instance().validate_task(task, errors);
   }
 
   for (const auto &task : def.tasks) {
@@ -465,13 +582,12 @@ parse_xcom_pull(const std::vector<detail::XComPullToml> &pull)
 [[nodiscard]] auto parse_definition_from_text(std::string_view text,
                                               std::string *diagnostic)
     -> Result<DAGInfo> {
-  auto raw_result = toml_util::parse_toml<detail::DAGToml>(text, diagnostic);
+  auto raw_result = toml_util::parse_toml<detail::ParsedDagToml>(text, diagnostic);
   if (!raw_result)
     return fail(raw_result.error());
-  auto &raw = *raw_result;
+  auto raw = std::move(*raw_result);
 
-  DAGInfo dag{};
-  if (raw.id.empty()) {
+  if (raw.dag.dag_id.empty()) {
     constexpr auto kErr =
         "DAG parse error: missing required top-level field 'id'\n"
         "Hint: add `id = \"your_dag_id\"` before any [[tasks]] section.";
@@ -481,21 +597,15 @@ parse_xcom_pull(const std::vector<detail::XComPullToml> &pull)
     }
     return fail(Error::InvalidArgument);
   }
-  dag.dag_id = DAGId(raw.id);
-  dag.name = raw.name.empty() ? raw.id : raw.name;
-  dag.description = raw.description;
-  dag.cron = raw.cron;
-  dag.catchup = raw.catchup;
-  dag.max_concurrent_runs = raw.max_active_runs;
-  dag.start_date = parse_days_timepoint(raw.start_date);
-  dag.end_date = parse_days_timepoint(raw.end_date);
-
-  auto defaults = parse_defaults(raw.default_args);
+  auto dag = std::move(raw.dag);
+  if (dag.name.empty()) {
+    dag.name = dag.dag_id.str();
+  }
 
   dag.tasks.reserve(raw.tasks.size());
   for (std::size_t i = 0; i < raw.tasks.size(); ++i) {
-    const auto &task_raw = raw.tasks[i];
-    if (task_raw.id.empty()) {
+    auto &parsed_task = raw.tasks[i];
+    if (parsed_task.task.task_id.empty()) {
       if (diagnostic) {
         *diagnostic = std::format(
             "DAG parse error: task #{} is missing required field 'id'\n"
@@ -504,15 +614,22 @@ parse_xcom_pull(const std::vector<detail::XComPullToml> &pull)
       }
       return fail(Error::InvalidArgument);
     }
-
-    auto parsed = parse_task(task_raw, defaults);
-    if (!parsed) {
-      if (diagnostic) {
-        *diagnostic = parsed.error().message();
+    apply_task_defaults(parsed_task.task, raw.default_args,
+                        parsed_task.presence);
+    parsed_task.task.dependencies =
+        materialize_task_dependencies(parsed_task.dependencies);
+    parsed_task.task.xcom_push = std::move(parsed_task.xcom_push);
+    for (auto &push : parsed_task.task.xcom_push) {
+      if (auto compiled = push.compile_regex(); !compiled) {
+        if (diagnostic) {
+          *diagnostic = "DAG parse error: invalid xcom_push regex";
+        }
+        return fail(compiled.error());
       }
-      return fail(parsed.error());
     }
-    dag.tasks.emplace_back(std::move(*parsed));
+    parsed_task.task.xcom_pull = std::move(parsed_task.xcom_pull);
+    finalize_task(parsed_task.task);
+    dag.tasks.emplace_back(std::move(parsed_task.task));
   }
 
   auto now = std::chrono::system_clock::now();
@@ -574,6 +691,7 @@ auto DAGDefinitionLoader::load_from_string(std::string_view toml_str,
     }
     return fail(Error::ParseError);
   } catch (...) {
+    log::error("TOML parse error: unknown exception");
     if (diagnostic) {
       *diagnostic = "unknown parse error";
     }
@@ -582,45 +700,33 @@ auto DAGDefinitionLoader::load_from_string(std::string_view toml_str,
 }
 
 auto DAGDefinitionLoader::to_string(const DAGInfo &dag) -> std::string {
-  detail::DAGToml raw{};
-  raw.id = dag.dag_id.str();
-  raw.name = dag.name;
-  raw.description = dag.description;
-  raw.cron = dag.cron;
-  raw.catchup = dag.catchup;
-  raw.max_active_runs = dag.max_concurrent_runs;
+  std::string out;
+  out.reserve(512 + dag.tasks.size() * 256);
 
-  // default_args are not stored in DAGInfo — use task-level values
-  raw.default_args = detail::TaskDefaultsToml{};
+  append_toml_string(out, "id", dag.dag_id.str());
+  append_toml_string(out, "name", dag.name);
+  if (!dag.description.empty()) {
+    append_toml_string(out, "description", dag.description);
+  }
+  if (!dag.cron.empty()) {
+    append_toml_string(out, "cron", dag.cron);
+  }
+  if (dag.start_date) {
+    append_toml_string(out, "start_date",
+                       toml_util::format_date_yyyy_mm_dd(*dag.start_date));
+  }
+  if (dag.end_date) {
+    append_toml_string(out, "end_date",
+                       toml_util::format_date_yyyy_mm_dd(*dag.end_date));
+  }
+  append_toml_scalar(out, "max_active_runs", dag.max_concurrent_runs);
+  append_toml_bool(out, "catchup", dag.catchup);
 
-  raw.tasks.reserve(dag.tasks.size());
-  for (const auto &t : dag.tasks) {
-    detail::TaskToml task_raw{};
-    task_raw.id = t.task_id.str();
-    task_raw.name = t.name;
-    task_raw.command = t.command;
-    task_raw.executor = enum_to_string(t.executor);
-    task_raw.timeout = static_cast<int>(t.execution_timeout.count());
-    task_raw.retry_interval = static_cast<int>(t.retry_interval.count());
-    task_raw.max_retries = t.max_retries;
-    task_raw.trigger_rule = enum_to_string(t.trigger_rule);
-    task_raw.is_branch = t.is_branch;
-    task_raw.depends_on_past = t.depends_on_past;
-    task_raw.working_dir = t.working_dir;
-
-    for (const auto &dep : t.dependencies) {
-      task_raw.dependencies.emplace_back(dep.task_id.str());
-    }
-
-    raw.tasks.emplace_back(std::move(task_raw));
+  for (const auto &task : dag.tasks) {
+    append_task_toml(out, task);
   }
 
-  auto result = glz::write_toml(raw);
-  if (result) {
-    return std::move(*result);
-  }
-  return std::format("id = \"{}\"\nname = \"{}\"\ncatchup = {}\n", dag.dag_id,
-                     dag.name, dag.catchup ? "true" : "false");
+  return out;
 }
 
 } // namespace dagforge

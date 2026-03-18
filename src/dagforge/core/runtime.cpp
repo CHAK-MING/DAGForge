@@ -10,9 +10,17 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <experimental/scope>
+#include <optional>
 #include <ranges>
 #include <thread>
 #include <vector>
+
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 namespace dagforge {
 
@@ -32,9 +40,30 @@ auto for_each_shard(unsigned num_shards, Fn &&fn) -> void {
     fn(i);
   }
 }
+
+#ifdef __linux__
+[[nodiscard]] auto allowed_cpus_for_current_thread() -> std::vector<int> {
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  if (pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) {
+    return {};
+  }
+
+  std::vector<int> cpus;
+  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+    if (CPU_ISSET(cpu, &cpuset)) {
+      cpus.push_back(cpu);
+    }
+  }
+  return cpus;
+}
+#endif
 } // namespace
 
-Runtime::Runtime(unsigned num_shards) {
+Runtime::Runtime(unsigned num_shards, bool pin_shards_to_cores,
+                 unsigned cpu_affinity_offset)
+    : pin_shards_to_cores_(pin_shards_to_cores),
+      cpu_affinity_offset_(cpu_affinity_offset) {
   if (num_shards == 0) {
     num_shards = 4;
   }
@@ -46,6 +75,7 @@ Runtime::Runtime(unsigned num_shards) {
   drain_scheduled_.reserve(num_shards);
   pending_inbound_.reserve(num_shards);
   shard_last_tick_ms_.reserve(num_shards);
+  pinned_cpus_.assign(num_shards, -1);
   for (unsigned i = 0; i < num_shards; ++i) {
     drain_scheduled_.emplace_back(std::make_unique<std::atomic<bool>>(false));
     pending_inbound_.emplace_back(
@@ -108,6 +138,29 @@ auto Runtime::stop() noexcept -> void {
 
   // std::jthread auto-joins on destruction, just clear the vector
   threads_.clear();
+
+  // Cross-shard queue items are raw pointers; release any remaining thunks
+  // after all shard threads have stopped.
+  for (unsigned source = 0; source < num_shards_; ++source) {
+    for (unsigned target = 0; target < num_shards_; ++target) {
+      if (source == target) {
+        continue;
+      }
+      auto &q_ptr = inbound_queues_[source][target];
+      if (!q_ptr) {
+        continue;
+      }
+      QueueItem item = nullptr;
+      while (q_ptr->pop(item)) {
+        std::unique_ptr<CrossShardThunk> owned(item);
+        item = nullptr;
+      }
+    }
+  }
+  for (unsigned i = 0; i < num_shards_; ++i) {
+    pending_inbound_[i]->store(0, std::memory_order_release);
+    drain_scheduled_[i]->store(false, std::memory_order_release);
+  }
 }
 
 auto Runtime::is_running() const noexcept -> bool {
@@ -128,21 +181,59 @@ auto Runtime::current_context() noexcept -> io::IoContext & {
 }
 
 auto Runtime::run_shard(shard_id id) -> void {
+  bind_shard_thread_to_cpu(id);
   detail::current_shard_id = id;
   detail::current_runtime = this;
+  std::experimental::scope_exit reset_thread_locals{
+      [] {
+        detail::current_shard_id = kInvalidShard;
+        detail::current_runtime = nullptr;
+      }};
 
   auto &ctx = shards_[id]->ctx();
   start_heartbeat_on_shard(id);
   // Drain any cross-shard work that arrived before this shard entered run().
   drain_inbound(id);
   ctx.run();
+}
 
-  detail::current_shard_id = kInvalidShard;
-  detail::current_runtime = nullptr;
+auto Runtime::bind_shard_thread_to_cpu(shard_id id) -> void {
+#ifdef __linux__
+  if (!pin_shards_to_cores_) {
+    pinned_cpus_[id] = -1;
+    return;
+  }
+
+  const auto allowed = allowed_cpus_for_current_thread();
+  if (allowed.empty()) {
+    log::warn("Shard {} failed to query allowed CPUs for affinity", id);
+    pinned_cpus_[id] = -1;
+    return;
+  }
+
+  const auto cpu =
+      allowed[(cpu_affinity_offset_ + static_cast<unsigned>(id)) % allowed.size()];
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(cpu, &cpuset);
+
+  if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) {
+    log::warn("Shard {} failed to bind to CPU {}: {}", id, cpu,
+              std::strerror(errno));
+    pinned_cpus_[id] = -1;
+    return;
+  }
+
+  pinned_cpus_[id] = cpu;
+  log::info("Shard {} bound to CPU {}", id, cpu);
+#else
+  (void)id;
+#endif
 }
 
 auto Runtime::enqueue_cross_shard(shard_id source, shard_id target,
-                                  QueueItem item) -> bool {
+                                  std::unique_ptr<CrossShardThunk> item)
+    -> bool {
   if (source == target || target >= num_shards_ || source >= num_shards_) {
     return false;
   }
@@ -150,9 +241,11 @@ auto Runtime::enqueue_cross_shard(shard_id source, shard_id target,
   if (!q_ptr) {
     return false;
   }
-  if (!q_ptr->push(std::move(item))) {
+  auto *raw = item.get();
+  if (!q_ptr->push(raw)) {
     return false;
   }
+  item.release();
   pending_inbound_[target]->fetch_add(1, std::memory_order_release);
   schedule_drain(target);
   return true;
@@ -178,6 +271,10 @@ auto Runtime::drain_inbound(shard_id target) -> void {
   }
 
   for (;;) {
+    // Each source->target mailbox is SPSC. We drain them all on the target
+    // shard thread, then clear the scheduled bit. If a sender races and marks
+    // new work after that point, the compare-exchange below re-arms exactly one
+    // follow-up drain without needing a strand or a global lock.
     for (unsigned source = 0; source < num_shards_; ++source) {
       if (source == target) {
         continue;
@@ -186,13 +283,14 @@ auto Runtime::drain_inbound(shard_id target) -> void {
       if (!q_ptr) {
         continue;
       }
-      QueueItem item;
+      QueueItem item = nullptr;
       while (q_ptr->pop(item)) {
         if (item) {
           pending_inbound_[target]->fetch_sub(1, std::memory_order_acquire);
-          item->run(*this, target);
+          std::unique_ptr<CrossShardThunk> owned(item);
+          owned->run(*this, target);
         }
-        item.reset();
+        item = nullptr;
       }
     }
 
@@ -237,6 +335,13 @@ auto Runtime::stall_age_ms(shard_id id) const -> std::uint64_t {
       shard_last_tick_ms_[id]->load(std::memory_order_acquire);
   const auto now_ms = now_monotonic_ms();
   return now_ms >= last_tick ? (now_ms - last_tick) : 0;
+}
+
+auto Runtime::pinned_cpu_for_shard(shard_id id) const noexcept -> int {
+  if (id >= num_shards_) {
+    return -1;
+  }
+  return pinned_cpus_[id];
 }
 
 auto Runtime::start_heartbeat_on_shard(shard_id id) -> void {

@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS task_instances (
     state TINYINT UNSIGNED NOT NULL DEFAULT 0,
     worker_id VARCHAR(128) NOT NULL DEFAULT '',
     last_heartbeat BIGINT NOT NULL DEFAULT 0,
+    execution_date BIGINT NOT NULL DEFAULT 0,
     started_at BIGINT NOT NULL DEFAULT 0,
     finished_at BIGINT NOT NULL DEFAULT 0,
     updated_at BIGINT NOT NULL DEFAULT 0,
@@ -99,6 +100,8 @@ CREATE TABLE IF NOT EXISTS task_instances (
     PRIMARY KEY (run_rowid, task_rowid, attempt),
     INDEX idx_ti_state (state),
     INDEX idx_ti_worker (worker_id),
+    INDEX idx_ti_queue (state, execution_date),
+    INDEX idx_ti_history (task_rowid, execution_date, attempt),
     INDEX idx_ti_state_heartbeat (state, last_heartbeat),
     CONSTRAINT fk_ti_run FOREIGN KEY (run_rowid) REFERENCES dag_runs(run_rowid) ON DELETE CASCADE,
     CONSTRAINT fk_ti_task FOREIGN KEY (task_rowid) REFERENCES dag_tasks(task_rowid) ON DELETE CASCADE

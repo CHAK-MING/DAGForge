@@ -5,6 +5,7 @@
 #include <concepts>
 #include <format>
 #include <functional>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <string_view>
@@ -111,93 +112,23 @@ inline auto operator<<(std::ostream &os, const TypedId<Tag> &id)
 
 } // namespace dagforge
 
-// --- std::hash specializations ---
+// --- std::hash specialization ---
 // `is_avalanching` tells ankerl::unordered_dense::hash to delegate to
 // std::hash<TypedId<T>> instead of falling back to wyhash-over-raw-bytes
 // (which would hash the std::string internal pointers — UB / corruption).
-template <> struct std::hash<dagforge::TypedId<dagforge::DAGTag>> {
+template <typename Tag> struct std::hash<dagforge::TypedId<Tag>> {
   using is_avalanching = void;
-  auto operator()(const dagforge::TypedId<dagforge::DAGTag> &id) const noexcept
+  auto operator()(const dagforge::TypedId<Tag> &id) const noexcept
       -> std::size_t {
     return std::hash<std::string_view>{}(id.value());
   }
 };
 
-template <> struct std::hash<dagforge::TypedId<dagforge::TaskTag>> {
-  using is_avalanching = void;
-  auto operator()(const dagforge::TypedId<dagforge::TaskTag> &id) const noexcept
-      -> std::size_t {
-    return std::hash<std::string_view>{}(id.value());
-  }
-};
-
-template <> struct std::hash<dagforge::TypedId<dagforge::DAGTaskTag>> {
-  using is_avalanching = void;
-  auto
-  operator()(const dagforge::TypedId<dagforge::DAGTaskTag> &id) const noexcept
-      -> std::size_t {
-    return std::hash<std::string_view>{}(id.value());
-  }
-};
-
-template <> struct std::hash<dagforge::TypedId<dagforge::DAGRunTag>> {
-  using is_avalanching = void;
-  auto
-  operator()(const dagforge::TypedId<dagforge::DAGRunTag> &id) const noexcept
-      -> std::size_t {
-    return std::hash<std::string_view>{}(id.value());
-  }
-};
-
-template <> struct std::hash<dagforge::TypedId<dagforge::InstanceTag>> {
-  using is_avalanching = void;
-  auto
-  operator()(const dagforge::TypedId<dagforge::InstanceTag> &id) const noexcept
-      -> std::size_t {
-    return std::hash<std::string_view>{}(id.value());
-  }
-};
-
-// --- std::formatter specializations (before any std::format usage) ---
-template <>
-struct std::formatter<dagforge::TypedId<dagforge::DAGTag>>
+// --- std::formatter specialization (before any std::format usage) ---
+template <typename Tag>
+struct std::formatter<dagforge::TypedId<Tag>>
     : std::formatter<std::string_view> {
-  auto format(const dagforge::TypedId<dagforge::DAGTag> &id, auto &ctx) const {
-    return std::formatter<std::string_view>::format(id.value(), ctx);
-  }
-};
-
-template <>
-struct std::formatter<dagforge::TypedId<dagforge::TaskTag>>
-    : std::formatter<std::string_view> {
-  auto format(const dagforge::TypedId<dagforge::TaskTag> &id, auto &ctx) const {
-    return std::formatter<std::string_view>::format(id.value(), ctx);
-  }
-};
-
-template <>
-struct std::formatter<dagforge::TypedId<dagforge::DAGTaskTag>>
-    : std::formatter<std::string_view> {
-  auto format(const dagforge::TypedId<dagforge::DAGTaskTag> &id,
-              auto &ctx) const {
-    return std::formatter<std::string_view>::format(id.value(), ctx);
-  }
-};
-
-template <>
-struct std::formatter<dagforge::TypedId<dagforge::DAGRunTag>>
-    : std::formatter<std::string_view> {
-  auto format(const dagforge::TypedId<dagforge::DAGRunTag> &id,
-              auto &ctx) const {
-    return std::formatter<std::string_view>::format(id.value(), ctx);
-  }
-};
-
-template <>
-struct std::formatter<dagforge::TypedId<dagforge::InstanceTag>>
-    : std::formatter<std::string_view> {
-  auto format(const dagforge::TypedId<dagforge::InstanceTag> &id,
-              auto &ctx) const {
+  auto format(const dagforge::TypedId<Tag> &id, auto &ctx) const {
     return std::formatter<std::string_view>::format(id.value(), ctx);
   }
 };
@@ -208,21 +139,44 @@ namespace dagforge {
 namespace detail {
 [[nodiscard]] auto generate_short_uuid() -> std::string;
 [[nodiscard]] auto generate_uuid_v7_like() -> std::string;
+inline constexpr std::string_view kDagRunSeparator = "__";
 } // namespace detail
 
 inline auto generate_dag_task_id(const DAGId &dag_id, const TaskId &task_id)
     -> DAGTaskId {
-  return DAGTaskId{std::format("{}_{}", dag_id, task_id)};
+  std::string out;
+  out.reserve(dag_id.value().size() + 1 + task_id.value().size());
+  out.append(dag_id.value());
+  out.push_back('_');
+  out.append(task_id.value());
+  return DAGTaskId{std::move(out)};
 }
 
 inline auto generate_dag_run_id([[maybe_unused]] const DAGId &dag_id)
     -> DAGRunId {
-  return DAGRunId{detail::generate_uuid_v7_like()};
+  return DAGRunId{
+      std::format("{}{}{}", dag_id, detail::kDagRunSeparator,
+                  detail::generate_uuid_v7_like())};
+}
+
+[[nodiscard]] inline auto dag_id_from_run_id(const DAGRunId &dag_run_id)
+    -> std::optional<DAGId> {
+  auto value = dag_run_id.value();
+  auto pos = value.find(detail::kDagRunSeparator);
+  if (pos == std::string_view::npos || pos == 0) {
+    return std::nullopt;
+  }
+  return DAGId{value.substr(0, pos)};
 }
 
 inline auto generate_instance_id(const DAGRunId &dag_run_id,
                                  const TaskId &task_id) -> InstanceId {
-  return InstanceId{std::format("{}_{}", dag_run_id, task_id)};
+  std::string out;
+  out.reserve(dag_run_id.value().size() + 1 + task_id.value().size());
+  out.append(dag_run_id.value());
+  out.push_back('_');
+  out.append(task_id.value());
+  return InstanceId{std::move(out)};
 }
 
 } // namespace dagforge

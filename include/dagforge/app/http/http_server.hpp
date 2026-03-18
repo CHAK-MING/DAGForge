@@ -36,9 +36,9 @@ public:
                                          std::string private_key_file)
       -> Result<void>;
 
-  auto start(std::string_view host, uint16_t port) -> task<Result<void>>;
+  auto start(std::string_view host, uint16_t port) -> Result<void>;
   auto start(std::string_view host, uint16_t port, bool reuse_port)
-      -> task<Result<void>>;
+      -> Result<void>;
   auto stop() -> void;
 
   [[nodiscard]] auto is_running() const -> bool;

@@ -94,11 +94,16 @@ namespace {
   auto text_res = ok(std::move(source_text));
   if (!config.regex_pattern.empty()) {
     try {
-      std::regex re(config.regex_pattern);
       std::match_results<std::string::const_iterator> match;
       const auto &text = *text_res;
+      const std::regex *re = config.compiled_regex.get();
+      std::optional<std::regex> local_regex;
+      if (re == nullptr) {
+        local_regex.emplace(config.regex_pattern);
+        re = &*local_regex;
+      }
 
-      if (!std::regex_search(text.begin(), text.end(), match, re)) {
+      if (!std::regex_search(text.begin(), text.end(), match, *re)) {
         return fail(Error::NotFound);
       }
 

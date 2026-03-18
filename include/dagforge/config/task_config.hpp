@@ -8,9 +8,10 @@
 #include "dagforge/core/error.hpp"
 #include <boost/describe/enum.hpp>
 #include <chrono>
+#include <memory>
+#include <regex>
 #include <ranges>
 #include <string>
-#include <variant>
 #include <vector>
 
 namespace dagforge {
@@ -50,6 +51,20 @@ struct XComPushConfig {
   std::string json_path;
   std::string regex_pattern;
   int regex_group{0};
+  std::shared_ptr<const std::regex> compiled_regex;
+
+  [[nodiscard]] auto compile_regex() -> Result<void> {
+    if (regex_pattern.empty()) {
+      compiled_regex.reset();
+      return ok();
+    }
+    try {
+      compiled_regex = std::make_shared<const std::regex>(regex_pattern);
+      return ok();
+    } catch (const std::regex_error &) {
+      return fail(Error::InvalidArgument);
+    }
+  }
 };
 
 struct TaskDependency {
@@ -67,25 +82,9 @@ inline auto get_dep_task_ids(const std::vector<TaskDependency> &deps) {
          });
 }
 
-struct ShellTaskConfig {};
-
-struct DockerTaskConfig {
-  std::string image;
-  std::string socket{"/var/run/docker.sock"};
-  ImagePullPolicy pull_policy{ImagePullPolicy::Never};
-};
-
-struct SensorTaskConfig {
-  SensorType type{SensorType::File};
-  std::string target;
-  std::chrono::seconds poke_interval{std::chrono::seconds(30)};
-  bool soft_fail{false};
-  int expected_status{200};
-  std::string http_method{"GET"};
-};
-
-using ExecutorTaskConfig =
-    std::variant<ShellTaskConfig, DockerTaskConfig, SensorTaskConfig>;
+using ShellTaskConfig = ShellExecutorConfig;
+using DockerTaskConfig = DockerExecutorConfig;
+using SensorTaskConfig = SensorExecutorConfig;
 
 struct TaskConfig {
   struct Builder;
@@ -98,7 +97,7 @@ struct TaskConfig {
   std::string working_dir;
   std::vector<TaskDependency> dependencies;
   ExecutorType executor{ExecutorType::Shell};
-  ExecutorTaskConfig executor_config{ShellTaskConfig{}};
+  ExecutorConfig executor_config{ShellExecutorConfig{}};
   std::chrono::seconds execution_timeout{task_defaults::kExecutionTimeout};
   std::chrono::seconds retry_interval{task_defaults::kRetryInterval};
   int max_retries{task_defaults::kMaxRetries};
@@ -145,7 +144,7 @@ struct TaskConfig::Builder {
     return std::move(*this);
   }
 
-  auto config(ExecutorTaskConfig cfg) -> Builder && {
+  auto config(ExecutorConfig cfg) -> Builder && {
     config_.executor_config = std::move(cfg);
     return std::move(*this);
   }
@@ -194,8 +193,14 @@ struct TaskConfig::Builder {
       }
       config_.task_id = TaskId{config_.name};
     }
-    if (config_.command.empty() && config_.executor != ExecutorType::Sensor) {
+    if (config_.command.empty() && config_.executor != ExecutorType::Sensor &&
+        config_.executor != ExecutorType::Noop) {
       return fail(Error::InvalidArgument);
+    }
+    for (auto &push : config_.xcom_push) {
+      if (auto compiled = push.compile_regex(); !compiled) {
+        return fail(compiled.error());
+      }
     }
     return ok(std::move(config_));
   }

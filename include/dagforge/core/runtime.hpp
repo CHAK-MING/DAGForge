@@ -1,5 +1,6 @@
 #pragma once
 
+#include "dagforge/core/memory.hpp"
 #include "dagforge/core/coroutine.hpp"
 #include "dagforge/core/error.hpp"
 #include "dagforge/core/shard.hpp"
@@ -7,9 +8,6 @@
 #include <boost/asio/bind_allocator.hpp>
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/recycling_allocator.hpp>
-#include <boost/asio/this_coro.hpp>
-#include <boost/asio/use_awaitable.hpp>
 #include <boost/lockfree/spsc_queue.hpp>
 
 #include <algorithm>
@@ -20,7 +18,6 @@
 #include <functional>
 #include <limits>
 #include <memory>
-#include <memory_resource>
 #include <span>
 #include <thread>
 #include <vector>
@@ -31,7 +28,8 @@ inline constexpr shard_id kInvalidShard = std::numeric_limits<shard_id>::max();
 
 class Runtime {
 public:
-  explicit Runtime(unsigned num_shards = 0);
+  explicit Runtime(unsigned num_shards = 0, bool pin_shards_to_cores = false,
+                   unsigned cpu_affinity_offset = 0);
   ~Runtime() noexcept;
 
   Runtime(const Runtime &) = delete;
@@ -45,20 +43,22 @@ public:
   /// preferred way to spawn work — replaces `coro.take() + schedule_on()`.
   template <typename T> auto spawn_on(shard_id target, task<T> coro) -> void {
     assert(target < num_shards_);
-    if (is_current_shard()) {
-      auto source = current_shard();
-      if (source != kInvalidShard && source != target) {
-        if (enqueue_cross_shard(
-                source, target,
-                std::make_shared<SpawnThunk<T>>(std::move(coro)))) {
-          return;
-        }
-      }
-    }
-    auto alloc = std::pmr::polymorphic_allocator<std::byte>{
-        shards_[target]->memory_resource()};
-    co_spawn(shards_[target]->ctx().get_executor(), std::move(coro),
-             boost::asio::bind_allocator(alloc, detached));
+    submit_to_shard(
+        target,
+        [&]() {
+          return std::make_unique<CrossShardThunk>(
+              [coro = std::move(coro)](Runtime &rt, shard_id queued_target) mutable {
+                Allocator alloc{rt.shards_[queued_target]->memory_resource()};
+                co_spawn(rt.shards_[queued_target]->ctx().get_executor(),
+                         std::move(coro),
+                         boost::asio::bind_allocator(alloc, detached));
+              });
+        },
+        [&]() {
+          Allocator alloc{shards_[target]->memory_resource()};
+          co_spawn(shards_[target]->ctx().get_executor(), std::move(coro),
+                   boost::asio::bind_allocator(alloc, detached));
+        });
   }
 
   /// Launch an awaitable coroutine on the current shard's executor.
@@ -82,6 +82,7 @@ public:
   }
   [[nodiscard]] auto pending_cross_shard_queue_length() const -> std::size_t;
   [[nodiscard]] auto stall_age_ms(shard_id id) const -> std::uint64_t;
+  [[nodiscard]] auto pinned_cpu_for_shard(shard_id id) const noexcept -> int;
 
   [[nodiscard]] auto current_shard() const noexcept -> shard_id;
   [[nodiscard]] auto is_current_shard() const noexcept -> bool;
@@ -102,19 +103,16 @@ public:
   /// The callable must be copyable or moveable and takes no arguments.
   template <typename F> auto post_to(shard_id target, F &&fn) -> void {
     assert(target < num_shards_);
-    if (is_current_shard()) {
-      auto source = current_shard();
-      if (source != kInvalidShard && source != target) {
-        using Fn = std::decay_t<F>;
-        if (enqueue_cross_shard(
-                source, target,
-                std::make_shared<PostThunk<Fn>>(std::forward<F>(fn)))) {
-          return;
-        }
-      }
-    }
-    boost::asio::post(shards_[target]->ctx().get_executor(),
-                      std::forward<F>(fn));
+    submit_to_shard(
+        target,
+        [&]() {
+          return std::make_unique<CrossShardThunk>(
+              [fn = std::forward<F>(fn)](Runtime &, shard_id) mutable { fn(); });
+        },
+        [&]() {
+          boost::asio::post(shards_[target]->ctx().get_executor(),
+                            std::forward<F>(fn));
+        });
   }
 
   /// Post a copy of a callable to every shard's executor (Seastar-style
@@ -127,43 +125,56 @@ public:
   }
 
 private:
-  struct CrossShardThunk {
-    virtual ~CrossShardThunk() = default;
-    virtual auto run(Runtime &rt, shard_id target) -> void = 0;
-  };
-
-  template <typename Fn> struct PostThunk final : CrossShardThunk {
-    explicit PostThunk(Fn &&fn_) : fn(std::forward<Fn>(fn_)) {}
-    auto run(Runtime &, shard_id) -> void override { fn(); }
-    Fn fn;
-  };
-
-  template <typename T> struct SpawnThunk final : CrossShardThunk {
-    explicit SpawnThunk(task<T> &&coro_) : coro(std::move(coro_)) {}
-    auto run(Runtime &rt, shard_id target) -> void override {
-      auto alloc = std::pmr::polymorphic_allocator<std::byte>{
-          rt.shards_[target]->memory_resource()};
-      co_spawn(rt.shards_[target]->ctx().get_executor(), std::move(coro),
-               boost::asio::bind_allocator(alloc, detached));
+  template <typename ThunkFactory, typename DirectFn>
+  auto submit_to_shard(shard_id target, ThunkFactory &&make_thunk,
+                       DirectFn &&direct_submit) -> void {
+    if (is_current_shard()) {
+      auto source = current_shard();
+      if (source != kInvalidShard && source != target) {
+        auto thunk = make_thunk();
+        if (enqueue_cross_shard(source, target, std::move(thunk))) {
+          return;
+        }
+        // Enqueue failed (queue full): run directly on target shard.
+        thunk->run(*this, target);
+        return;
+      }
     }
-    task<T> coro;
+    direct_submit();
+  }
+
+  struct CrossShardThunk {
+    explicit CrossShardThunk(
+        std::move_only_function<void(Runtime &, shard_id)> fn_)
+        : fn(std::move(fn_)) {}
+
+    auto run(Runtime &rt, shard_id target) -> void { fn(rt, target); }
+
+    std::move_only_function<void(Runtime &, shard_id)> fn;
   };
 
-  using QueueItem = std::shared_ptr<CrossShardThunk>;
+  using QueueItem = CrossShardThunk *;
+  // Cross-shard dispatch uses one SPSC mailbox per source/target pair.
+  // A strand only serializes handlers already scheduled onto one executor;
+  // it does not replace the cross-thread handoff we need here.
   using PairQueue =
       boost::lockfree::spsc_queue<QueueItem, boost::lockfree::capacity<4096>>;
 
   [[nodiscard]] auto enqueue_cross_shard(shard_id source, shard_id target,
-                                         QueueItem item) -> bool;
+                                         std::unique_ptr<CrossShardThunk> item)
+      -> bool;
   auto schedule_drain(shard_id target) -> void;
   auto drain_inbound(shard_id target) -> void;
   [[nodiscard]] auto has_pending_for_target(shard_id target) const -> bool;
   auto run_shard(shard_id id) -> void;
+  auto bind_shard_thread_to_cpu(shard_id id) -> void;
   auto start_stall_detection() -> void;
   auto stop_stall_detection() -> void;
   auto start_heartbeat_on_shard(shard_id id) -> void;
 
   alignas(64) std::atomic<bool> running_{false};
+  bool pin_shards_to_cores_{false};
+  unsigned cpu_affinity_offset_{0};
   unsigned num_shards_;
   std::vector<std::unique_ptr<Shard>> shards_;
   std::vector<std::optional<
@@ -177,6 +188,7 @@ private:
       std::vector<std::unique_ptr<std::atomic<std::uint32_t>>> pending_inbound_;
   alignas(64) std::vector<
       std::unique_ptr<std::atomic<std::uint64_t>>> shard_last_tick_ms_;
+  std::vector<int> pinned_cpus_;
   alignas(64) std::atomic<bool> stop_requested_{false};
   alignas(64) std::atomic<std::uint64_t> external_rr_{0};
 };
@@ -185,17 +197,12 @@ private:
 namespace detail {
 inline thread_local shard_id current_shard_id = kInvalidShard;
 inline thread_local Runtime *current_runtime = nullptr;
+inline thread_local pmr::memory_resource *override_memory_resource = nullptr;
 } // namespace detail
 
 // ---------------------------------------------------------------------------
 // Free-function coroutine helpers
 // ---------------------------------------------------------------------------
-
-/// Yield execution back to the current shard's event loop (one cycle).
-[[nodiscard]] inline auto async_yield() -> spawn_task {
-  auto executor = co_await boost::asio::this_coro::executor;
-  co_await boost::asio::post(executor, boost::asio::use_awaitable);
-}
 
 [[nodiscard]] inline auto current_io_context() noexcept -> io::IoContext & {
   assert(detail::current_runtime != nullptr);
@@ -204,7 +211,10 @@ inline thread_local Runtime *current_runtime = nullptr;
 }
 
 [[nodiscard]] inline auto current_memory_resource() noexcept
-    -> std::pmr::memory_resource * {
+    -> pmr::memory_resource * {
+  if (detail::override_memory_resource != nullptr) {
+    return detail::override_memory_resource;
+  }
   assert(detail::current_runtime != nullptr);
   assert(detail::current_shard_id != kInvalidShard);
   return detail::current_runtime->shard(detail::current_shard_id)
@@ -212,14 +222,36 @@ inline thread_local Runtime *current_runtime = nullptr;
 }
 
 [[nodiscard]] inline auto current_memory_resource_or_default() noexcept
-    -> std::pmr::memory_resource * {
+    -> pmr::memory_resource * {
+  if (detail::override_memory_resource != nullptr) {
+    return detail::override_memory_resource;
+  }
   if (detail::current_runtime == nullptr ||
       detail::current_shard_id == kInvalidShard) {
-    return std::pmr::get_default_resource();
+    return pmr::get_default_resource();
   }
   return detail::current_runtime->shard(detail::current_shard_id)
       .memory_resource();
 }
+
+class ScopedMemoryResourceOverride {
+public:
+  explicit ScopedMemoryResourceOverride(pmr::memory_resource *resource)
+      : previous_(detail::override_memory_resource) {
+    detail::override_memory_resource = resource;
+  }
+
+  ScopedMemoryResourceOverride(const ScopedMemoryResourceOverride &) = delete;
+  auto operator=(const ScopedMemoryResourceOverride &)
+      -> ScopedMemoryResourceOverride & = delete;
+
+  ~ScopedMemoryResourceOverride() {
+    detail::override_memory_resource = previous_;
+  }
+
+private:
+  pmr::memory_resource *previous_;
+};
 
 template <typename Rep, typename Period>
 [[nodiscard]] inline auto

@@ -11,15 +11,22 @@
 #include "dagforge/storage/mysql_database.hpp"
 #include "dagforge/util/id.hpp"
 #include "dagforge/util/json.hpp"
+#include "dagforge/util/log.hpp"
 #include "dagforge/xcom/xcom_types.hpp"
 
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/experimental/concurrent_channel.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/post.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/thread_pool.hpp>
 #include <boost/asio/use_future.hpp>
 
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -47,14 +54,36 @@ public:
   [[nodiscard]] auto is_open() const noexcept -> bool;
   template <typename T>
   [[nodiscard]] auto sync_wait(task<Result<T>> op) -> Result<T> {
-    auto fut = boost::asio::co_spawn(db_pool_.get_executor(), std::move(op),
-                                     boost::asio::use_future);
-    return fut.get();
+    boost::asio::io_context io;
+    auto fut = boost::asio::co_spawn(io, std::move(op), boost::asio::use_future);
+    while (fut.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+      io.run_one();
+    }
+    io.restart();
+    try {
+      return fut.get();
+    } catch (const std::future_error &e) {
+      log::error("PersistenceService sync_wait failed: {}", e.what());
+      return fail(Error::Unknown);
+    } catch (const std::exception &e) {
+      log::error("PersistenceService sync_wait failed: {}", e.what());
+      return fail(Error::Unknown);
+    }
   }
   auto sync_wait(task<void> op) -> void {
-    auto fut = boost::asio::co_spawn(db_pool_.get_executor(), std::move(op),
-                                     boost::asio::use_future);
-    fut.get();
+    boost::asio::io_context io;
+    auto fut = boost::asio::co_spawn(io, std::move(op), boost::asio::use_future);
+    while (fut.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+      io.run_one();
+    }
+    io.restart();
+    try {
+      fut.get();
+    } catch (const std::future_error &e) {
+      log::error("PersistenceService sync_wait(void) failed: {}", e.what());
+    } catch (const std::exception &e) {
+      log::error("PersistenceService sync_wait(void) failed: {}", e.what());
+    }
   }
 
   // DAG management
@@ -87,6 +116,22 @@ public:
   create_run_with_task_instances(DAGRun run,
                                  std::vector<TaskInstanceInfo> instances)
       -> task<Result<int64_t>>;
+  [[nodiscard]] auto trigger_batch_queue_depth() const noexcept -> std::size_t;
+  [[nodiscard]] auto trigger_batch_last_size() const noexcept -> std::size_t;
+  [[nodiscard]] auto trigger_batch_last_linger_us() const noexcept
+      -> std::uint64_t;
+  [[nodiscard]] auto trigger_batch_last_flush_ms() const noexcept
+      -> std::uint64_t;
+  [[nodiscard]] auto trigger_batch_requests_total() const noexcept
+      -> std::uint64_t;
+  [[nodiscard]] auto trigger_batch_commits_total() const noexcept
+      -> std::uint64_t;
+  [[nodiscard]] auto trigger_batch_fallback_total() const noexcept
+      -> std::uint64_t;
+  [[nodiscard]] auto trigger_batch_rejected_total() const noexcept
+      -> std::uint64_t;
+  [[nodiscard]] auto trigger_batch_wakeup_lag_us() const noexcept
+      -> std::uint64_t;
 
   // Task instance persistence
   // ---------------------------------------------------
@@ -116,7 +161,7 @@ public:
   // XCom
   // ------------------------------------------------------------------------
   [[nodiscard]] auto save_xcom(const DAGRunId &run_id, const TaskId &task_id,
-                               std::string_view key, const JsonValue &value)
+                               std::string key, const JsonValue &value)
       -> task<Result<void>>;
   [[nodiscard]] auto get_xcom(const DAGRunId &run_id, const TaskId &task_id,
                               std::string_view key) -> task<Result<XComEntry>>;
@@ -137,6 +182,10 @@ public:
       -> task<Result<std::vector<RunHistoryEntry>>>;
   [[nodiscard]] auto has_dag_run(const DAGId &dag_id, TimePoint execution_date)
       -> task<Result<bool>>;
+  [[nodiscard]] auto list_dag_run_execution_dates(const DAGId &dag_id,
+                                                  TimePoint start,
+                                                  TimePoint end)
+      -> task<Result<std::vector<TimePoint>>>;
   [[nodiscard]] auto get_last_execution_date(const DAGId &dag_id)
       -> task<Result<TimePoint>>;
 
@@ -153,8 +202,7 @@ public:
 
   // Previous task state (for trigger-rule cross-run checks)
   // --------------------
-  [[nodiscard]] auto get_previous_task_state(const DAGId &dag_id,
-                                             const TaskId &task_id,
+  [[nodiscard]] auto get_previous_task_state(std::int64_t task_rowid,
                                              TimePoint current_execution_date,
                                              const DAGRunId &current_run_id)
       -> task<Result<TaskState>>;
@@ -167,7 +215,7 @@ public:
   // ---------------------------------------------------------------
   [[nodiscard]] auto
   append_task_log(const DAGRunId &run_id, const TaskId &task_id, int attempt,
-                  std::string_view stream, std::string_view content)
+                  std::string stream, std::string content)
       -> task<Result<void>>;
   [[nodiscard]] auto get_task_logs(const DAGRunId &run_id,
                                    const TaskId &task_id, int attempt,
@@ -182,7 +230,42 @@ public:
   auto clear_all_dag_data() -> task<Result<void>>;
 
 private:
+  struct CreateRunBatchRequest;
+  using CreateRunBatchRequestPtr = std::shared_ptr<CreateRunBatchRequest>;
+  using CreateRunBatchQueue = boost::asio::experimental::concurrent_channel<
+      boost::asio::any_io_executor,
+      void(boost::system::error_code, CreateRunBatchRequestPtr)>;
+  using CreateRunBatchReply = boost::asio::experimental::concurrent_channel<
+      boost::asio::any_io_executor, void(boost::system::error_code, Result<int64_t>)>;
+
+  struct CreateRunBatchRequest {
+    RunInsertBundle bundle;
+    boost::asio::any_io_executor caller_executor;
+    std::shared_ptr<CreateRunBatchReply> reply;
+  };
+
+  auto trigger_batch_writer_loop() -> spawn_task;
+  auto flush_trigger_batch(
+      boost::mysql::any_connection &conn,
+      std::vector<CreateRunBatchRequestPtr> batch,
+      std::chrono::steady_clock::time_point first_enqueued_at) -> task<void>;
+  auto publish_batch_result(const CreateRunBatchRequestPtr &request,
+                            Result<int64_t> result,
+                            std::chrono::steady_clock::time_point commit_done)
+      -> void;
+
   boost::asio::thread_pool db_pool_;
+  CreateRunBatchQueue create_run_batch_queue_;
+  std::atomic<bool> trigger_batch_writer_running_{false};
+  std::atomic<std::size_t> trigger_batch_queue_depth_{0};
+  std::atomic<std::size_t> trigger_batch_last_size_{0};
+  std::atomic<std::uint64_t> trigger_batch_last_linger_us_{0};
+  std::atomic<std::uint64_t> trigger_batch_last_flush_ms_{0};
+  std::atomic<std::uint64_t> trigger_batch_requests_total_{0};
+  std::atomic<std::uint64_t> trigger_batch_commits_total_{0};
+  std::atomic<std::uint64_t> trigger_batch_fallback_total_{0};
+  std::atomic<std::uint64_t> trigger_batch_rejected_total_{0};
+  std::atomic<std::uint64_t> trigger_batch_wakeup_lag_us_{0};
   storage::MySQLDatabase db_;
 };
 

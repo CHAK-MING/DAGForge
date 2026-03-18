@@ -61,6 +61,11 @@ using XComMap =
 
 class XComCache {
 public:
+  // Thread-safety:
+  // This cache is intentionally unsynchronized. It is expected to live inside
+  // shard-local / run-local state and be accessed only from the owning shard's
+  // event loop thread. Callers that want cross-thread access must provide their
+  // own external synchronization.
   struct CacheKey {
     DAGRunId run_id;
     TaskId task_id;

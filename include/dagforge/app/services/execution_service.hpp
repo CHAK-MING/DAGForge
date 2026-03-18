@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <deque>
 #include <flat_map>
 #include <functional>
 #include <map>
@@ -88,8 +89,8 @@ public:
 
   struct RunContext {
     std::unique_ptr<DAGRun> run;
-    std::vector<ExecutorConfig> executor_configs;
-    std::vector<TaskConfig> task_configs;
+    std::shared_ptr<const std::vector<ExecutorConfig>> executor_configs;
+    std::shared_ptr<const std::vector<TaskConfig>> task_configs;
     std::optional<DAGId> dag_id;
   };
 
@@ -110,6 +111,8 @@ public:
   auto wait_for_completion_async(int timeout_ms) -> task<void>;
 
   [[nodiscard]] auto coro_count() const -> int;
+  [[nodiscard]] auto dispatch_invocations() const -> std::uint64_t;
+  [[nodiscard]] auto dispatch_scan_invocations() const -> std::uint64_t;
 
   auto set_max_concurrency(int max_concurrency) -> void;
 
@@ -118,6 +121,9 @@ public:
   [[nodiscard]] auto template_resolver() noexcept -> TemplateResolver & {
     return template_resolver_;
   }
+  auto emit_log_chunk(const DAGRunId &dag_run_id, const TaskId &task_id,
+                      int attempt, std::string_view stream,
+                      std::string_view msg) -> void;
 
   struct TaskJob {
     NodeIndex idx{kInvalidNode};
@@ -132,10 +138,34 @@ public:
 private:
   struct ActiveRunState {
     std::unique_ptr<DAGRun> run;
-    std::vector<ExecutorConfig> executor_configs;
-    std::vector<TaskConfig> task_configs;
+    std::shared_ptr<const std::vector<ExecutorConfig>> executor_configs;
+    std::shared_ptr<const std::vector<TaskConfig>> task_configs;
     std::optional<DAGId> dag_id;
     std::map<std::pair<std::string, std::string>, JsonValue> xcom_cache;
+    bool dispatch_scheduled{false};
+    bool redispatch_requested{false};
+    bool queued_for_dispatch{false};
+  };
+
+  struct TransitionEffects {
+    std::optional<TaskInstanceInfo> persisted_task_info;
+    std::vector<TaskInstanceInfo> persisted_infos;
+    std::vector<std::pair<TaskId, TaskState>> status_updates;
+    std::shared_ptr<DAGRun> completed_snapshot;
+  };
+
+  using RunMap = std::flat_map<DAGRunId, ActiveRunState>;
+
+  // ---- Per-shard state (single-writer, no mutex needed on write path) ----
+  struct ShardState {
+    RunMap runs;
+    std::deque<DAGRunId> ready_run_queue;
+    bool dispatch_scan_scheduled{false};
+    bool dispatch_scan_requested{false};
+  };
+
+  struct alignas(64) QueueSizeCounter {
+    std::atomic<std::uint32_t> value{0};
   };
 
   auto dispatch(DAGRunId dag_run_id) -> task<Result<void>>;
@@ -147,28 +177,29 @@ private:
   auto on_task_success(const DAGRunId &dag_run_id, NodeIndex idx)
       -> task<Result<void>>;
   auto on_task_failure(const DAGRunId &dag_run_id, NodeIndex idx,
-                       std::string_view error, int exit_code) -> Result<bool>;
+                       std::string_view error, int exit_code, bool timed_out)
+      -> Result<bool>;
   auto on_task_skipped(const DAGRunId &dag_run_id, NodeIndex idx)
       -> Result<void>;
   auto on_task_fail_immediately(const DAGRunId &dag_run_id, NodeIndex idx,
                                 std::string_view error, int exit_code)
       -> Result<void>;
+  auto record_task_snapshot(const DAGRun &run, NodeIndex idx,
+                            TransitionEffects &effects) const -> void;
+  auto collect_propagated_terminal_updates(const DAGRun &run,
+                                           TransitionEffects &effects) const
+      -> void;
+  auto collect_failure_updates(const DAGRun &run,
+                               TransitionEffects &effects) const -> void;
+  auto complete_transition_if_needed(ShardState &state, RunMap::iterator it,
+                                     TransitionEffects &effects) -> void;
   auto finalize_task_transition(
-      const DAGRunId &dag_run_id,
-      std::optional<TaskInstanceInfo> persisted_info,
-      std::vector<TaskInstanceInfo> persisted_infos,
-      std::vector<std::pair<TaskId, TaskState>> status_updates,
-      std::shared_ptr<DAGRun> completed_run_snapshot) -> void;
+      const DAGRunId &dag_run_id, TransitionEffects effects) -> void;
   auto on_run_complete(DAGRun &run, const DAGRunId &dag_run_id) -> Result<void>;
   auto maybe_persist_task(const DAGRunId &dag_run_id,
                           const TaskInstanceInfo &info) -> void;
   auto maybe_persist_tasks(const DAGRunId &dag_run_id,
                            std::span<const TaskInstanceInfo> infos) -> void;
-
-  // ---- Per-shard state (single-writer, no mutex needed on write path) ----
-  struct ShardState {
-    std::flat_map<DAGRunId, ActiveRunState> runs;
-  };
 
   [[nodiscard]] auto owner_shard(const DAGRunId &dag_run_id) const noexcept
       -> shard_id;
@@ -179,6 +210,13 @@ private:
   }
   auto dispatch_pending_on_shard(shard_id sid) -> void;
   auto notify_capacity_available() -> void;
+  auto schedule_dispatch_scan(shard_id sid) -> void;
+  auto schedule_dispatch(const DAGRunId &dag_run_id) -> void;
+  auto enqueue_ready_run(ShardState &state, const DAGRunId &dag_run_id)
+      -> void;
+  auto schedule_dispatch_on_owner(ShardState &state, const DAGRunId &dag_run_id)
+      -> void;
+  auto finish_dispatch_cycle(shard_id sid, const DAGRunId &dag_run_id) -> void;
 
   Runtime &runtime_;
   IExecutor &executor_;
@@ -186,9 +224,13 @@ private:
   TemplateResolver template_resolver_;
 
   std::vector<ShardState> shard_states_;
+  std::vector<QueueSizeCounter> ready_run_queue_sizes_;
+  std::atomic<std::uint32_t> notify_rr_{0};
   std::atomic<int> active_run_count_{0};
   std::atomic<int> coro_count_{0};
   std::atomic<int> running_tasks_{0};
+  std::atomic<std::uint64_t> dispatch_invocations_{0};
+  std::atomic<std::uint64_t> dispatch_scan_invocations_{0};
   int max_concurrency_{100};
 
   friend struct ExecutionVisitor;

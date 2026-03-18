@@ -18,6 +18,26 @@ namespace {
 namespace beast = boost::beast;
 namespace beast_http = beast::http;
 
+auto method_to_string(HttpMethod method) -> std::string_view {
+  switch (method) {
+  case HttpMethod::GET:
+    return "GET";
+  case HttpMethod::POST:
+    return "POST";
+  case HttpMethod::PUT:
+    return "PUT";
+  case HttpMethod::DELETE:
+    return "DELETE";
+  case HttpMethod::PATCH:
+    return "PATCH";
+  case HttpMethod::OPTIONS:
+    return "OPTIONS";
+  case HttpMethod::HEAD:
+    return "HEAD";
+  }
+  return "GET";
+}
+
 auto to_response(
     const beast_http::response<beast_http::vector_body<uint8_t>> &msg)
     -> HttpResponse {
@@ -36,6 +56,10 @@ template <typename Stream>
 auto request_over_stream(Stream &stream, HttpRequest req,
                          HttpClientConfig config, const std::string &host)
     -> task<HttpResponse> {
+  const auto method = req.method;
+  const auto target = req.query_string.empty()
+                          ? req.path
+                          : std::format("{}?{}", req.path, req.query_string);
   if (!req.headers.contains("Host")) {
     req.headers["Host"] = host;
   }
@@ -49,7 +73,8 @@ auto request_over_stream(Stream &stream, HttpRequest req,
       boost::asio::cancel_after(config.read_timeout, use_nothrow));
   (void)written;
   if (write_ec) {
-    log::error("Failed to write request: {}", write_ec.message());
+    log::error("HTTP request write failed host={} method={} target={}: {}",
+               host, method_to_string(method), target, write_ec.message());
     co_return HttpResponse{
         .status = HttpStatus::InternalServerError, .headers = {}, .body = {}};
   }
@@ -64,7 +89,8 @@ auto request_over_stream(Stream &stream, HttpRequest req,
       boost::asio::cancel_after(config.read_timeout, use_nothrow));
   (void)read_n;
   if (read_ec) {
-    log::error("Failed to read response: {}", read_ec.message());
+    log::error("HTTP response read failed host={} method={} target={}: {}",
+               host, method_to_string(method), target, read_ec.message());
     co_return HttpResponse{
         .status = HttpStatus::InternalServerError, .headers = {}, .body = {}};
   }

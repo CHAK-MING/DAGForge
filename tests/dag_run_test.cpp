@@ -75,6 +75,21 @@ TEST_F(DAGRunTest, SetFinishedAt) {
   EXPECT_EQ(dag_run_->finished_at(), now);
 }
 
+TEST(DAGRunRowidTest, SetRunRowidPropagatesToTaskInfos) {
+  DAG dag;
+  ASSERT_TRUE(dag.add_node(TaskId{"task1"}, TriggerRule::AllSuccess).has_value());
+  auto run_result =
+      DAGRun::create(DAGRunId("rowid_run"), std::make_shared<DAG>(dag));
+  ASSERT_TRUE(run_result.has_value());
+
+  auto &run = *run_result;
+  run.set_run_rowid(42);
+
+  auto infos = run.all_task_info();
+  ASSERT_EQ(infos.size(), 1);
+  EXPECT_EQ(infos[0].run_rowid, 42);
+}
+
 TEST_F(DAGRunTest, TriggerTypeDefault) {
   EXPECT_EQ(dag_run_->trigger_type(), TriggerType::Manual);
 }
@@ -308,4 +323,61 @@ TEST_F(DAGRunTest, StringToTriggerType) {
   EXPECT_EQ(parse<TriggerType>("manual"), TriggerType::Manual);
   EXPECT_EQ(parse<TriggerType>("schedule"), TriggerType::Schedule);
   EXPECT_EQ(parse<TriggerType>("unknown"), TriggerType::Manual);
+}
+
+TEST_F(DAGRunTest, RestoreTaskInstanceCascadesThroughPendingDependents) {
+  DAG dag;
+  auto root = dag.add_node(TaskId("root"));
+  auto mid = dag.add_node(TaskId("mid"));
+  auto leaf = dag.add_node(TaskId("leaf"));
+  ASSERT_TRUE(root.has_value());
+  ASSERT_TRUE(mid.has_value());
+  ASSERT_TRUE(leaf.has_value());
+  ASSERT_TRUE(dag.add_edge(*root, *mid).has_value());
+  ASSERT_TRUE(dag.add_edge(*mid, *leaf).has_value());
+
+  auto run_result =
+      DAGRun::create(DAGRunId("restore_cascade"), std::make_shared<DAG>(dag));
+  ASSERT_TRUE(run_result.has_value());
+  auto &run = *run_result;
+
+  auto root_info = run.get_task_info(*root);
+  ASSERT_TRUE(root_info.has_value());
+  root_info->state = TaskState::Failed;
+  root_info->finished_at = std::chrono::system_clock::now();
+
+  ASSERT_TRUE(run.restore_task_instance(*root_info));
+
+  auto mid_info = run.get_task_info(*mid);
+  auto leaf_info = run.get_task_info(*leaf);
+  ASSERT_TRUE(mid_info.has_value());
+  ASSERT_TRUE(leaf_info.has_value());
+  EXPECT_EQ(mid_info->state, TaskState::UpstreamFailed);
+  EXPECT_EQ(leaf_info->state, TaskState::UpstreamFailed);
+}
+
+TEST_F(DAGRunTest, ReadyTasksPreserveActivationOrder) {
+  DAG dag;
+  auto first = dag.add_node(TaskId("first"));
+  auto second = dag.add_node(TaskId("second"));
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(second.has_value());
+
+  auto run_result =
+      DAGRun::create(DAGRunId("ready_order"), std::make_shared<DAG>(dag));
+  ASSERT_TRUE(run_result.has_value());
+  auto &run = *run_result;
+
+  ASSERT_TRUE(run.mark_task_started(*first, InstanceId("inst-first")));
+  ASSERT_TRUE(run.mark_task_failed(*first, "error", 2));
+  ASSERT_TRUE(run.mark_task_started(*second, InstanceId("inst-second")));
+  ASSERT_TRUE(run.mark_task_failed(*second, "error", 2));
+
+  ASSERT_TRUE(run.mark_task_retry_ready(*second));
+  ASSERT_TRUE(run.mark_task_retry_ready(*first));
+
+  auto ready = run.get_ready_tasks();
+  ASSERT_EQ(ready.size(), 2);
+  EXPECT_EQ(ready[0], *second);
+  EXPECT_EQ(ready[1], *first);
 }

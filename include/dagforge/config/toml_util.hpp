@@ -5,8 +5,11 @@
 
 #include <glaze/toml.hpp>
 
+#include <charconv>
+#include <chrono>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -39,6 +42,52 @@ template <typename T>
     return fail(Error::ParseError);
   }
   return ok(std::move(raw));
+}
+
+[[nodiscard]] inline auto parse_date_yyyy_mm_dd(std::string_view text)
+    -> std::optional<std::chrono::system_clock::time_point> {
+  if (text.empty()) {
+    return std::nullopt;
+  }
+
+  int year_value = 0;
+  unsigned month_value = 0;
+  unsigned day_value = 0;
+
+  const char *begin = text.data();
+  const char *end = begin + text.size();
+
+  auto [year_end, year_ec] = std::from_chars(begin, end, year_value);
+  if (year_ec != std::errc{} || year_end >= end || *year_end != '-') {
+    return std::nullopt;
+  }
+
+  auto [month_end, month_ec] = std::from_chars(year_end + 1, end, month_value);
+  if (month_ec != std::errc{} || month_end >= end || *month_end != '-') {
+    return std::nullopt;
+  }
+
+  auto [day_end, day_ec] = std::from_chars(month_end + 1, end, day_value);
+  if (day_ec != std::errc{} || day_end != end) {
+    return std::nullopt;
+  }
+
+  using namespace std::chrono;
+  const year_month_day ymd{year{year_value}, month{month_value},
+                           day{day_value}};
+  if (!ymd.ok()) {
+    return std::nullopt;
+  }
+  return sys_days{ymd};
+}
+
+[[nodiscard]] inline auto format_date_yyyy_mm_dd(
+    std::chrono::system_clock::time_point value) -> std::string {
+  using namespace std::chrono;
+  const auto days = floor<sys_days::duration>(value);
+  const year_month_day ymd{sys_days{days}};
+  return std::format("{:04}-{:02}-{:02}", int(ymd.year()),
+                     unsigned(ymd.month()), unsigned(ymd.day()));
 }
 
 } // namespace dagforge::toml_util

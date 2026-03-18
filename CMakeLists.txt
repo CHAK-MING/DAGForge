@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(DAGForge VERSION 0.1.0 LANGUAGES C CXX)
+project(DAGForge VERSION 0.2.0 LANGUAGES C CXX)
 
 # Compiler Requirements Check
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
@@ -76,7 +76,9 @@ add_library(dagforge_lib
     src/dagforge/executor/shell_executor.cpp
     src/dagforge/executor/docker_executor.cpp
     src/dagforge/executor/sensor_executor.cpp
+    src/dagforge/executor/noop_executor.cpp
     src/dagforge/executor/composite_executor.cpp
+    src/dagforge/executor/executor_registry.cpp
     src/dagforge/app/config_builder.cpp
     src/dagforge/app/application.cpp
     src/dagforge/app/api/api_server.cpp

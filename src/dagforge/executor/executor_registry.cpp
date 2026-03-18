@@ -1,0 +1,314 @@
+#include "dagforge/executor/executor.hpp"
+
+#include "dagforge/config/task_config.hpp"
+#include "dagforge/util/log.hpp"
+
+#include <glaze/json.hpp>
+
+namespace dagforge::executor_dto {
+
+struct SensorExecutorConfigJson {
+  std::string type;
+  std::string target;
+  std::int64_t poke_interval{30};
+  bool soft_fail{false};
+  std::int64_t expected_status{200};
+  std::string http_method{"GET"};
+};
+
+struct DockerExecutorConfigJson {
+  std::string image;
+  std::string socket{"/var/run/docker.sock"};
+  std::string pull_policy;
+};
+
+} // namespace dagforge::executor_dto
+
+namespace glz {
+
+template <> struct meta<dagforge::executor_dto::SensorExecutorConfigJson> {
+  using T = dagforge::executor_dto::SensorExecutorConfigJson;
+  static constexpr auto value =
+      object("type", &T::type, "target", &T::target, "poke_interval",
+             &T::poke_interval, "soft_fail", &T::soft_fail, "expected_status",
+             &T::expected_status, "http_method", &T::http_method);
+};
+
+template <> struct meta<dagforge::executor_dto::DockerExecutorConfigJson> {
+  using T = dagforge::executor_dto::DockerExecutorConfigJson;
+  static constexpr auto value = object("image", &T::image, "socket", &T::socket,
+                                       "pull_policy", &T::pull_policy);
+};
+
+} // namespace glz
+
+namespace dagforge {
+namespace {
+
+auto build_shell_config(const TaskConfig &task) -> Result<ExecutorConfig> {
+  ShellExecutorConfig exec;
+  exec.command = task.command;
+  exec.working_dir = task.working_dir;
+  exec.execution_timeout = task.execution_timeout;
+  return ok(ExecutorConfig{std::move(exec)});
+}
+
+auto build_docker_config(const TaskConfig &task) -> Result<ExecutorConfig> {
+  DockerExecutorConfig exec;
+  if (const auto *docker_cfg = task.executor_config.as<DockerExecutorConfig>()) {
+    exec.image = docker_cfg->image;
+    exec.docker_socket = docker_cfg->docker_socket;
+    exec.pull_policy = docker_cfg->pull_policy;
+  }
+  exec.command = task.command;
+  exec.working_dir = task.working_dir;
+  exec.execution_timeout = task.execution_timeout;
+  return ok(ExecutorConfig{std::move(exec)});
+}
+
+auto build_sensor_config(const TaskConfig &task) -> Result<ExecutorConfig> {
+  SensorExecutorConfig exec;
+  exec.execution_timeout = task.execution_timeout;
+  if (const auto *sensor_cfg = task.executor_config.as<SensorExecutorConfig>()) {
+    exec.type = sensor_cfg->type;
+    exec.target = sensor_cfg->target;
+    exec.poke_interval = sensor_cfg->poke_interval;
+    exec.soft_fail = sensor_cfg->soft_fail;
+    exec.expected_status = sensor_cfg->expected_status;
+    exec.http_method = sensor_cfg->http_method;
+  }
+  return ok(ExecutorConfig{std::move(exec)});
+}
+
+auto build_noop_config(const TaskConfig &task) -> Result<ExecutorConfig> {
+  NoopExecutorConfig exec;
+  if (const auto *noop_cfg = task.executor_config.as<NoopExecutorConfig>()) {
+    exec.exit_code = noop_cfg->exit_code;
+  }
+  return ok(ExecutorConfig{std::move(exec)});
+}
+
+auto serialize_default_config(const ExecutorConfig &) -> std::string {
+  return "{}";
+}
+
+auto parse_default_config(ExecutorType type, std::string_view)
+    -> Result<ExecutorConfig> {
+  switch (type) {
+  case ExecutorType::Shell:
+    return ok(ExecutorConfig{ShellExecutorConfig{}});
+  case ExecutorType::Noop:
+    return ok(ExecutorConfig{NoopExecutorConfig{}});
+  case ExecutorType::Docker:
+    return ok(ExecutorConfig{DockerExecutorConfig{}});
+  case ExecutorType::Sensor:
+    return ok(ExecutorConfig{SensorExecutorConfig{}});
+  }
+  return fail(Error::InvalidArgument);
+}
+
+auto serialize_docker_config(const ExecutorConfig &config) -> std::string {
+  const auto *docker = config.as<DockerExecutorConfig>();
+  if (docker == nullptr) {
+    return "{}";
+  }
+  executor_dto::DockerExecutorConfigJson j{
+      .image = docker->image,
+      .socket = docker->docker_socket,
+      .pull_policy = enum_to_string(docker->pull_policy),
+  };
+  if (auto out = glz::write_json(j); out) {
+    return *out;
+  }
+  return "{}";
+}
+
+auto parse_docker_config(std::string_view input) -> Result<ExecutorConfig> {
+  if (input.empty() || input == "{}") {
+    return ok(ExecutorConfig{DockerExecutorConfig{}});
+  }
+
+  executor_dto::DockerExecutorConfigJson j{};
+  constexpr auto kOpts = glz::opts{.null_terminated = false};
+  if (auto ec = glz::read<kOpts>(j, input); ec) {
+    return fail(Error::ParseError);
+  }
+
+  DockerExecutorConfig cfg{};
+  cfg.image = std::move(j.image);
+  cfg.docker_socket = std::move(j.socket);
+  if (cfg.docker_socket.empty()) {
+    cfg.docker_socket = "/var/run/docker.sock";
+  }
+  if (!j.pull_policy.empty()) {
+    cfg.pull_policy = parse<ImagePullPolicy>(j.pull_policy);
+  }
+  return ok(ExecutorConfig{std::move(cfg)});
+}
+
+auto validate_docker_task(const TaskConfig &task, std::vector<std::string> &errors)
+    -> void {
+  const auto *docker = task.executor_config.as<DockerExecutorConfig>();
+  if (docker != nullptr && docker->image.empty()) {
+    errors.emplace_back(
+        std::format("Task '{}': docker image cannot be empty", task.task_id));
+  }
+}
+
+auto serialize_sensor_config(const ExecutorConfig &config) -> std::string {
+  const auto *sensor = config.as<SensorExecutorConfig>();
+  if (sensor == nullptr) {
+    return "{}";
+  }
+  executor_dto::SensorExecutorConfigJson j{
+      .type = enum_to_string(sensor->type),
+      .target = sensor->target,
+      .poke_interval = sensor->poke_interval.count(),
+      .soft_fail = sensor->soft_fail,
+      .expected_status = sensor->expected_status,
+      .http_method = sensor->http_method,
+  };
+  if (auto out = glz::write_json(j); out) {
+    return *out;
+  }
+  return "{}";
+}
+
+auto parse_sensor_config(std::string_view input) -> Result<ExecutorConfig> {
+  if (input.empty() || input == "{}") {
+    return ok(ExecutorConfig{SensorExecutorConfig{}});
+  }
+
+  executor_dto::SensorExecutorConfigJson j{};
+  constexpr auto kOpts = glz::opts{.null_terminated = false};
+  if (auto ec = glz::read<kOpts>(j, input); ec) {
+    return fail(Error::ParseError);
+  }
+
+  SensorExecutorConfig cfg{};
+  if (!j.type.empty()) {
+    cfg.type = parse<SensorType>(j.type);
+  }
+  cfg.target = std::move(j.target);
+  cfg.poke_interval = std::chrono::seconds(j.poke_interval);
+  cfg.soft_fail = j.soft_fail;
+  cfg.expected_status = static_cast<int>(j.expected_status);
+  cfg.http_method = std::move(j.http_method);
+  if (cfg.http_method.empty()) {
+    cfg.http_method = "GET";
+  }
+  return ok(ExecutorConfig{std::move(cfg)});
+}
+
+auto validate_sensor_task(const TaskConfig &task, std::vector<std::string> &errors)
+    -> void {
+  const auto *sensor = task.executor_config.as<SensorExecutorConfig>();
+  if (sensor != nullptr && sensor->target.empty()) {
+    errors.emplace_back(
+        std::format("Task '{}': sensor target cannot be empty", task.task_id));
+  }
+}
+
+} // namespace
+
+} // namespace dagforge
+
+namespace dagforge {
+
+auto ExecutorRegistry::instance() -> ExecutorRegistry & {
+  static ExecutorRegistry registry = [] {
+    ExecutorRegistry value;
+    value.register_type(
+        ExecutorType::Shell, [](Runtime &rt) { return create_shell_executor(rt); },
+        build_shell_config, serialize_default_config,
+        [](std::string_view input) {
+          return parse_default_config(ExecutorType::Shell, input);
+        });
+    value.register_type(
+        ExecutorType::Docker,
+        [](Runtime &rt) { return create_docker_executor(rt); },
+        build_docker_config, serialize_docker_config, parse_docker_config,
+        validate_docker_task);
+    value.register_type(
+        ExecutorType::Sensor,
+        [](Runtime &rt) { return create_sensor_executor(rt); },
+        build_sensor_config, serialize_sensor_config, parse_sensor_config,
+        validate_sensor_task);
+    value.register_type(
+        ExecutorType::Noop, [](Runtime &rt) { return create_noop_executor(rt); },
+        build_noop_config, serialize_default_config,
+        [](std::string_view input) {
+          return parse_default_config(ExecutorType::Noop, input);
+        });
+    return value;
+  }();
+  return registry;
+}
+
+auto ExecutorRegistry::register_type(ExecutorType type, Creator creator,
+                                     ConfigBuilder builder,
+                                     ConfigSerializer serializer,
+                                     ConfigParser parser,
+                                     TaskValidator validator) -> void {
+  entries_[type] = Entry{.creator = std::move(creator),
+                         .builder = std::move(builder),
+                         .serializer = std::move(serializer),
+                         .parser = std::move(parser),
+                         .validator = std::move(validator)};
+}
+
+auto ExecutorRegistry::create(ExecutorType type, Runtime &rt) const
+    -> std::unique_ptr<IExecutor> {
+  auto it = entries_.find(type);
+  if (it == entries_.end()) {
+    return nullptr;
+  }
+  return it->second.creator(rt);
+}
+
+auto ExecutorRegistry::build_config(const TaskConfig &task) const
+    -> Result<ExecutorConfig> {
+  auto it = entries_.find(task.executor);
+  if (it == entries_.end()) {
+    return fail(Error::InvalidArgument);
+  }
+  return it->second.builder(task);
+}
+
+auto ExecutorRegistry::serialize_config(const ExecutorConfig &config) const
+    -> std::string {
+  auto it = entries_.find(config.type());
+  if (it == entries_.end() || !it->second.serializer) {
+    return "{}";
+  }
+  return it->second.serializer(config);
+}
+
+auto ExecutorRegistry::parse_persisted_config(
+    ExecutorType type, std::string_view persisted_config) const
+    -> Result<ExecutorConfig> {
+  auto it = entries_.find(type);
+  if (it == entries_.end()) {
+    return fail(Error::InvalidArgument);
+  }
+  if (!it->second.parser) {
+    return fail(Error::InvalidArgument);
+  }
+  return it->second.parser(persisted_config);
+}
+
+auto ExecutorRegistry::validate_task(const TaskConfig &task,
+                                     std::vector<std::string> &errors) const
+    -> void {
+  auto it = entries_.find(task.executor);
+  if (it == entries_.end() || !it->second.validator) {
+    return;
+  }
+  it->second.validator(task, errors);
+}
+
+auto ExecutorRegistry::registered_types() const -> std::vector<ExecutorType> {
+  return entries_ | std::views::keys | std::ranges::to<std::vector>();
+}
+
+} // namespace dagforge

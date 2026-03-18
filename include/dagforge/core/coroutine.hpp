@@ -9,6 +9,10 @@
 
 namespace dagforge {
 
+// These aliases are intentionally project-level vocabulary, not a namespace
+// forwarding convenience. `task<>` / `spawn_task` appear in public interfaces
+// across runtime, storage, HTTP, and tests, so keeping them stable avoids
+// baking Boost.Asio types into every call site.
 template <typename T = void> using task = boost::asio::awaitable<T>;
 
 /// Convenience alias for fire-and-forget coroutines.

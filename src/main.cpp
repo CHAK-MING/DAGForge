@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdlib> // getenv
+#include <exception>
 #include <print>
 #include <string>
 
@@ -19,6 +20,21 @@ auto default_config() -> std::string {
 } // namespace
 
 int main(int argc, char *argv[]) {
+  std::set_terminate([] {
+    if (auto eptr = std::current_exception(); eptr) {
+      try {
+        std::rethrow_exception(eptr);
+      } catch (const std::exception &e) {
+        dagforge::log::error("Unhandled fatal exception: {}", e.what());
+      } catch (...) {
+        dagforge::log::error("Unhandled fatal non-std exception");
+      }
+    } else {
+      dagforge::log::error("std::terminate called without active exception");
+    }
+    std::abort();
+  });
+
   // Keep non-serve CLI output clean by default.
   dagforge::log::set_output_stderr();
   dagforge::log::set_level(dagforge::log::Level::Warn);
@@ -54,6 +70,8 @@ int main(int argc, char *argv[]) {
     serve_start_cfg->required();
   serve_start->add_flag("--no-api", serve_start_opts.no_api,
                         "Disable REST API");
+  serve_start->add_option("--pid-file", serve_start_opts.pid_file,
+                          "PID file path override");
   serve_start->add_option("--log-file", serve_start_opts.log_file,
                           "Log file path (required for --daemon)");
   serve_start->add_option("--log-level", serve_start_opts.log_level,
@@ -61,7 +79,8 @@ int main(int argc, char *argv[]) {
   serve_start->add_flag("-d,--daemon", serve_start_opts.daemon,
                         "Run as daemon");
   serve_start->add_option("--shards", serve_start_opts.shards,
-                          "Number of shards (default: auto-detect CPU cores)");
+                          "Number of shards (default: auto-detect CPU cores)")
+      ->check(CLI::PositiveNumber);
   serve_start->callback([&serve_start_opts]() {
     std::exit(dagforge::cli::cmd_serve_start(serve_start_opts));
   });
@@ -77,6 +96,8 @@ int main(int argc, char *argv[]) {
           ->check(CLI::ExistingFile);
   if (env_config.empty())
     serve_status_cfg->required();
+  serve_status->add_option("--pid-file", serve_status_opts.pid_file,
+                           "PID file path override");
   serve_status->add_flag("--json", serve_status_opts.json, "Output JSON");
   serve_status->callback([&serve_status_opts]() {
     std::exit(dagforge::cli::cmd_serve_status(serve_status_opts));
@@ -92,8 +113,11 @@ int main(int argc, char *argv[]) {
           ->check(CLI::ExistingFile);
   if (env_config.empty())
     serve_stop_cfg->required();
+  serve_stop->add_option("--pid-file", serve_stop_opts.pid_file,
+                         "PID file path override");
   serve_stop->add_option("--timeout", serve_stop_opts.timeout_sec,
-                         "Seconds to wait before failing or forcing stop");
+                         "Seconds to wait before failing or forcing stop")
+      ->check(CLI::PositiveNumber);
   serve_stop->add_flag("--force", serve_stop_opts.force,
                        "Send SIGKILL if graceful stop times out");
   serve_stop->callback([&serve_stop_opts]() {
@@ -177,7 +201,8 @@ int main(int argc, char *argv[]) {
   list_dags->add_flag("--include-stale", list_dags_opts.include_stale,
                       "Include DB-only stale DAGs in output");
   list_dags->add_option("--limit", list_dags_opts.limit,
-                        "Max records to display (default: 50)");
+                        "Max records to display (default: 50)")
+      ->check(CLI::PositiveNumber);
   list_dags->callback([&list_dags_opts]() {
     std::exit(dagforge::cli::cmd_list_dags(list_dags_opts));
   });
@@ -203,7 +228,8 @@ int main(int argc, char *argv[]) {
                    "Output format: table|json")
       ->check(CLI::IsMember({"table", "json"}, CLI::ignore_case));
   list_runs->add_option("--limit", list_runs_opts.limit,
-                        "Max records to display (default: 50)");
+                        "Max records to display (default: 50)")
+      ->check(CLI::PositiveNumber);
   list_runs->callback([&list_runs_opts]() {
     std::exit(dagforge::cli::cmd_list_runs(list_runs_opts));
   });
@@ -344,7 +370,8 @@ int main(int argc, char *argv[]) {
   logs_cmd->add_option("--run", logs_opts.run_id, "Run ID or 'latest'");
   logs_cmd->add_option("--task", logs_opts.task_id, "Filter by task ID");
   logs_cmd->add_option("--attempt", logs_opts.attempt,
-                       "Attempt number (default: 1)");
+                       "Attempt number (default: 1)")
+      ->check(CLI::PositiveNumber);
   logs_cmd->add_flag("--latest", logs_opts.latest, "Use the most recent run");
   logs_cmd->add_flag("--follow,-f", logs_opts.follow,
                      "Poll for new log lines until run completes");

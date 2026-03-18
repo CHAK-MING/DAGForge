@@ -7,6 +7,7 @@
 namespace dagforge::cli {
 struct ServeStartOptions {
   std::string config_file;
+  std::optional<std::string> pid_file;
   std::optional<std::string> log_file;
   std::optional<std::string> log_level;
   bool no_api{false};
@@ -16,12 +17,14 @@ struct ServeStartOptions {
 
 struct ServeStopOptions {
   std::string config_file;
+  std::optional<std::string> pid_file;
   int timeout_sec{10};
   bool force{false};
 };
 
 struct ServeStatusOptions {
   std::string config_file;
+  std::optional<std::string> pid_file;
   bool json{false};
 };
 

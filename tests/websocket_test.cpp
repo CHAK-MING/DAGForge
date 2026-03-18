@@ -176,7 +176,7 @@ class WebSocketTest : public ::testing::Test {
 protected:
   void SetUp() override {
     runtime_ = std::make_unique<Runtime>(1);
-    runtime_->start();
+    ASSERT_TRUE(runtime_->start().has_value());
     hub_ = std::make_unique<WebSocketHub>(*runtime_);
   }
 

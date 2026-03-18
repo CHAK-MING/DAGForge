@@ -68,10 +68,6 @@ auto cmd_validate(const ValidateOptions &opts) -> int {
   std::vector<ValidationResult> results;
 
   if (opts.file.has_value()) {
-    if (!std::filesystem::exists(*opts.file)) {
-      std::println(stderr, "Error: File does not exist: {}", *opts.file);
-      return 1;
-    }
     results.emplace_back(validate_single_file(*opts.file));
   } else {
     auto config_res = ConfigLoader::load_from_file(opts.config_file);

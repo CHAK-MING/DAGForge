@@ -2,6 +2,37 @@
 
 All notable changes to DAGForge will be documented in this file.
 
+## [0.2.0] - 2026-03-18
+
+### Changed
+- **Configuration System Refactor**
+  - Reworked system and DAG configuration loading around the domain model instead of parallel adapter structs.
+  - Expanded instance-level configuration coverage for scheduler, API, DAG source, daemon, TLS, executor, and runtime options.
+  - Tightened CLI/config validation so invalid combinations fail earlier and with clearer diagnostics.
+- **Database & Persistence Refactor**
+  - Consolidated MySQL persistence paths and reduced duplicated query/error-handling code.
+  - Improved task/run state persistence behavior for retries, invalid commands, timeouts, and executor edge cases.
+  - Normalized task instance bookkeeping to avoid inconsistent attempt/state rows during recovery and retries.
+
+### Improved
+- **Performance**
+  - Reduced scheduler/executor overhead in the hot path through runtime and process-management cleanup.
+  - Added and expanded benchmark coverage for DAG engine, scheduler service, and Airflow-style workload comparisons.
+  - Current repo benchmark artifact for `scene1_linear_100x10` reports `1237 ms` total task lag and `1.237 ms/task` average lag.
+
+### Fixed
+- **Correctness & Edge Cases**
+  - Fixed timeout handling so timed-out tasks fail cleanly instead of remaining effectively stuck behind retry flow.
+  - Fixed invalid command / non-zero shell exit handling and related task persistence state transitions.
+  - Fixed large-output logging so shell stdout/stderr are streamed line-by-line instead of collapsing into a few oversized log records.
+  - Fixed working-directory parsing/handling issues and cleaned up process lifecycle management shared by shell/sensor executors.
+
+### Added
+- **Testing**
+  - Added targeted executor, persistence, validation, HTTP API, WebSocket, and end-to-end integration tests.
+  - Added regression coverage for invalid commands, timeout behavior, non-zero exits, log streaming, WebSocket delivery, and sensor execution paths.
+  - Expanded benchmark and verification coverage around scheduler throughput and Airflow-style scenarios.
+
 ## [0.1.0-beta] - Initial Beta Release
 
 ### Added

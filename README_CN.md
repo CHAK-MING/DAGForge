@@ -33,7 +33,17 @@
 - **DAG 引擎：** 基于 TOML 定义工作流，支持依赖图、触发规则、条件分支和传感器等待。
 - **执行器：** 原生支持 Shell 命令、Docker 容器以及 Sensor 传感器模式。
 - **XCom 机制：** 提供跨任务数据传递机制与模板变量支持（如 `{{ds}}`, `{{xcom_pull(...)}}`）。
+- **HTTP API + WebSocket：** 内置 REST 接口、Prometheus 指标与实时日志/事件推送能力。
 - **Web UI：** 采用 React 19、Tailwind CSS 和 React Flow 构建的现代化可视化监控控制台。
+
+## 📈 性能快照
+
+| 场景 | 拓扑 | DAG 运行数 | 每个 DAG 任务数 | 总任务数 | 总任务延迟 | 平均每任务延迟 | 最大延迟 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `scene1_linear_100x10` | 10 个线性链 | 100 | 10 | 1000 | 1237.0 ms | 1.237 ms | 24.0 ms |
+| `scene2_linear_10x100` | 100 个线性链 | 10 | 100 | 1000 | 86.0 ms | 0.086 ms | 15.0 ms |
+| `scene3_tree_100x10` | 树型 DAG | 100 | 10 | 1000 | 1134.0 ms | 1.134 ms | 12.0 ms |
+
 
 ## 📚 文档指南
 
@@ -64,9 +74,9 @@
 
 ```bash
 # 从 GitHub Releases 下载（按需替换版本号）
-curl -LO https://github.com/CHAK-MING/dagforge/releases/download/0.1.0-beta/dagforge-0.1.0-beta-linux-x86_64.tar.gz
-tar -xzf dagforge-0.1.0-beta-linux-x86_64.tar.gz
-cd dagforge-0.1.0-beta-linux-x86_64
+curl -LO https://github.com/CHAK-MING/dagforge/releases/download/0.2.0/dagforge-0.2.0-linux-x86_64.tar.gz
+tar -xzf dagforge-0.2.0-linux-x86_64.tar.gz
+cd dagforge-0.2.0-linux-x86_64
 ```
 
 二进制路径：`./bin/dagforge`
@@ -88,6 +98,16 @@ cp system_config.toml my_config.local.toml
 export DAGFORGE_CONFIG=my_config.local.toml
 ```
 
+启动前至少需要修改 `[database]` 部分。当前示例配置还包含这些常用项：
+
+- `database.connect_timeout`
+- `scheduler.log_file` / `scheduler.pid_file`
+- `scheduler.zombie_reaper_interval_sec`
+- `scheduler.zombie_heartbeat_timeout_sec`
+- `scheduler.pin_shards_to_cores`、`scheduler.cpu_affinity_offset`
+- `api.tls_enabled`、`api.tls_cert_file`、`api.tls_key_file`
+- `dag_source.mode = "File" | "Api" | "Hybrid"`
+
 ### 4) 初始化数据库 + 校验 DAG
 
 ```bash
@@ -106,7 +126,12 @@ dagforge serve start --log-level debug --shards 4
 dagforge serve start --daemon --log-file dagforge.log
 ```
 
+说明：
+- `--daemon` 需要日志输出目标。请显式传入 `--log-file`，或者先在配置文件中设置 `scheduler.log_file`。
+
 API/UI：`http://127.0.0.1:8888`
+
+Prometheus 指标：`http://127.0.0.1:8888/metrics`
 
 ### 6) 触发并查看
 
@@ -121,7 +146,7 @@ dagforge logs hello_world --latest
 ```bash
 cmake --preset default
 cmake --build --preset default
-./build/bin/dagforge serve start
+./build/bin/dagforge serve start -c system_config.toml
 ```
 
 ### 8) 备选方式：Docker Compose
@@ -137,9 +162,9 @@ docker compose logs -f dagforge
 
 ```bash
 # 服务
-dagforge serve start  [-c file] [--daemon/-d] [--log-file path] [--no-api] [--log-level trace|debug|info|warn|error] [--shards N]
-dagforge serve status [-c file] [--json]
-dagforge serve stop   [-c file] [--timeout N] [--force]
+dagforge serve start  [-c file] [--pid-file path] [--daemon/-d] [--log-file path] [--no-api] [--log-level trace|debug|info|warn|error] [--shards N]
+dagforge serve status [-c file] [--pid-file path] [--json]
+dagforge serve stop   [-c file] [--pid-file path] [--timeout N] [--force]
 
 # 触发与测试
 dagforge trigger <dag_id> [--wait] [-e execution_date] [--no-api] [--json]
@@ -168,6 +193,11 @@ dagforge db prune-stale [--dry-run]
 dagforge validate [-c file | -f dag.toml] [--json]
 ```
 
+如果没有设置 `DAGFORGE_CONFIG`，则必须显式传入 `-c/--config`。
+
+说明：
+- `dagforge serve start --daemon` 需要 `--log-file`，或者配置中已有 `scheduler.log_file`。
+
 ---
 
 ## 🗺️ 官方路线图
@@ -190,7 +220,6 @@ dagforge validate [-c file | -f dag.toml] [--json]
 - 报告 bug 并提供功能建议。
 - 改进文档。
 - 提交代码优化和性能改进的 PR。
-- 编写新的 Executor（执行器）和 Sensor（传感器）。
 
 查看我们的 **[官方路线图](#-官方路线图)** 了解优先开发事项。
 

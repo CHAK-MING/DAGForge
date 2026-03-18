@@ -20,47 +20,13 @@ namespace dagforge::cli {
 namespace {
 
 auto to_executor_config(const TaskConfig &task) -> ExecutorConfig {
-  switch (task.executor) {
-  case ExecutorType::Shell: {
-    ShellExecutorConfig exec;
-    exec.command = task.command;
-    exec.working_dir = task.working_dir;
-    exec.execution_timeout = task.execution_timeout;
-    return exec;
+  auto config = ExecutorRegistry::instance().build_config(task);
+  if (config) {
+    return std::move(*config);
   }
-  case ExecutorType::Docker: {
-    DockerExecutorConfig exec;
-    exec.command = task.command;
-    exec.working_dir = task.working_dir;
-    exec.execution_timeout = task.execution_timeout;
-    if (const auto *docker_cfg =
-            std::get_if<DockerTaskConfig>(&task.executor_config)) {
-      exec.image = docker_cfg->image;
-      exec.docker_socket = docker_cfg->socket;
-      exec.pull_policy = docker_cfg->pull_policy;
-    }
-    return exec;
-  }
-  case ExecutorType::Sensor: {
-    SensorExecutorConfig exec;
-    exec.execution_timeout = task.execution_timeout;
-    if (const auto *sensor_cfg =
-            std::get_if<SensorTaskConfig>(&task.executor_config)) {
-      exec.type = sensor_cfg->type;
-      exec.target = sensor_cfg->target;
-      exec.poke_interval = sensor_cfg->poke_interval;
-      exec.soft_fail = sensor_cfg->soft_fail;
-      exec.expected_status = sensor_cfg->expected_status;
-      exec.http_method = sensor_cfg->http_method;
-    }
-    return exec;
-  }
-  }
-  ShellExecutorConfig fallback;
-  fallback.command = task.command;
-  fallback.working_dir = task.working_dir;
-  fallback.execution_timeout = task.execution_timeout;
-  return fallback;
+  auto fallback =
+      ExecutorRegistry::instance().parse_persisted_config(task.executor, "{}");
+  return fallback ? std::move(*fallback) : ExecutorConfig{};
 }
 
 auto load_dag(const Config &config, const DAGId &dag_id) -> Result<DAGInfo> {
@@ -118,7 +84,7 @@ auto cmd_test_task(const TestTaskOptions &opts) -> int {
   auto fut = boost::asio::co_spawn(
       runtime.shard(0).ctx(),
       execute_async(runtime, *executor, InstanceId{iid},
-                    to_executor_config(*task), shard_id{0}),
+                    to_executor_config(*task)),
       boost::asio::use_future);
 
   ExecutorResult result;

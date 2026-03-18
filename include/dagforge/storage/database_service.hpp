@@ -26,6 +26,11 @@ struct ClaimedTaskInstance {
   int attempt{0};
 };
 
+struct RunInsertBundle {
+  DAGRun run;
+  std::vector<TaskInstanceInfo> instances;
+};
+
 // Abstract async database interface.
 // Implementations: MySQLDatabase (now), PostgresDatabase (future).
 // All methods are coroutines returning task<Result<T>>.
@@ -113,7 +118,7 @@ public:
 
   // === XCom ===
   virtual auto save_xcom(const DAGRunId &run_id, const TaskId &task_id,
-                         std::string_view key, const JsonValue &value)
+                         std::string key, const JsonValue &value)
       -> task<Result<void>> = 0;
   virtual auto get_xcom(const DAGRunId &run_id, const TaskId &task_id,
                         std::string_view key) -> task<Result<XComEntry>> = 0;
@@ -143,16 +148,15 @@ public:
       -> task<Result<void>> = 0;
 
   // === Previous Task State ===
-  virtual auto get_previous_task_state(const DAGId &dag_id,
-                                       const TaskId &task_id,
+  virtual auto get_previous_task_state(std::int64_t task_rowid,
                                        TimePoint current_execution_date,
                                        const DAGRunId &current_run_id)
       -> task<Result<TaskState>> = 0;
 
   // === Task Logs ===
   virtual auto append_task_log(const DAGRunId &run_id, const TaskId &task_id,
-                               int attempt, std::string_view stream,
-                               std::string_view content)
+                               int attempt, std::string stream,
+                               std::string content)
       -> task<Result<void>> = 0;
   virtual auto get_task_logs(const DAGRunId &run_id, const TaskId &task_id,
                              int attempt, std::size_t limit = 5000)

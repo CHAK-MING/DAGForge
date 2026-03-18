@@ -57,10 +57,6 @@ public:
 private:
   XComLookupFn xcom_lookup_;
   XComCache xcom_cache_;
-
-  [[nodiscard]] auto resolve_date_variables(std::string_view tmpl,
-                                            const TemplateContext &ctx)
-      -> std::string;
 };
 
 } // namespace dagforge

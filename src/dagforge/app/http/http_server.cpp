@@ -294,61 +294,9 @@ struct HttpServer::Impl {
     stream.shutdown(shutdown_ec);
   }
 
-  auto accept_loop(boost::asio::ip::address bind_address, uint16_t port,
-                   bool enable_reuse_port, unsigned shard_index) -> spawn_task {
+  auto accept_loop(std::shared_ptr<boost::asio::ip::tcp::acceptor> acceptor,
+                   unsigned shard_index) -> spawn_task {
     auto &io_ctx = current_io_context();
-    auto acceptor = std::make_shared<boost::asio::ip::tcp::acceptor>(io_ctx);
-    boost::system::error_code ec;
-
-    acceptor->open(bind_address.is_v6() ? boost::asio::ip::tcp::v6()
-                                        : boost::asio::ip::tcp::v4(),
-                   ec);
-    if (ec) {
-      log::error("Failed to open acceptor: {}", ec.message());
-      co_return;
-    }
-
-    acceptor->set_option(boost::asio::socket_base::reuse_address(true), ec);
-    if (ec) {
-      log::warn("Failed to set SO_REUSEADDR: {}", ec.message());
-      ec.clear();
-    }
-
-#ifdef SO_REUSEPORT
-    if (enable_reuse_port) {
-      int reuse = 1;
-      if (::setsockopt(acceptor->native_handle(), SOL_SOCKET, SO_REUSEPORT,
-                       &reuse, sizeof(reuse)) < 0) {
-        log::error("Failed to set SO_REUSEPORT: {}",
-                   std::error_code(errno, std::system_category()).message());
-        co_return;
-      }
-    }
-#else
-    if (enable_reuse_port) {
-      log::error("SO_REUSEPORT is not supported on this platform");
-      co_return;
-    }
-#endif
-
-    acceptor->bind({bind_address, port}, ec);
-    if (ec) {
-      log::error("Failed to bind {}:{}: {}", bind_address.to_string(), port,
-                 ec.message());
-      co_return;
-    }
-
-    acceptor->listen(boost::asio::socket_base::max_listen_connections, ec);
-    if (ec) {
-      log::error("Failed to listen on {}:{}: {}", bind_address.to_string(),
-                 port, ec.message());
-      co_return;
-    }
-
-    if (running.load(std::memory_order_acquire)) {
-      shard_states[shard_index].acceptor = acceptor;
-    }
-
     while (running.load(std::memory_order_acquire)) {
       boost::asio::ip::tcp::socket socket(io_ctx);
       auto [accept_ec] =
@@ -395,7 +343,9 @@ struct HttpServer::Impl {
           handle_connection(std::move(socket), std::move(detect_buffer)));
     }
 
-    shard_states[shard_index].acceptor.reset();
+    if (shard_states[shard_index].acceptor == acceptor) {
+      shard_states[shard_index].acceptor.reset();
+    }
   }
 };
 
@@ -445,25 +395,22 @@ auto HttpServer::set_tls_credentials(std::string cert_chain_file,
   return ok();
 }
 
-auto HttpServer::start(std::string_view host, uint16_t port)
-    -> task<Result<void>> {
-  co_return co_await start(host, port, false);
+auto HttpServer::start(std::string_view host, uint16_t port) -> Result<void> {
+  return start(host, port, false);
 }
 
 auto HttpServer::start(std::string_view host, uint16_t port, bool reuse_port)
-    -> task<Result<void>> {
+    -> Result<void> {
   auto impl = impl_;
 
   auto cleanup = [&](std::error_code ec) -> Result<void> {
     impl->running = false;
-    for (unsigned i = 0; i < impl->runtime.shard_count(); ++i) {
-      boost::asio::post(impl->runtime.executor_for(i), [impl, i]() {
-        if (auto acc = impl->shard_states[i].acceptor) {
-          boost::system::error_code close_ec;
-          acc->cancel(close_ec);
-          acc->close(close_ec);
-        }
-      });
+    for (auto &state : impl->shard_states) {
+      if (auto acc = std::exchange(state.acceptor, nullptr)) {
+        boost::system::error_code close_ec;
+        acc->cancel(close_ec);
+        acc->close(close_ec);
+      }
     }
     return fail(ec);
   };
@@ -477,7 +424,7 @@ auto HttpServer::start(std::string_view host, uint16_t port, bool reuse_port)
   }
   if (addr_ec) {
     log::error("Invalid host address '{}': {}", host, addr_ec.message());
-    co_return cleanup(make_error_code(Error::InvalidArgument));
+    return cleanup(make_error_code(Error::InvalidArgument));
   }
 
   for (auto &state : impl->shard_states) {
@@ -486,24 +433,76 @@ auto HttpServer::start(std::string_view host, uint16_t port, bool reuse_port)
   const auto acceptor_count =
       reuse_port ? std::max(1U, impl->runtime.shard_count()) : 1U;
 
+  for (unsigned i = 0; i < acceptor_count; ++i) {
+    unsigned shard_idx =
+        reuse_port ? (i % std::max(1U, impl->runtime.shard_count())) : 0;
+
+    auto acceptor = std::make_shared<boost::asio::ip::tcp::acceptor>(
+        impl->runtime.shard(shard_idx).ctx());
+    boost::system::error_code ec;
+
+    acceptor->open(bind_address.is_v6() ? boost::asio::ip::tcp::v6()
+                                        : boost::asio::ip::tcp::v4(),
+                   ec);
+    if (ec) {
+      log::error("Failed to open acceptor: {}", ec.message());
+      return cleanup(ec);
+    }
+
+    acceptor->set_option(boost::asio::socket_base::reuse_address(true), ec);
+    if (ec) {
+      log::warn("Failed to set SO_REUSEADDR: {}", ec.message());
+      ec.clear();
+    }
+
+#ifdef SO_REUSEPORT
+    if (reuse_port) {
+      int reuse = 1;
+      if (::setsockopt(acceptor->native_handle(), SOL_SOCKET, SO_REUSEPORT,
+                       &reuse, sizeof(reuse)) < 0) {
+        const auto opt_ec = std::error_code(errno, std::system_category());
+        log::error("Failed to set SO_REUSEPORT: {}", opt_ec.message());
+        return cleanup(opt_ec);
+      }
+    }
+#else
+    if (reuse_port) {
+      log::error("SO_REUSEPORT is not supported on this platform");
+      return cleanup(make_error_code(Error::InvalidArgument));
+    }
+#endif
+
+    acceptor->bind({bind_address, port}, ec);
+    if (ec) {
+      log::error("Failed to bind {}:{}: {}", bind_address.to_string(), port,
+                 ec.message());
+      return cleanup(ec);
+    }
+
+    acceptor->listen(boost::asio::socket_base::max_listen_connections, ec);
+    if (ec) {
+      log::error("Failed to listen on {}:{}: {}", bind_address.to_string(),
+                 port, ec.message());
+      return cleanup(ec);
+    }
+
+    impl->shard_states[shard_idx].acceptor = acceptor;
+  }
+
   impl->running = true;
 
   log::info("HTTP server listening on {}:{} (acceptors={}, reuse_port={})",
             host, port, acceptor_count, reuse_port);
 
   for (unsigned i = 0; i < acceptor_count; ++i) {
-    unsigned shard_idx =
+    const auto shard_idx =
         reuse_port ? (i % std::max(1U, impl->runtime.shard_count())) : 0;
-    auto accept_coro =
-        impl->accept_loop(bind_address, port, reuse_port, shard_idx);
-    if (reuse_port) {
-      impl->runtime.spawn_on(shard_idx, std::move(accept_coro));
-    } else {
-      impl->runtime.spawn_external(std::move(accept_coro));
-    }
+    auto acceptor = impl->shard_states[shard_idx].acceptor;
+    impl->runtime.spawn_on(shard_idx,
+                           impl->accept_loop(std::move(acceptor), shard_idx));
   }
 
-  co_return ok();
+  return ok();
 }
 
 auto HttpServer::stop() -> void {

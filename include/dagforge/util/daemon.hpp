@@ -9,6 +9,10 @@
 #include <string>
 #include <string_view>
 
+namespace boost::interprocess {
+class file_lock;
+}
+
 namespace dagforge {
 
 extern std::atomic<bool> g_shutdown_requested;
@@ -28,11 +32,11 @@ public:
 
 private:
   std::string path_;
-  std::unique_ptr<void, void (*)(void *)> lock_{nullptr, nullptr};
+  std::unique_ptr<boost::interprocess::file_lock> lock_{nullptr};
   bool owns_{false};
 
   explicit PidFileGuard(std::string path,
-                        std::unique_ptr<void, void (*)(void *)> lock) noexcept;
+                        std::unique_ptr<boost::interprocess::file_lock> lock) noexcept;
   auto release() noexcept -> void;
 };
 

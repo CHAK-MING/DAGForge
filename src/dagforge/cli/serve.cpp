@@ -15,9 +15,17 @@
 namespace dagforge::cli {
 namespace {
 
-auto resolve_pid_file(const Config &config) -> std::string {
+auto resolve_pid_file(const Config &config,
+                      const std::optional<std::string> &override_pid_file)
+    -> std::string {
+  if (override_pid_file.has_value() && !override_pid_file->empty()) {
+    return *override_pid_file;
+  }
   if (!config.scheduler.pid_file.empty()) {
     return config.scheduler.pid_file;
+  }
+  if (const char *env = std::getenv("DAGFORGE_PID_FILE"); env && *env) {
+    return env;
   }
   return "/tmp/dagforge.pid";
 }
@@ -88,7 +96,7 @@ auto cmd_serve_start(const ServeStartOptions &opts) -> int {
 
   log::set_level(config.scheduler.log_level);
 
-  const auto pid_file = resolve_pid_file(config);
+  const auto pid_file = resolve_pid_file(config, opts.pid_file);
   auto pid_guard = PidFileGuard::acquire(pid_file);
   if (!pid_guard) {
     if (pid_guard.error() == make_error_code(Error::AlreadyExists)) {
@@ -113,6 +121,7 @@ auto cmd_serve_start(const ServeStartOptions &opts) -> int {
     return 1;
   }
 
+  g_shutdown_requested.store(false, std::memory_order_release);
   setup_signal_handlers();
 
   if (auto r = app.recover_from_crash(); !r.has_value()) {
@@ -139,7 +148,7 @@ auto cmd_serve_stop(const ServeStopOptions &opts) -> int {
   if (!config_res) {
     return 1;
   }
-  const auto pid_file = resolve_pid_file(*config_res);
+  const auto pid_file = resolve_pid_file(*config_res, opts.pid_file);
 
   auto pid_res = read_pid_file(pid_file);
   if (!pid_res) {
@@ -199,7 +208,7 @@ auto cmd_serve_status(const ServeStatusOptions &opts) -> int {
   if (!config_res) {
     return 1;
   }
-  const auto pid_file = resolve_pid_file(*config_res);
+  const auto pid_file = resolve_pid_file(*config_res, opts.pid_file);
 
   bool running = false;
   bool stale = false;

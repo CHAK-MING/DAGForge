@@ -15,7 +15,7 @@ class DockerClientTest : public ::testing::Test {
 protected:
   void SetUp() override {
     runtime_ = std::make_unique<Runtime>();
-    runtime_->start();
+    ASSERT_TRUE(runtime_->start().has_value());
   }
 
   void TearDown() override {
@@ -29,7 +29,7 @@ protected:
 
 TEST_F(DockerClientTest, ConnectFailsForNonExistentSocket) {
   std::atomic<bool> completed{false};
-  DockerResult<std::unique_ptr<TestDockerClient>> result;
+  Result<std::unique_ptr<TestDockerClient>> result;
 
   auto test_task = [&]() -> spawn_task {
     result = co_await TestDockerClient::connect(
@@ -49,7 +49,7 @@ TEST_F(DockerClientTest, ConnectFailsForNonExistentSocket) {
 
   EXPECT_TRUE(completed.load());
   EXPECT_FALSE(result.has_value());
-  EXPECT_EQ(result.error(), DockerError::ConnectionFailed);
+  EXPECT_EQ(result.error(), make_error_code(DockerError::ConnectionFailed));
 }
 
 TEST_F(DockerClientTest, DockerClientConfigDefaults) {
@@ -86,6 +86,14 @@ TEST_F(DockerClientTest, ContainerConfigConstruction) {
   EXPECT_EQ(config.env.size(), 2U);
   EXPECT_EQ(config.env["KEY1"], "value1");
   EXPECT_EQ(config.env["KEY2"], "value2");
+}
+
+TEST_F(DockerClientTest, DockerErrorConvertsToErrorCode) {
+  const auto ec = make_error_code(DockerError::Timeout);
+
+  EXPECT_EQ(ec.category(), docker_error_category());
+  EXPECT_EQ(ec.message(), "timeout");
+  EXPECT_EQ(ec, std::errc::timed_out);
 }
 
 } // namespace dagforge::docker::test
