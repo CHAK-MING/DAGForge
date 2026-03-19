@@ -1,6 +1,7 @@
 > [!NOTE]
 > **DAGForge 正在积极开发中。**
-> 我们正在构建一个基于现代 C++23 的高性能 DAG 工作流编排器，它的架构灵感来自 Apache Airflow，但专为高性能和低延迟执行进行了深度优化。
+> DAGForge 是一个基于现代 C++23 的高性能单机 DAG 引擎。
+> 它专注于中小规模 pipeline 的低延迟调度。
 
 <div align="center">
 
@@ -10,10 +11,9 @@
 
 </div>
 
-> **告别 Python 带来的锁竞争和高延迟。**
 > DAGForge 使用了受 Seastar 启发的独立分片异步运行时，每个 CPU 核心都有自己的 `io_context` (Boost.Asio) 和内存资源。
 >
-> 我们认为工作流编排不应该成为系统的瓶颈。DAGForge 提供了一个极速的 DAG 引擎，支持基于 TOML 的配置定义、异步持久化，并自带现代化的 React 19 Web 控制台。
+> 我们认为工作流编排不应该成为系统的瓶颈。DAGForge 提供了一个高性能的 DAG 引擎，支持基于 TOML 的配置定义、异步持久化，并自带现代化的 React 19 Web 控制台。
 
 <div align="center">
 
@@ -38,11 +38,27 @@
 
 ## 📈 性能快照
 
-| 场景 | 拓扑 | DAG 运行数 | 每个 DAG 任务数 | 总任务数 | 总任务延迟 | 平均每任务延迟 | 最大延迟 |
+| 场景 | 拓扑 | DAG 运行数 | 每个 DAG 任务数 | 总任务数 | 总调度延迟 | 平均调度延迟 / 任务 | 最大调度延迟 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `scene1_linear_100x10` | 10 个线性链 | 100 | 10 | 1000 | 1237.0 ms | 1.237 ms | 24.0 ms |
 | `scene2_linear_10x100` | 100 个线性链 | 10 | 100 | 1000 | 86.0 ms | 0.086 ms | 15.0 ms |
 | `scene3_tree_100x10` | 树型 DAG | 100 | 10 | 1000 | 1134.0 ms | 1.134 ms | 12.0 ms |
+| `scene7_diamond_100x10` | 菱形 DAG | 100 | 10 | 1000 | 3029.0 ms | 3.029 ms | 28.0 ms |
+| `scene8_fanout_100x10` | 扇出 DAG | 100 | 10 | 1000 | 3396.0 ms | 3.396 ms | 30.0 ms |
+| `scene9_fanin_100x10` | 扇入 DAG | 100 | 10 | 1000 | 14323.0 ms | 14.323 ms | 26.0 ms |
+| `scene10_mesh_100x10` | 网状 DAG | 100 | 10 | 1000 | 3368.0 ms | 3.368 ms | 20.0 ms |
+
+### 测试环境
+
+- CPU：32 个逻辑 CPU，2 个插槽，16 核 / 插槽
+- CPU 型号：Intel Xeon Gold 5218 @ 2.30GHz
+- 内核：Linux 6.17.0-19-generic
+- 调度 Shard：`1`
+- Runtime Shard：`4`
+- CPU 亲和：`pin_shards_to_cores = false`
+- MySQL 兼容数据库：`11.8.3-MariaDB-1build1`
+- 数据库连接池：`16`
+- API 端口：`8888`
 
 
 ## 📚 文档指南

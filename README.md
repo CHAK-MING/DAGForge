@@ -1,6 +1,7 @@
 > [!NOTE]
 > **DAGForge is in Active Development.**
-> We are building a high-performance DAG workflow orchestrator built with modern C++23, inspired by the architecture of Apache Airflow but optimized for performance and low-latency execution.
+> DAGForge is a high-performance single-node DAG engine built with modern C++23.
+> It focuses on low-latency scheduling for small to medium pipelines.
 
 <div align="center">
 
@@ -10,10 +11,9 @@
 
 </div>
 
-> **Say goodbye to Python-induced lock contention and latency.**
 > DAGForge uses a Seastar-inspired sharded async runtime where each CPU core has its own `io_context` (Boost.Asio) and memory resource.
 >
-> We believe workflow orchestration shouldn't be the bottleneck. DAGForge provides a blazing fast DAG engine with TOML-based definitions, async persistence, and a modern React 19 dashboard.
+> We believe workflow orchestration shouldn't be the bottleneck. DAGForge provides a fast DAG engine with TOML-based definitions, async persistence, and a modern React 19 dashboard.
 
 <div align="center">
 
@@ -38,11 +38,27 @@
 
 ## 📈 Performance Snapshot
 
-| Scenario | Topology | DAG Runs | Tasks / DAG | Total Tasks | Total Task Lag | Avg Lag / Task | Max Lag |
+| Scenario | Topology | DAG Runs | Tasks / DAG | Total Tasks | Total Scheduling Lag | Avg Scheduling Lag / Task | Max Scheduling Lag |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `scene1_linear_100x10` | 10-step linear chain | 100 | 10 | 1000 | 1237.0 ms | 1.237 ms | 24.0 ms |
 | `scene2_linear_10x100` | 100-step linear chain | 10 | 100 | 1000 | 86.0 ms | 0.086 ms | 15.0 ms |
 | `scene3_tree_100x10` | tree-shaped DAG | 100 | 10 | 1000 | 1134.0 ms | 1.134 ms | 12.0 ms |
+| `scene7_diamond_100x10` | diamond DAG | 100 | 10 | 1000 | 3029.0 ms | 3.029 ms | 28.0 ms |
+| `scene8_fanout_100x10` | fan-out DAG | 100 | 10 | 1000 | 3396.0 ms | 3.396 ms | 30.0 ms |
+| `scene9_fanin_100x10` | fan-in DAG | 100 | 10 | 1000 | 14323.0 ms | 14.323 ms | 26.0 ms |
+| `scene10_mesh_100x10` | mesh DAG | 100 | 10 | 1000 | 3368.0 ms | 3.368 ms | 20.0 ms |
+
+### Test Environment
+
+- CPU: 32 logical CPUs, 2 sockets, 16 cores/socket
+- CPU model: Intel Xeon Gold 5218 @ 2.30GHz
+- Kernel: Linux 6.17.0-19-generic
+- Scheduler shards: `1`
+- Runtime shards: `4`
+- CPU affinity: `pin_shards_to_cores = false`
+- MySQL-compatible database: `11.8.3-MariaDB-1build1`
+- Database pool size: `16`
+- API port: `8888`
 
 ## 📚 Documentation
 
