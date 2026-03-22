@@ -74,7 +74,6 @@
 - **[Docker Tasks](docs/USER_GUIDE.md#8-docker-tasks)** - Run tasks inside isolated Docker containers.
 - **[Branching DAGs](docs/USER_GUIDE.md#10-branching-dags)** - Conditional logic paths within pipelines.
 - **[Benchmark Report](docs/BENCH_REPORT.md)** - Aggregated stability and throughput report.
-- **[Benchmark Generator](bench/scripts/gen_airflow_bench_dags.py)** - Generate the benchmark DAG TOMLs locally.
 
 ### Integration
 - **[API Reference](docs/API.md)** - HTTP REST and WebSocket API endpoints.

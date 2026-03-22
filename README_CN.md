@@ -75,7 +75,6 @@
 - **[Docker 任务](docs/USER_GUIDE.md#8-docker-tasks)** - 在隔离的 Docker 容器中运行任务。
 - **[分支 DAG](docs/USER_GUIDE.md#10-branching-dags)** - 流水线内的条件逻辑路径。
 - **[基准报告](docs/BENCH_REPORT.md)** - 稳定性与吞吐量汇总。
-- **[基准生成器](bench/scripts/gen_airflow_bench_dags.py)** - 在本地生成基准 DAG TOML。
 
 ### 集成与部署
 - **[API 参考](docs/API.md)** - HTTP REST 与 WebSocket API 接口。
