@@ -26,6 +26,10 @@ command = "echo '[\"b_kept\"]'"
 dependencies = ["seed"]
 is_branch = true
 
+[[tasks.xcom_push]]
+key = "branch"
+source = "json"
+
 [[tasks]]
 id = "b_kept"
 name = "Branch Kept"
