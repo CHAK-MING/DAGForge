@@ -1,6 +1,7 @@
 > [!NOTE]
 > **DAGForge 正在积极开发中。**
-> 我们正在构建一个基于现代 C++23 的高性能 DAG 工作流编排器，它的架构灵感来自 Apache Airflow，但专为高性能和低延迟执行进行了深度优化。
+> DAGForge 是一个基于现代 C++23 的高性能单机 DAG 引擎。
+> 它专注于中小规模 pipeline 的低延迟调度。
 
 <div align="center">
 
@@ -10,10 +11,9 @@
 
 </div>
 
-> **告别 Python 带来的锁竞争和高延迟。**
 > DAGForge 使用了受 Seastar 启发的独立分片异步运行时，每个 CPU 核心都有自己的 `io_context` (Boost.Asio) 和内存资源。
 >
-> 我们认为工作流编排不应该成为系统的瓶颈。DAGForge 提供了一个极速的 DAG 引擎，支持基于 TOML 的配置定义、异步持久化，并自带现代化的 React 19 Web 控制台。
+> DAGForge 提供了高性能的 DAG 引擎，支持基于 TOML 的配置定义、异步持久化，并自带现代化的 React 19 Web 控制台，实现高效的工作流编排。
 
 <div align="center">
 
@@ -32,17 +32,33 @@
 - **分片运行时：** 基于 Boost.Asio 的核心独占 `io_context`，最大限度减少锁竞争。
 - **DAG 引擎：** 基于 TOML 定义工作流，支持依赖图、触发规则、条件分支和传感器等待。
 - **执行器：** 原生支持 Shell 命令、Docker 容器以及 Sensor 传感器模式。
-- **XCom 机制：** 提供跨任务数据传递机制与模板变量支持（如 `{{ds}}`, `{{xcom_pull(...)}}`）。
+- **XCom 机制：** 提供跨任务数据传递机制与模板变量支持（如 `{{ds}}`, `{{xcom.task.key}}`）。
 - **HTTP API + WebSocket：** 内置 REST 接口、Prometheus 指标与实时日志/事件推送能力。
 - **Web UI：** 采用 React 19、Tailwind CSS 和 React Flow 构建的现代化可视化监控控制台。
 
 ## 📈 性能快照
 
-| 场景 | 拓扑 | DAG 运行数 | 每个 DAG 任务数 | 总任务数 | 总任务延迟 | 平均每任务延迟 | 最大延迟 |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `scene1_linear_100x10` | 10 个线性链 | 100 | 10 | 1000 | 1237.0 ms | 1.237 ms | 24.0 ms |
-| `scene2_linear_10x100` | 100 个线性链 | 10 | 100 | 1000 | 86.0 ms | 0.086 ms | 15.0 ms |
-| `scene3_tree_100x10` | 树型 DAG | 100 | 10 | 1000 | 1134.0 ms | 1.134 ms | 12.0 ms |
+| 场景 | 拓扑 | DAG 运行数 | 每个 DAG 任务数 | 总任务数 | 总调度延迟 | 平均调度延迟 / 任务 | 最大调度延迟 | 吞吐量 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `scene1_linear_100x10` | 10 条线性链 | 100 | 10 | 1000 | 1437.0 ms | 1.437 ms | 26.0 ms | 1179.7 tasks/s |
+| `scene2_linear_10x100` | 100 条线性链 | 10 | 100 | 1000 | 108.0 ms | 0.108 ms | 5.0 ms | 2242.5 tasks/s |
+| `scene3_tree_100x10` | 树型 DAG | 100 | 10 | 1000 | 1889.0 ms | 1.889 ms | 25.0 ms | 1804.8 tasks/s |
+| `scene7_diamond_100x10` | 菱形 DAG | 100 | 10 | 1000 | 1748.0 ms | 1.748 ms | 19.0 ms | 1920.8 tasks/s |
+| `scene8_fanout_100x10` | 扇出 DAG | 100 | 10 | 1000 | 2163.0 ms | 2.163 ms | 25.0 ms | 1897.2 tasks/s |
+| `scene9_fanin_100x10` | 扇入 DAG | 100 | 10 | 1000 | 10958.0 ms | 10.958 ms | 23.0 ms | 1870.1 tasks/s |
+| `scene10_mesh_100x10` | 网状 DAG | 100 | 10 | 1000 | 4195.0 ms | 4.195 ms | 24.0 ms | 2011.9 tasks/s |
+
+### 测试环境
+
+- CPU：32 个逻辑 CPU，2 个插槽，16 核 / 插槽
+- CPU 型号：Intel Xeon Gold 5218 @ 2.30GHz
+- 内核：Linux 6.17.0-19-generic
+- 调度 Shard：`1`
+- Runtime Shard：`4`
+- CPU 亲和：`pin_shards_to_cores = false`
+- 数据库：`MariaDB 11.8.3`
+- 数据库连接池：`16`
+- API 端口：`8888`
 
 
 ## 📚 文档指南
@@ -58,10 +74,11 @@
 - **[传感器任务](docs/USER_GUIDE.md#7-sensor-tasks)** - 阻塞并轮询外部条件。
 - **[Docker 任务](docs/USER_GUIDE.md#8-docker-tasks)** - 在隔离的 Docker 容器中运行任务。
 - **[分支 DAG](docs/USER_GUIDE.md#10-branching-dags)** - 流水线内的条件逻辑路径。
+- **[基准报告](docs/BENCH_REPORT.md)** - 稳定性与吞吐量汇总。
 
 ### 集成与部署
 - **[API 参考](docs/API.md)** - HTTP REST 与 WebSocket API 接口。
-- **[Docker 部署](docs/USER_GUIDE.md#8-docker-tasks)** - 简单的 `docker-compose` 编排。
+- **[Docker 部署](docs/USER_GUIDE.md#8-docker-tasks)** - `docker-compose` 编排。
 
 ### 问题排查
 - **[故障排除指南](docs/USER_GUIDE.md#16-troubleshooting)** - 常见问题与解决方案。

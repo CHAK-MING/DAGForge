@@ -40,7 +40,7 @@ In-depth usage, patterns, and troubleshooting. For a quick overview see the [REA
 ### 🛠️ Prerequisites
 
 - Linux (x86-64 or ARM64)
-- GCC 14+ or Clang 19+
+- GCC 15+ or Clang 19+
 - CMake 3.25+
 - Boost 1.87+
 - MySQL 8.0+
@@ -350,7 +350,7 @@ source = "stdout"       # captures the last non-empty stdout line
 
 [[tasks]]
 id           = "process"
-command      = "echo Processing {{xcom_pull(count_rows, row_count)}} rows"
+command      = "echo Processing {{xcom.count_rows.row_count}} rows"
 dependencies = ["count_rows"]
 ```
 
@@ -419,7 +419,7 @@ Sensors poll an external condition and block until it is met (or timeout).
 id            = "wait_for_file"
 executor      = "sensor"
 sensor_type   = "file"
-sensor_target = "/data/input/ready.flag"
+target        = "/data/input/ready.flag"
 sensor_interval = 10      # poll every 10 seconds
 timeout       = 3600      # fail after 1 hour
 soft_fail     = false     # true = timeout → skipped instead of failed
@@ -430,7 +430,7 @@ soft_fail     = false     # true = timeout → skipped instead of failed
 ```toml
 executor      = "sensor"
 sensor_type   = "file"
-sensor_target = "/path/to/file"
+target        = "/path/to/file"
 ```
 
 Succeeds when the file exists.
@@ -440,7 +440,7 @@ Succeeds when the file exists.
 ```toml
 executor             = "sensor"
 sensor_type          = "http"
-sensor_target        = "https://api.example.com/status"
+target               = "https://api.example.com/status"
 sensor_http_method   = "GET"
 sensor_expected_status = 200
 ```
@@ -452,7 +452,7 @@ Succeeds when the HTTP response status matches `sensor_expected_status`.
 ```toml
 executor      = "sensor"
 sensor_type   = "command"
-sensor_target = "pg_isready -h db.internal"
+target        = "pg_isready -h db.internal"
 ```
 
 Succeeds when the command exits with code 0.
@@ -466,7 +466,7 @@ Set `soft_fail = true` to treat a timeout as `skipped` rather than `failed`. Use
 id            = "wait_for_optional_feed"
 executor      = "sensor"
 sensor_type   = "file"
-sensor_target = "/data/optional_feed.csv"
+target        = "/data/optional_feed.csv"
 timeout       = 300
 soft_fail     = true
 

@@ -1,6 +1,7 @@
 > [!NOTE]
 > **DAGForge is in Active Development.**
-> We are building a high-performance DAG workflow orchestrator built with modern C++23, inspired by the architecture of Apache Airflow but optimized for performance and low-latency execution.
+> DAGForge is a high-performance single-node DAG engine built with modern C++23.
+> It focuses on low-latency scheduling for small to medium pipelines.
 
 <div align="center">
 
@@ -10,10 +11,9 @@
 
 </div>
 
-> **Say goodbye to Python-induced lock contention and latency.**
 > DAGForge uses a Seastar-inspired sharded async runtime where each CPU core has its own `io_context` (Boost.Asio) and memory resource.
 >
-> We believe workflow orchestration shouldn't be the bottleneck. DAGForge provides a blazing fast DAG engine with TOML-based definitions, async persistence, and a modern React 19 dashboard.
+> DAGForge provides a fast DAG engine with TOML-based definitions, async persistence, and a modern React 19 dashboard for efficient workflow orchestration.
 
 <div align="center">
 
@@ -32,22 +32,38 @@
 - **Sharded Runtime:** Core-local `io_context` via Boost.Asio to minimize lock contention.
 - **DAG Engine:** TOML-based DAGs supporting dependencies, trigger rules, branching, and sensors.
 - **Executors:** Native support for Shell, Docker, and Sensor execution modes.
-- **XCom:** Cross-task communication mechanism using template variables (e.g., `{{ds}}`, `{{xcom_pull(...)}}`).
+- **XCom:** Cross-task communication mechanism using template variables (e.g., `{{ds}}`, `{{xcom.task.key}}`).
 - **HTTP API + WebSocket:** Built-in REST endpoints, metrics, and real-time event/log streaming.
 - **Web UI:** Real-time visualization and management powered by React 19, Tailwind CSS, and React Flow.
 
 ## 📈 Performance Snapshot
 
-| Scenario | Topology | DAG Runs | Tasks / DAG | Total Tasks | Total Task Lag | Avg Lag / Task | Max Lag |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `scene1_linear_100x10` | 10-step linear chain | 100 | 10 | 1000 | 1237.0 ms | 1.237 ms | 24.0 ms |
-| `scene2_linear_10x100` | 100-step linear chain | 10 | 100 | 1000 | 86.0 ms | 0.086 ms | 15.0 ms |
-| `scene3_tree_100x10` | tree-shaped DAG | 100 | 10 | 1000 | 1134.0 ms | 1.134 ms | 12.0 ms |
+| Scenario | Topology | DAG Runs | Tasks / DAG | Total Tasks | Total Scheduling Lag | Avg Scheduling Lag / Task | Max Scheduling Lag | Throughput |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `scene1_linear_100x10` | 10 linear chains | 100 | 10 | 1000 | 1437.0 ms | 1.437 ms | 26.0 ms | 1179.7 tasks/s |
+| `scene2_linear_10x100` | 100 linear chains | 10 | 100 | 1000 | 108.0 ms | 0.108 ms | 5.0 ms | 2242.5 tasks/s |
+| `scene3_tree_100x10` | tree DAG | 100 | 10 | 1000 | 1889.0 ms | 1.889 ms | 25.0 ms | 1804.8 tasks/s |
+| `scene7_diamond_100x10` | diamond DAG | 100 | 10 | 1000 | 1748.0 ms | 1.748 ms | 19.0 ms | 1920.8 tasks/s |
+| `scene8_fanout_100x10` | fan-out DAG | 100 | 10 | 1000 | 2163.0 ms | 2.163 ms | 25.0 ms | 1897.2 tasks/s |
+| `scene9_fanin_100x10` | fan-in DAG | 100 | 10 | 1000 | 10958.0 ms | 10.958 ms | 23.0 ms | 1870.1 tasks/s |
+| `scene10_mesh_100x10` | mesh DAG | 100 | 10 | 1000 | 4195.0 ms | 4.195 ms | 24.0 ms | 2011.9 tasks/s |
+
+### Test Environment
+
+- CPU: 32 logical CPUs, 2 sockets, 16 cores/socket
+- CPU model: Intel Xeon Gold 5218 @ 2.30GHz
+- Kernel: Linux 6.17.0-19-generic
+- Scheduler shards: `1`
+- Runtime shards: `4`
+- CPU affinity: `pin_shards_to_cores = false`
+- Database: `MariaDB 11.8.3`
+- Database pool size: `16`
+- API port: `8888`
 
 ## 📚 Documentation
 
 ### Getting Started
-- **[Quickstart Guide](docs/USER_GUIDE.md#1-first-time-setup)** - Get up and running quickly.
+- **[Quickstart Guide](docs/USER_GUIDE.md#1-first-time-setup)** - Get started quickly.
 - **[Detailed User Guide](docs/USER_GUIDE.md)** - In-depth usage, patterns, and troubleshooting.
 - **[Configuration Guide](docs/USER_GUIDE.md#2-running-the-service)** - Settings and customization for the runtime.
 
@@ -57,10 +73,11 @@
 - **[Sensor Tasks](docs/USER_GUIDE.md#7-sensor-tasks)** - Block and poll on external conditions.
 - **[Docker Tasks](docs/USER_GUIDE.md#8-docker-tasks)** - Run tasks inside isolated Docker containers.
 - **[Branching DAGs](docs/USER_GUIDE.md#10-branching-dags)** - Conditional logic paths within pipelines.
+- **[Benchmark Report](docs/BENCH_REPORT.md)** - Aggregated stability and throughput report.
 
 ### Integration
 - **[API Reference](docs/API.md)** - HTTP REST and WebSocket API endpoints.
-- **[Docker Deployment](docs/USER_GUIDE.md#8-docker-tasks)** - Simple `docker-compose` orchestration.
+- **[Docker Deployment](docs/USER_GUIDE.md#8-docker-tasks)** - `docker-compose` orchestration.
 
 ### Troubleshooting
 - **[Troubleshooting Guide](docs/USER_GUIDE.md#16-troubleshooting)** - Common issues and solutions.
@@ -205,9 +222,9 @@ See what's coming next for DAGForge:
 
 1. **Enhance API Security:** Implement authentication and authorization mechanisms.
 2. **PostgreSQL Support:** Add support for PostgreSQL alongside MySQL.
-3. **Streamlined Configuration:** Support more efficient one-click deployments.
-4. **Extended executor support:** Add more types of executors, such as a native Kubernetes (k8s) executor, to enable large-scale horizontal scalability.
-5. **Observability:** Deep integration with OpenTelemetry and improved metrics.
+3. **Configuration Optimization:** Support more efficient one-click deployments.
+4. **Additional executor support:** Add more types of executors, such as a native Kubernetes (k8s) executor, to enable large-scale horizontal scalability.
+5. **Observability Integration:** Deep integration with OpenTelemetry and improved metrics.
 6. **Performance Optimization:** Ongoing work on the C++23 coroutine runtime to further drop latencies.
 
 ---

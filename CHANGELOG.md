@@ -47,7 +47,7 @@ All notable changes to DAGForge will be documented in this file.
 - **Workflow Features:**
   - XCom cross-task communication via template variables (`{{ds}}`, `{{xcom_pull(...)}}`).
   - Branching DAGs via `is_branch = true` tasks.
-  - Comprehensive trigger rules (`all_success`, `all_failed`, `one_success`, etc.).
+  - Complete trigger rules (`all_success`, `all_failed`, `one_success`, etc.).
   - Configurable retries, timeouts, and soft-fails.
 - **Storage & State:**
   - Asynchronous MySQL persistence using `Boost.Mysql`.
@@ -66,6 +66,6 @@ All notable changes to DAGForge will be documented in this file.
 - **Prebuilt Linux Tarball:** Self-contained archive with binary, config, and web-ui distribution.
 
 ### Documentation
-- Comprehensive `README.md` and `README_CN.md` with quickstart guides.
+- Complete `README.md` and `README_CN.md` with quickstart guides.
 - Detailed `USER_GUIDE.md` covering all features and troubleshooting.
 - Dedicated `API.md` for REST/WebSocket integrations.

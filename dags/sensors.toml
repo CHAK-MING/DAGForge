@@ -7,10 +7,9 @@ id = "wait_for_file"
 name = "Wait for Input File"
 executor = "sensor"
 sensor_type = "file"
-sensor_target = "/tmp/dagforge_input.txt"
+target = "/tmp/dagforge_input.txt"
 sensor_interval = 5
 timeout = 60
-command = "true"
 
 [[tasks]]
 id = "process_file"
@@ -23,11 +22,10 @@ id = "wait_for_api"
 name = "Wait for API Ready"
 executor = "sensor"
 sensor_type = "http"
-sensor_target = "http://localhost:8080/health"
+target = "http://localhost:8080/health"
 sensor_expected_status = 200
 sensor_interval = 5
 timeout = 60
-command = "true"
 
 [[tasks]]
 id = "call_api"
@@ -40,7 +38,7 @@ id = "check_service"
 name = "Check External Service"
 executor = "sensor"
 sensor_type = "command"
-command = "[ -f /tmp/service_ready ] && exit 0 || exit 1"
+target = "[ -f /tmp/service_ready ] && exit 0 || exit 1"
 sensor_interval = 3
 timeout = 30
 
