@@ -48,8 +48,6 @@ DAGForge is built for speed. In the latest NUMA-local 5-run benchmark sweep, it 
 | `scene2_linear` | 10 DAGs × 100 linear tasks | 1,000 | 0.231 s | 1.00 ms | **6,933 tasks/s** | **~62.0x faster** |
 | `scene6_burst` | 1 DAG × 1,001 burst-ready tasks | 1,001 | 1.608 s | 1.60 ms | **7,215 tasks/s** | **N/A** |
 
-> For the complete benchmark results, see the full report: [Benchmark Report](docs/BENCH_REPORT.md).
-
 > [!TIP]
 > **Check out the [Benchmark Report](docs/BENCH_REPORT.md)** for a detailed analysis and comparison with other workflow engines.
 
