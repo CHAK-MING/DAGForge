@@ -1,9 +1,12 @@
+import { useI18n } from "@/contexts/I18nContext";
+
 interface RunSparklineProps {
   runs: Array<{ state: 'success' | 'failed' | 'running' }>;
   maxBars?: number;
 }
 
 export function RunSparkline({ runs, maxBars = 10 }: RunSparklineProps) {
+  const { t } = useI18n();
   const recentRuns = runs.slice(0, maxBars);
 
   const getColor = (state: 'success' | 'failed' | 'running') => {
@@ -22,13 +25,13 @@ export function RunSparkline({ runs, maxBars = 10 }: RunSparklineProps) {
   const getTooltip = (state: 'success' | 'failed' | 'running') => {
     switch (state) {
       case 'success':
-        return '成功';
+        return t.runStatus.success;
       case 'failed':
-        return '失败';
+        return t.runStatus.failed;
       case 'running':
-        return '运行中';
+        return t.runStatus.running;
       default:
-        return '未知';
+        return 'Unknown';
     }
   };
 
@@ -39,7 +42,7 @@ export function RunSparkline({ runs, maxBars = 10 }: RunSparklineProps) {
           <div
             key={i}
             className="w-1.5 h-4 rounded-sm bg-muted/30"
-            title="无运行记录"
+            title={t.dashboard.noRecords}
           />
         ))}
       </div>
@@ -59,7 +62,7 @@ export function RunSparkline({ runs, maxBars = 10 }: RunSparklineProps) {
         <div
           key={`empty-${i}`}
           className="w-1.5 h-4 rounded-sm bg-muted/30"
-          title="无记录"
+          title={t.dashboard.noRecords}
         />
       ))}
     </div>

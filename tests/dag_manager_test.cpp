@@ -6,7 +6,21 @@
 
 #include "gtest/gtest.h"
 
+#include <concepts>
+
 using namespace dagforge;
+
+namespace {
+
+template <typename T>
+concept HasCompiledTaskView = requires {
+  typename T::Compiled;
+  requires requires(T value) {
+    { value.compiled() } -> std::same_as<typename T::Compiled>;
+  };
+};
+
+} // namespace
 
 class DAGManagerTest : public ::testing::Test {
 protected:
@@ -67,6 +81,10 @@ TEST_F(DAGManagerTest, CreateDagPreparesRuntimeArtifacts) {
   EXPECT_EQ(result->compiled_graph->size(), 1);
   EXPECT_EQ(result->compiled_executor_configs->size(), 1);
   EXPECT_EQ(result->compiled_indexed_task_configs->size(), 1);
+}
+
+TEST(TaskConfigTest, ExposesCompiledTaskView) {
+  EXPECT_TRUE((HasCompiledTaskView<TaskConfig>));
 }
 
 TEST_F(DAGManagerTest, MergeDbStateInvalidatesAndRebuildsRuntimeArtifacts) {

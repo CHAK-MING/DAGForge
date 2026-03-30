@@ -1,0 +1,116 @@
+import foundation = lib{dagforge-foundation}
+
+./: lib{dagforge}
+
+intf_libs = -lboost_url -lboost_system
+
+./: lib{dagforge-foundation}: libul{dagforge-foundation}: \
+  mxx{modules/base modules/core modules/util modules/domain modules/io \
+      modules/config modules/scheduler modules/dag modules/storage \
+      modules/client modules/executor modules/task_types modules/app \
+      modules/cli modules/xcom} \
+  cxx{modules/scheduler}
+
+lib{dagforge-foundation}:
+{
+  cxx.export.poptions = "-I$src_root/include" "-DDAGFORGE_USE_STDLIB_MODULES=0"
+  cxx.export.libs = $intf_libs
+}
+
+mxx{modules/*}:
+{
+  install = include/dagforge/
+  install.subdirs = true
+}
+
+lib{dagforge}:                                                   \
+  cxx{dagforge/core/shard                                         \
+      dagforge/core/runtime                                       \
+      dagforge/io/context                                         \
+      dagforge/io/timing_wheel                                    \
+      dagforge/scheduler/cron                                     \
+      dagforge/scheduler/engine                                   \
+      dagforge/dag/dag_run                                        \
+      dagforge/dag/dag_manager                                    \
+      dagforge/app/metrics_exporter                               \
+      dagforge/storage/mysql_database                             \
+      dagforge/executor/shell_executor                            \
+      dagforge/executor/docker_executor                           \
+      dagforge/executor/sensor_executor                           \
+      dagforge/executor/noop_executor                             \
+      dagforge/executor/composite_executor                        \
+      dagforge/executor/executor_registry                         \
+      dagforge/app/config_builder                                 \
+      dagforge/app/application                                    \
+      dagforge/app/api/api_server                                 \
+      dagforge/app/services/execution_service                     \
+      dagforge/app/services/execution_event_bridge                \
+      dagforge/app/services/dag_catalog_service                   \
+      dagforge/app/services/scheduler_service                     \
+      dagforge/app/services/persistence_service                   \
+      dagforge/client/http/http_parser                            \
+      dagforge/app/http/router                                    \
+      dagforge/app/http/http_server                               \
+      dagforge/client/http/http_client                            \
+      dagforge/app/http/websocket                                 \
+      dagforge/config/dag_info_loader                             \
+      dagforge/config/dag_file_loader                             \
+      dagforge/config/config_watcher                              \
+      dagforge/config/system_config_loader                        \
+      dagforge/cli/serve                                          \
+      dagforge/cli/run                                            \
+      dagforge/cli/list                                           \
+      dagforge/cli/status                                         \
+      dagforge/cli/validate                                       \
+      dagforge/cli/state                                          \
+      dagforge/cli/clear                                          \
+      dagforge/cli/context                                        \
+      dagforge/cli/db                                             \
+      dagforge/cli/logs                                           \
+      dagforge/cli/test                                           \
+      dagforge/cli/management_client                              \
+      dagforge/util/daemon                                        \
+      dagforge/util/log                                           \
+      dagforge/storage/dag_state_adapter                          \
+      dagforge/xcom/xcom_util                                     \
+      dagforge/xcom/xcom_codec                                    \
+      dagforge/xcom/xcom_extractor                                \
+      dagforge/xcom/template_resolver}                            \
+  $foundation                                                     \
+  ../third_party/prometheus-cpp-core/cxx{check_names             \
+      counter                                                     \
+      detail_builder                                              \
+      detail_ckms_quantiles                                       \
+      detail_time_window_quantiles                                \
+      detail_utils                                                \
+      family                                                      \
+      gauge                                                       \
+      histogram                                                   \
+      info                                                        \
+      registry                                                    \
+      serializer                                                  \
+      summary                                                     \
+      text_serializer}
+{
+  cxx.poptions += "-DDAGFORGE_CONSUME_NAMED_MODULES=0" \
+                  "-DBOOST_ASIO_HAS_IO_URING=0" \
+                  "-DDAGFORGE_USE_MIMALLOC=0"
+  cxx.libs = -lboost_system -lboost_url -lboost_charconv -lboost_process -lssl -lcrypto -pthread
+  cxx.export.libs = -lboost_system -lboost_url -lboost_charconv -lboost_process -lssl -lcrypto -pthread
+}
+
+mxx{modules/base}@modules/: cxx.module_name = dagforge.base
+mxx{modules/core}@modules/: cxx.module_name = dagforge.core
+mxx{modules/util}@modules/: cxx.module_name = dagforge.util
+mxx{modules/domain}@modules/: cxx.module_name = dagforge.domain
+mxx{modules/io}@modules/: cxx.module_name = dagforge.io
+mxx{modules/config}@modules/: cxx.module_name = dagforge.config
+mxx{modules/scheduler}@modules/: cxx.module_name = dagforge.scheduler
+mxx{modules/dag}@modules/: cxx.module_name = dagforge.dag
+mxx{modules/storage}@modules/: cxx.module_name = dagforge.storage
+mxx{modules/client}@modules/: cxx.module_name = dagforge.client
+mxx{modules/executor}@modules/: cxx.module_name = dagforge.executor
+mxx{modules/task_types}@modules/: cxx.module_name = dagforge.task_types
+mxx{modules/app}@modules/: cxx.module_name = dagforge.app
+mxx{modules/cli}@modules/: cxx.module_name = dagforge.cli
+mxx{modules/xcom}@modules/: cxx.module_name = dagforge.xcom

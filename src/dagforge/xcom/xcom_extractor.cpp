@@ -1,13 +1,42 @@
 #include "dagforge/xcom/xcom_extractor.hpp"
+#include "dagforge/util/json.hpp"
 
 #include <boost/algorithm/string/trim.hpp>
 #include <ranges>
 #include <regex>
 #include <utility>
 
+
 namespace dagforge::xcom {
 
 namespace {
+
+[[nodiscard]] auto extract_last_non_empty_line(std::string_view text)
+    -> std::string {
+  while (!text.empty() &&
+         (text.back() == '\n' || text.back() == '\r')) {
+    text.remove_suffix(1);
+  }
+
+  while (!text.empty()) {
+    const auto line_start = text.rfind('\n');
+    std::string_view line =
+        line_start == std::string_view::npos ? text : text.substr(line_start + 1);
+    line = boost::trim_copy(line);
+    if (!line.empty()) {
+      return std::string(line);
+    }
+    if (line_start == std::string_view::npos) {
+      break;
+    }
+    text = text.substr(0, line_start);
+    if (!text.empty() && text.back() == '\r') {
+      text.remove_suffix(1);
+    }
+  }
+
+  return {};
+}
 
 [[nodiscard]] auto get_source_text(const ExecutorResult &result,
                                    XComSource source) -> std::string {
@@ -67,7 +96,6 @@ namespace {
       cur = &(*cur)[key];
     }
 
-    // Process all bracket subscripts: [0][1]...
     while (bracket != std::string_view::npos) {
       auto close = token.find(']', bracket);
       if (close == std::string_view::npos)
@@ -91,6 +119,11 @@ namespace {
                                const XComPushConfig &config)
     -> Result<ExtractedXCom> {
   std::string source_text = get_source_text(result, config.source);
+  if (config.source != XComSource::Json &&
+      config.source != XComSource::ExitCode &&
+      config.regex_pattern.empty() && config.json_path.empty()) {
+    source_text = extract_last_non_empty_line(source_text);
+  }
   auto text_res = ok(std::move(source_text));
   if (!config.regex_pattern.empty()) {
     try {
@@ -133,18 +166,23 @@ namespace {
           if (!config.json_path.empty()) {
             return apply_json_path(*parsed, config.json_path)
                 .transform([&](auto &&val) {
-                  return ExtractedXCom{.key = config.key, .value = val};
+                  return ExtractedXCom{
+                      .key = config.key,
+                      .value = dump_json(val),
+                  };
                 });
           }
           return ok(
-              ExtractedXCom{.key = config.key, .value = std::move(*parsed)});
+              ExtractedXCom{.key = config.key,
+                            .value = dump_json(*parsed)});
         }
 
         JsonValue value = (config.source == XComSource::ExitCode)
                               ? JsonValue(result.exit_code)
                               : JsonValue(std::move(text));
 
-        return ok(ExtractedXCom{.key = config.key, .value = std::move(value)});
+        return ok(
+            ExtractedXCom{.key = config.key, .value = dump_json(value)});
       });
 }
 

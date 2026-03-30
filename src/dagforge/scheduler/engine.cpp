@@ -1,10 +1,8 @@
 #include "dagforge/scheduler/engine.hpp"
 
 #include "dagforge/core/runtime.hpp"
-#include "dagforge/scheduler/cron.hpp"
-#include "dagforge/scheduler/task.hpp"
-#include "dagforge/util/id.hpp"
 #include "dagforge/util/log.hpp"
+
 
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
@@ -16,6 +14,7 @@
 #include <chrono>
 #include <expected>
 #include <optional>
+#include <ranges>
 #include <system_error>
 #include <thread>
 #include <unordered_set>
@@ -27,7 +26,7 @@ namespace dagforge {
 Engine::Engine(Runtime &runtime)
     : Engine(runtime, runtime.shard(shard_id{0}).ctx()) {}
 
-Engine::Engine(Runtime &runtime, boost::asio::io_context &io) : io_(io) {
+Engine::Engine(Runtime &runtime, io::IoContext &io) : io_(io) {
   (void)runtime;
 }
 
@@ -38,10 +37,10 @@ auto Engine::start() -> void {
     return;
   }
 
-  work_guard_.emplace(boost::asio::make_work_guard(io_));
+  work_guard_.emplace(boost::asio::make_work_guard(io_.get_executor()));
 
   stopped_.store(false, std::memory_order_release);
-  log::info("Engine started");
+  log::debug("Engine started");
 }
 
 auto Engine::stop() -> void {
@@ -80,7 +79,7 @@ auto Engine::stop() -> void {
     log::warn("Engine stop timed out waiting for scheduler loop shutdown");
   }
 
-  log::info("Engine stopped");
+  log::debug("Engine stopped");
 }
 
 auto Engine::run_cron_task(DAGTaskId dag_task_id, TimePoint first_time)
@@ -123,11 +122,11 @@ auto Engine::run_cron_task(DAGTaskId dag_task_id, TimePoint first_time)
     }
 
     if (on_dag_trigger_) {
-      log::info("Cron triggered DAG: {} for execution_date: {}",
-                task_it->second.dag_id,
-                std::chrono::duration_cast<std::chrono::seconds>(
-                    next_time.time_since_epoch())
-                    .count());
+      log::debug("Cron triggered DAG: {} for execution_date: {}",
+                 task_it->second.dag_id,
+                 std::chrono::duration_cast<std::chrono::seconds>(
+                     next_time.time_since_epoch())
+                     .count());
       on_dag_trigger_(task_it->second.dag_id, next_time);
 
       if (save_watermark_) {
@@ -149,8 +148,8 @@ auto Engine::run_cron_task(DAGTaskId dag_task_id, TimePoint first_time)
     auto next_run = task_it->second.cron_expr->next_after(next_time);
     if (task_it->second.end_date.has_value() &&
         next_run > *task_it->second.end_date) {
-      log::info("DAG {} finished: next run time exceeds end_date",
-                task_it->second.dag_id);
+      log::debug("DAG {} finished: next run time exceeds end_date",
+                 task_it->second.dag_id);
       scheduled_tasks_.erase(dag_task_id);
       co_return;
     }
@@ -228,18 +227,26 @@ auto Engine::set_save_watermark_callback(SaveWatermarkCallback cb) -> void {
   save_watermark_ = std::move(cb);
 }
 
+auto Engine::scheduled_task_count() const -> std::size_t {
+  return scheduled_tasks_.size();
+}
+
+auto Engine::missed_schedules_total() const -> std::uint64_t {
+  return missed_schedules_total_.load(std::memory_order_relaxed);
+}
+
 auto Engine::handle_event(AddTaskEvent e) -> boost::asio::awaitable<void> {
   auto id = generate_dag_task_id(e.exec_info.dag_id, e.exec_info.task_id);
 
-  if (tasks_.count(id)) {
+  if (tasks_.contains(id)) {
     co_return;
   }
 
   tasks_.emplace(id, e.exec_info);
 
-  if (e.exec_info.cron_expr.has_value()) {
+  if (const auto &cron_expr = e.exec_info.cron_expr; cron_expr) {
     auto now = std::chrono::system_clock::now();
-    const auto &cron = e.exec_info.cron_expr.value();
+    const auto &cron = *cron_expr;
 
     TimePoint baseline_time = now;
     if (e.exec_info.start_date.has_value()) {
@@ -274,10 +281,8 @@ auto Engine::handle_event(AddTaskEvent e) -> boost::asio::awaitable<void> {
       std::unordered_set<std::int64_t> existing_runs;
       bool use_batched_existence = false;
       if (list_run_execution_dates_ && !catchup_runs.empty()) {
-        auto existing_res =
-            co_await list_run_execution_dates_(e.exec_info.dag_id,
-                                               catchup_runs.front(),
-                                               catchup_runs.back());
+        auto existing_res = co_await list_run_execution_dates_(
+            e.exec_info.dag_id, catchup_runs.front(), catchup_runs.back());
         if (!existing_res) {
           log::error("Failed to batch load run existence for DAG {}: {}",
                      e.exec_info.dag_id, existing_res.error().message());
@@ -293,73 +298,90 @@ auto Engine::handle_event(AddTaskEvent e) -> boost::asio::awaitable<void> {
         }
       }
 
-      for (const auto execution_date : catchup_runs) {
-        bool exists = false;
-        if (use_batched_existence) {
-          exists = existing_runs.contains(
-              std::chrono::duration_cast<std::chrono::milliseconds>(
-                  execution_date.time_since_epoch())
-                  .count());
-        } else if (run_exists_) {
-          auto res = co_await run_exists_(e.exec_info.dag_id, execution_date);
-          if (!res) {
-            log::error("Failed to check run existence for DAG {}: {}",
-                       e.exec_info.dag_id, res.error().message());
-            exists = true;
-          } else {
-            exists = *res;
-          }
+      const auto execution_date_to_ms = [](TimePoint date) -> std::int64_t {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   date.time_since_epoch())
+            .count();
+      };
+
+      auto trigger_catchup_run = [&](TimePoint execution_date)
+          -> boost::asio::awaitable<void> {
+        missed_schedules_total_.fetch_add(1, std::memory_order_relaxed);
+        if (!running_.load(std::memory_order_acquire)) {
+          co_return;
         }
+        log::debug("Catchup triggering DAG: {} for execution_date: {}",
+                   e.exec_info.dag_id,
+                   std::chrono::duration_cast<std::chrono::seconds>(
+                       execution_date.time_since_epoch())
+                       .count());
+        on_dag_trigger_(e.exec_info.dag_id, execution_date);
 
-        if (!exists && on_dag_trigger_) {
-          if (!running_.load(std::memory_order_acquire)) {
-            co_return;
-          }
-          log::info("Catchup triggering DAG: {} for execution_date: {}",
-                    e.exec_info.dag_id,
-                    std::chrono::duration_cast<std::chrono::seconds>(
-                        execution_date.time_since_epoch())
-                        .count());
-          on_dag_trigger_(e.exec_info.dag_id, execution_date);
-
-          if (save_watermark_) {
-            auto wm_res =
-                co_await save_watermark_(e.exec_info.dag_id, execution_date);
-            wm_res.or_else([&](std::error_code ec) -> Result<void> {
-              log::error("Failed to save watermark for DAG {}: {}",
-                         e.exec_info.dag_id, ec.message());
-              return fail(ec);
-            });
-          }
+        if (save_watermark_) {
+          auto wm_res =
+              co_await save_watermark_(e.exec_info.dag_id, execution_date);
+          wm_res.or_else([&](std::error_code ec) -> Result<void> {
+            log::error("Failed to save watermark for DAG {}: {}",
+                       e.exec_info.dag_id, ec.message());
+            return fail(ec);
+          });
         }
-      }
-    }
-
-    auto next_time = cron.next_after(std::max(effective_baseline, now));
-
-    if (e.exec_info.end_date.has_value() && next_time > *e.exec_info.end_date) {
-      if (scheduled_tasks_.find(id) == scheduled_tasks_.end()) {
-        log::info("DAG {} not scheduled: next run time exceeds end_date",
-                  e.exec_info.dag_id);
         co_return;
+      };
+
+      if (use_batched_existence) {
+        auto pending_runs =
+            catchup_runs | std::views::filter([&](const TimePoint &date) {
+              return !existing_runs.contains(execution_date_to_ms(date));
+            });
+        for (const auto execution_date : pending_runs) {
+          co_await trigger_catchup_run(execution_date);
+        }
+      } else {
+        for (const auto execution_date : catchup_runs) {
+          bool exists = false;
+          if (run_exists_) {
+            auto res = co_await run_exists_(e.exec_info.dag_id, execution_date);
+            if (!res) {
+              log::error("Failed to check run existence for DAG {}: {}",
+                         e.exec_info.dag_id, res.error().message());
+              exists = true;
+            } else {
+              exists = *res;
+            }
+          }
+          if (!exists) {
+            co_await trigger_catchup_run(execution_date);
+          }
+        }
       }
-    } else {
-      schedule_task(id, next_time);
     }
 
-    log::info("DAG : {}, Task added: {}, next scheduled at: {}",
-              e.exec_info.dag_id, e.exec_info.task_id,
-              std::chrono::duration_cast<std::chrono::seconds>(
-                  next_time.time_since_epoch())
-                  .count());
+  auto next_time = cron.next_after(std::max(effective_baseline, now));
+
+  if (e.exec_info.end_date.has_value() && next_time > *e.exec_info.end_date) {
+    if (scheduled_tasks_.find(id) == scheduled_tasks_.end()) {
+      log::debug("DAG {} not scheduled: next run time exceeds end_date",
+                 e.exec_info.dag_id);
+      co_return;
+    }
+  } else {
+    schedule_task(id, next_time);
   }
+
+  log::debug("DAG : {}, Task added: {}, next scheduled at: {}",
+             e.exec_info.dag_id, e.exec_info.task_id,
+             std::chrono::duration_cast<std::chrono::seconds>(
+                 next_time.time_since_epoch())
+                 .count());
+}
 }
 
 auto Engine::handle_event(const RemoveTaskEvent &e) -> void {
   auto id = generate_dag_task_id(e.dag_id, e.task_id);
   unschedule_task(id);
   tasks_.erase(id);
-  log::info("DAG: {}, Task removed: {}", e.dag_id, e.task_id);
+  log::debug("DAG: {}, Task removed: {}", e.dag_id, e.task_id);
 }
 
 auto Engine::handle_event(const ShutdownEvent &) -> void {

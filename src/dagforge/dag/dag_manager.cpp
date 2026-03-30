@@ -2,8 +2,8 @@
 
 #include "dagforge/app/config_builder.hpp"
 #include "dagforge/app/services/persistence_service.hpp"
-#include "dagforge/core/runtime.hpp"
 #include "dagforge/util/log.hpp"
+
 
 #include <algorithm>
 #include <queue>
@@ -19,9 +19,10 @@ using DagMap = ankerl::unordered_dense::map<DAGId, DAGInfo>;
 
 template <typename Map>
 [[nodiscard]] auto find_dag_in(Map &dags, const DAGId &dag_id)
-    -> std::conditional_t<std::is_const_v<Map>,
-                          const typename std::remove_const_t<Map>::mapped_type *,
-                          typename std::remove_const_t<Map>::mapped_type *> {
+    -> std::conditional_t<
+        std::is_const_v<Map>,
+        const typename std::remove_const_t<Map>::mapped_type *,
+        typename std::remove_const_t<Map>::mapped_type *> {
   auto it = dags.find(dag_id);
   return it != dags.end() ? &it->second : nullptr;
 }
@@ -35,7 +36,7 @@ template <typename T>
   return persistence->sync_wait(std::move(op));
 }
 
-[[nodiscard]] auto prepare_dag_definition(DAGId dag_id, const DAGInfo &info)
+[[nodiscard]] auto prepare_dag_info(DAGId dag_id, const DAGInfo &info)
     -> Result<DAGInfo> {
   DAGInfo dag_copy = info;
   dag_copy.dag_id = std::move(dag_id);
@@ -45,16 +46,16 @@ template <typename T>
   return ok(std::move(dag_copy));
 }
 
-[[nodiscard]] auto persist_dag_definition_if_needed(PersistenceService *persistence,
-                                                    const DAGId &dag_id,
-                                                    DAGInfo dag,
-                                                    bool existed_pre)
-    -> Result<DAGInfo> {
+[[nodiscard]] auto
+persist_dag_info_if_needed(PersistenceService *persistence,
+                           const DAGId &dag_id, DAGInfo dag,
+                           bool existed_pre) -> Result<DAGInfo> {
   if (!persistence || !persistence->is_open()) {
     return ok(std::move(dag));
   }
   auto persisted = run_persistence_sync(
-      persistence, persistence->upsert_dag_definition(dag_id, dag, existed_pre));
+      persistence,
+      persistence->upsert_dag_info(dag_id, dag, existed_pre));
   if (!persisted) {
     return fail(persisted.error());
   }
@@ -68,7 +69,8 @@ auto DAGInfo::prepare_runtime_artifacts() -> Result<void> {
 
   auto graph = std::make_shared<DAG>();
   for (const auto &task : tasks) {
-    if (auto r = graph->add_node(task.task_id, task.trigger_rule, task.is_branch);
+    if (auto r =
+            graph->add_node(task.task_id, task.trigger_rule, task.is_branch);
         !r) {
       return fail(r.error());
     }
@@ -83,11 +85,11 @@ auto DAGInfo::prepare_runtime_artifacts() -> Result<void> {
   }
 
   auto executor_configs = ExecutorConfigBuilder::build(*this, *graph);
-  std::vector<TaskConfig> indexed_task_configs(tasks.size());
+  std::vector<TaskConfig::Compiled> indexed_task_configs(tasks.size());
   for (const auto &task : tasks) {
     NodeIndex idx = graph->get_index(task.task_id);
     if (idx != kInvalidNode && idx < indexed_task_configs.size()) {
-      indexed_task_configs[idx] = task;
+      indexed_task_configs[idx] = task.compiled();
     }
   }
 
@@ -96,9 +98,37 @@ auto DAGInfo::prepare_runtime_artifacts() -> Result<void> {
       std::make_shared<const std::vector<ExecutorConfig>>(
           std::move(executor_configs));
   compiled_indexed_task_configs =
-      std::make_shared<const std::vector<TaskConfig>>(
+      std::make_shared<const std::vector<TaskConfig::Compiled>>(
           std::move(indexed_task_configs));
   return ok();
+}
+
+auto DAGInfo::rebuild_task_index() -> void {
+  task_index.clear();
+  for (auto [i, task] : tasks | std::views::enumerate) {
+    task_index.emplace(task.task_id, static_cast<std::size_t>(i));
+  }
+}
+
+auto DAGInfo::compute_reverse_adj() const
+    -> ankerl::unordered_dense::map<TaskId, std::vector<TaskId>> {
+  ankerl::unordered_dense::map<TaskId, std::vector<TaskId>> result;
+  for (const auto &task : tasks) {
+    for (const auto &dep : task.dependencies) {
+      result[dep.task_id].push_back(task.task_id);
+    }
+  }
+  return result;
+}
+
+auto DAGInfo::find_task(const TaskId &task_id) -> TaskConfig * {
+  auto it = task_index.find(task_id);
+  return it != task_index.end() ? &tasks[it->second] : nullptr;
+}
+
+auto DAGInfo::find_task(const TaskId &task_id) const -> const TaskConfig * {
+  auto it = task_index.find(task_id);
+  return it != task_index.end() ? &tasks[it->second] : nullptr;
 }
 
 DAGManager::DAGManager(PersistenceService *persistence)
@@ -123,7 +153,8 @@ auto DAGManager::local_state_snapshot() const noexcept
   if (runtime_) {
     const shard_id sid = runtime_->current_shard();
     if (sid != kInvalidShard && sid < shard_slots_.size()) {
-      auto snapshot = shard_slots_[sid].snapshot.load(std::memory_order_acquire);
+      auto snapshot =
+          shard_slots_[sid].snapshot.load(std::memory_order_acquire);
       if (snapshot) {
         return snapshot;
       }
@@ -158,11 +189,9 @@ auto DAGManager::broadcast_state(State next) -> void {
     if (current != kInvalidShard && i == current) {
       continue;
     }
-    runtime_->post_to(static_cast<shard_id>(i),
-                      [this, i, snapshot] {
-                        shard_slots_[i].snapshot.store(snapshot,
-                                                       std::memory_order_release);
-                      });
+    runtime_->post_to(static_cast<shard_id>(i), [this, i, snapshot] {
+      shard_slots_[i].snapshot.store(snapshot, std::memory_order_release);
+    });
   }
 }
 
@@ -181,7 +210,8 @@ auto DAGManager::store_local_state(State next) -> void {
   shard_slots_[0].snapshot.store(snapshot, std::memory_order_release);
 }
 
-auto DAGManager::mutable_dag_in(State &state, const DAGId &dag_id) -> DAGInfo * {
+auto DAGManager::mutable_dag_in(State &state, const DAGId &dag_id)
+    -> DAGInfo * {
   return find_dag_in(state.dags, dag_id);
 }
 
@@ -189,12 +219,12 @@ auto DAGManager::persistence_available() const noexcept -> bool {
   return persistence_ != nullptr && persistence_->is_open();
 }
 
-auto DAGManager::persist_dag_definition(DAGId dag_id, DAGInfo dag,
-                                        bool existed_pre,
-                                        std::string_view action)
+auto DAGManager::persist_dag_info(DAGId dag_id, DAGInfo dag, bool existed_pre,
+                                  std::string_view action)
     -> Result<DAGInfo> {
-  auto result = persist_dag_definition_if_needed(persistence_, dag_id, std::move(dag),
-                                                 existed_pre);
+  auto result =
+      persist_dag_info_if_needed(persistence_, dag_id, std::move(dag),
+                                 existed_pre);
   log_result_error(result, "Failed to {} DAG {}", action, dag_id);
   return result;
 }
@@ -225,14 +255,14 @@ auto DAGManager::persist_task_if_needed(const DAGId &dag_id,
   return result;
 }
 
-auto DAGManager::persist_task_delete(const DAGId &dag_id,
-                                     const TaskId &task_id) -> Result<void> {
+auto DAGManager::persist_task_delete(const DAGId &dag_id, const TaskId &task_id)
+    -> Result<void> {
   if (!persistence_available()) {
     return ok();
   }
 
-  auto result =
-      run_persistence_sync(persistence_, persistence_->delete_task(dag_id, task_id));
+  auto result = run_persistence_sync(
+      persistence_, persistence_->delete_task(dag_id, task_id));
   log_result_error(result, "Failed to delete task {} from DAG {}", task_id,
                    dag_id);
   return result;
@@ -288,8 +318,7 @@ auto DAGManager::erase_dag_snapshot(const DAGId &dag_id) -> Result<void> {
 
 auto DAGManager::validate_mutation(const DAGId &dag_id,
                                    const MutationContext &ctx,
-                                   DagValidateFn &validate)
-    -> Result<void> {
+                                   DagValidateFn &validate) -> Result<void> {
   (void)dag_id;
   if (!validate) {
     return ok();
@@ -301,8 +330,7 @@ auto DAGManager::validate_mutation(const DAGId &dag_id,
 }
 
 auto DAGManager::apply_mutation(const DAGId &dag_id, MutationContext &ctx,
-                                DagMutateFn &mutate)
-    -> Result<void> {
+                                DagMutateFn &mutate) -> Result<void> {
   (void)dag_id;
   if (!mutate) {
     return ok();
@@ -314,8 +342,8 @@ auto DAGManager::apply_mutation(const DAGId &dag_id, MutationContext &ctx,
 }
 
 auto DAGManager::commit_mutation(const DAGId &dag_id, MutationContext ctx,
-                                 DagMutationMode mode,
-                                 bool touch_updated_at) -> Result<void> {
+                                 DagMutationMode mode, bool touch_updated_at)
+    -> Result<void> {
   if (ctx.mutated == nullptr) {
     return fail(Error::NotFound);
   }
@@ -347,9 +375,10 @@ auto DAGManager::commit_mutation(const DAGId &dag_id, MutationContext ctx,
   return ok();
 }
 
-auto DAGManager::mutate_existing_dag(
-    const DAGId &dag_id, DagValidateFn validate, DagMutateFn mutate,
-    DagMutationMode mode, bool touch_updated_at) -> Result<void> {
+auto DAGManager::mutate_existing_dag(const DAGId &dag_id,
+                                     DagValidateFn validate, DagMutateFn mutate,
+                                     DagMutationMode mode,
+                                     bool touch_updated_at) -> Result<void> {
   auto ctx = begin_mutation(dag_id);
   if (!ctx) {
     return fail(ctx.error());
@@ -381,7 +410,7 @@ auto DAGManager::rebuild_and_broadcast(State next, const DAGId &dag_id,
 
 auto DAGManager::create_dag(DAGId dag_id, const DAGInfo &info) -> Result<void> {
   auto current = local_state_snapshot();
-  auto dag_copy = prepare_dag_definition(dag_id.clone(), info);
+  auto dag_copy = prepare_dag_info(dag_id.clone(), info);
   if (!dag_copy) {
     return fail(dag_copy.error());
   }
@@ -390,7 +419,7 @@ auto DAGManager::create_dag(DAGId dag_id, const DAGInfo &info) -> Result<void> {
   }
 
   auto persisted =
-      persist_dag_definition(dag_id.clone(), std::move(*dag_copy), false, "persist");
+      persist_dag_info(dag_id.clone(), std::move(*dag_copy), false, "persist");
   if (!persisted) {
     return fail(persisted.error());
   }
@@ -470,14 +499,14 @@ auto DAGManager::apply_dag_state_local(const DAGId &dag_id,
 
 auto DAGManager::upsert_dag(DAGId dag_id, const DAGInfo &info) -> Result<void> {
   auto current = local_state_snapshot();
-  auto dag_copy = prepare_dag_definition(dag_id.clone(), info);
+  auto dag_copy = prepare_dag_info(dag_id.clone(), info);
   if (!dag_copy) {
     return fail(dag_copy.error());
   }
   const bool existed_pre = find_dag_in(current->dags, dag_id) != nullptr;
 
-  auto persisted = persist_dag_definition(dag_id.clone(), std::move(*dag_copy),
-                                          existed_pre, "upsert");
+  auto persisted = persist_dag_info(dag_id.clone(), std::move(*dag_copy),
+                                    existed_pre, "upsert");
   if (!persisted) {
     return fail(persisted.error());
   }
@@ -501,8 +530,7 @@ auto DAGManager::get_dag(const DAGId &dag_id) const -> Result<DAGInfo> {
 
 auto DAGManager::list_dags() const -> std::vector<DAGInfo> {
   auto current = local_state_snapshot();
-  return current->dags | std::views::values |
-         std::ranges::to<std::vector>();
+  return current->dags | std::views::values | std::ranges::to<std::vector>();
 }
 
 auto DAGManager::delete_dag(const DAGId &dag_id) -> Result<void> {
@@ -518,6 +546,29 @@ auto DAGManager::delete_dag(const DAGId &dag_id) -> Result<void> {
     return fail(erased.error());
   }
   log::info("Deleted DAG: {}", dag_id);
+  return ok();
+}
+
+auto DAGManager::replace_all(std::vector<DAGInfo> dags) -> Result<void> {
+  State next;
+  next.dags.reserve(dags.size());
+
+  for (auto &dag : dags) {
+    if (dag.dag_id.empty()) {
+      return fail(Error::InvalidArgument);
+    }
+    if (auto r = dag.prepare_runtime_artifacts(); !r) {
+      return fail(r.error());
+    }
+
+    auto dag_id = dag.dag_id.clone();
+    auto [_, inserted] = next.dags.emplace(dag_id, std::move(dag));
+    if (!inserted) {
+      return fail(Error::AlreadyExists);
+    }
+  }
+
+  broadcast_state(std::move(next));
   return ok();
 }
 
@@ -545,11 +596,11 @@ auto DAGManager::add_task(const DAGId &dag_id, const TaskConfig &task)
     return fail(Error::InvalidArgument);
   }
 
-  for (const auto &dep : task.dependencies) {
-    if (!dag->find_task(dep.task_id)) {
-      log::warn("Dependency {} not found in DAG {}", dep.task_id, dag_id);
-      return fail(Error::NotFound);
-    }
+  if (std::ranges::any_of(task.dependencies, [&](const TaskDependency &dep) {
+        return !dag->find_task(dep.task_id);
+      })) {
+    log::warn("Dependency not found in DAG {}", dag_id);
+    return fail(Error::NotFound);
   }
 
   auto persisted_task_rowid = persist_task_if_needed(dag_id, task, "create");
@@ -803,8 +854,8 @@ auto DAGManager::load_from_database() -> Result<void> {
         }
 
         broadcast_state(std::move(next));
-        log::info("Loaded {} DAGs from database (inserted={}, merged={})",
-                  dags_result.size(), inserted_from_db, merged_into_file_dags);
+        log::debug("Loaded {} DAGs from database (inserted={}, merged={})",
+                   dags_result.size(), inserted_from_db, merged_into_file_dags);
         return ok();
       });
 }

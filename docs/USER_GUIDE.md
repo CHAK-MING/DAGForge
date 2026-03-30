@@ -31,7 +31,8 @@ In-depth usage, patterns, and troubleshooting. For a quick overview see the [REA
 13. [Re-running Failed Tasks](#13-re-running-failed-tasks)
 14. [Database Maintenance](#14-database-maintenance)
 15. [Scripting / JSON Output](#15-scripting--json-output)
-16. [Troubleshooting](#16-troubleshooting)
+16. [CLI Cheatsheet](#16-cli-cheatsheet)
+17. [Troubleshooting](#17-troubleshooting)
 
 ---
 
@@ -41,7 +42,7 @@ In-depth usage, patterns, and troubleshooting. For a quick overview see the [REA
 
 - Linux (x86-64 or ARM64)
 - GCC 15+ or Clang 19+
-- CMake 3.25+
+- build2 0.17+ (`b`, `bdep`, `bpkg`)
 - Boost 1.87+
 - MySQL 8.0+
 
@@ -58,9 +59,9 @@ FLUSH PRIVILEGES;
 ### 🏗️ Build
 
 ```bash
-cmake --preset default
-cmake --build --preset default
-# Binary: ./build/bin/dagforge
+bdep init -C build @gcc cc config.cxx=g++
+bdep update @gcc
+# Binary: ./bin/dagforge
 ```
 
 ### ⚙️ Configure
@@ -68,36 +69,39 @@ cmake --build --preset default
 The `system_config.toml` file maps to the internal configuration structures.
 
 ```toml
+[scheduler]
+log_level = "info"
+log_file = ""
+pid_file = ""
+tick_interval_ms = 1000
+max_concurrency = 10
+shards = 0
+scheduler_shards = 1
+pin_shards_to_cores = false
+cpu_affinity_offset = 0
+zombie_reaper_interval_sec = 60
+zombie_heartbeat_timeout_sec = 300
+
 [database]
 host = "127.0.0.1"
 port = 3306
 username = "dagforge"
 password = "dagforge"
 database = "dagforge"
-pool_size = 4             # connections per shard
-connect_timeout = 5       # seconds
-
-[scheduler]
-log_level = "info"        # trace | debug | info | warn | error
-log_file = ""             # used for daemon mode
-pid_file = ""
-tick_interval_ms = 1000   # scheduling loop frequency
-max_concurrency = 10      # max active task runs per shard
-shards = 0                # 0 = auto-detect CPU cores
-zombie_reaper_interval_sec = 60
-zombie_heartbeat_timeout_sec = 300
+pool_size = 4
+connect_timeout = 5
 
 [api]
 enabled = true
-port = 8888
 host = "127.0.0.1"
+port = 8888
 reuse_port = false
 tls_enabled = false
 tls_cert_file = ""
 tls_key_file = ""
 
 [dag_source]
-mode = "File"             # File | Api | Hybrid
+mode = "File"
 directory = "./dags"
 scan_interval_sec = 60
 ```
@@ -131,14 +135,17 @@ dagforge validate -f dags/hello_world.toml   # single file
 ### Foreground (Development)
 
 ```bash
-dagforge serve start
+dagforge serve start -c system_config.toml
 # Logs go to stderr; API at http://127.0.0.1:8888
 ```
+
+> [!TIP]
+> Set `export DAGFORGE_CONFIG=system_config.toml` to skip `-c` on every command.
 
 ### Background Daemon (Production)
 
 ```bash
-dagforge serve start -d --log-file /var/log/dagforge.log
+dagforge serve start -c system_config.toml -d --log-file /var/log/dagforge.log
 ```
 
 The process detaches and redirects all output to the log file. `--log-file` is required when using `--daemon`.
@@ -147,16 +154,16 @@ The process detaches and redirects all output to the log file. `--log-file` is r
 Check status or stop it with:
 
 ```bash
-dagforge serve status
-dagforge serve stop
+dagforge serve status -c system_config.toml
+dagforge serve stop -c system_config.toml
 # custom stop timeout (default: 10s)
-dagforge serve stop --timeout 30
+dagforge serve stop -c system_config.toml --timeout 30
 ```
 
 ### Disable the API
 
 ```bash
-dagforge serve start --no-api   # scheduler only, no HTTP server
+dagforge serve start -c system_config.toml --no-api   # scheduler only, no HTTP server
 ```
 
 ### Log Levels
@@ -164,7 +171,7 @@ dagforge serve start --no-api   # scheduler only, no HTTP server
 The default is `info`. To see scheduler internals:
 
 ```bash
-dagforge serve start --log-level debug
+dagforge serve start -c system_config.toml --log-level debug
 ```
 
 ### Shard Count Override
@@ -172,18 +179,15 @@ dagforge serve start --log-level debug
 By default, DAGForge auto-detects CPU cores and uses that shard count. To override:
 
 ```bash
-dagforge serve start --shards 4
+dagforge serve start -c system_config.toml --shards 4
 ```
 
 Or set it permanently in `system_config.toml`:
 
 ```toml
 [scheduler]
-log_level = "debug"
+shards = 4
 ```
-
-> [!WARNING]
-> Log lines from the service itself (e.g. `MySQL database opened`) go to **stderr**, not stdout. When piping JSON output from CLI commands, only stdout is captured — stderr is separate.
 
 ---
 
@@ -194,19 +198,25 @@ Task stdout and stderr are captured line-by-line and stored in the MySQL `task_l
 ### View all logs for the latest run
 
 ```bash
-dagforge logs hello_world --latest
+dagforge logs hello_world --latest -c system_config.toml
+```
+
+### View logs for a specific run
+
+```bash
+dagforge logs daily_etl --run <run_id> -c system_config.toml
 ```
 
 ### View logs for a specific task
 
 ```bash
-dagforge logs daily_etl --latest --task extract
+dagforge logs daily_etl --latest --task extract -c system_config.toml
 ```
 
 ### Follow logs in real time (like `tail -f`)
 
 ```bash
-dagforge logs daily_etl --latest -f
+dagforge logs daily_etl --latest -f -c system_config.toml
 ```
 
 This polls and exits automatically when the run reaches a terminal state (success, failed, cancelled).
@@ -214,13 +224,13 @@ This polls and exits automatically when the run reaches a terminal state (succes
 ### View logs for a retry attempt
 
 ```bash
-dagforge logs daily_etl --latest --task extract --attempt 2
+dagforge logs daily_etl --latest --task extract --attempt 2 -c system_config.toml
 ```
 
 ### JSON output (for scripting)
 
 ```bash
-dagforge logs hello_world --latest --json
+dagforge logs hello_world --latest --json -c system_config.toml
 # Each line is a JSON object: {"task_id":"greet","attempt":1,"stream":"stdout","logged_at":"...","content":"..."}
 ```
 
@@ -253,7 +263,7 @@ If the run shows `success` but `logs` shows nothing, the run predates the log ta
 
 ## 4. DAG Hot-Reload
 
-The service scans the DAG source directory every `scan_interval_sec` seconds (default: 60). Changes to `.toml` files are picked up automatically — **no restart required**.
+The service scans the DAG source directory every `scan_interval_sec` seconds (default: 30). Changes to `.toml` files are picked up automatically — **no restart required**.
 
 ```toml
 [dag_source]
@@ -685,11 +695,48 @@ To reduce startup noise, lower the log level in config:
 log_level = "warn"   # only warnings and errors
 ```
 
-Commands with `--json` support: `trigger`, `test`, `list dags`, `list runs`, `list tasks`, `inspect`, `logs`, `pause`, `unpause`, `validate`.
+Commands with `--json` support: `trigger`, `test`, `list dags`, `list runs`, `list tasks`, `inspect`, `logs`, `pause`, `unpause`, `clear`, `serve status`, `validate`.
 
 ---
 
-## 16. Troubleshooting
+## 16. CLI Cheatsheet
+
+```bash
+# Service Management
+dagforge serve start  [-c file] [--pid-file path] [--daemon/-d] [--log-file path] [--no-api] [--log-level trace|debug|info|warn|error] [--shards N]
+dagforge serve status [-c file] [--pid-file path] [--json]
+dagforge serve stop   [-c file] [--pid-file path] [--timeout N] [--force]
+
+# Trigger & Test
+dagforge trigger <dag_id> [--wait] [-e execution_date] [--no-api] [--json]
+dagforge test <dag_id> <task_id> [--json]
+
+# Listing
+dagforge list dags  [--include-stale] [--limit N] [--output table|json] [--json]
+dagforge list runs  [dag_id] [--state failed|success|running] [--limit N] [--output table|json] [--json]
+dagforge list tasks [dag_id] [--output table|json] [--json]
+
+# Inspection and Logs
+dagforge inspect <dag_id> [--run id|--latest] [--xcom] [--details] [--json]
+dagforge logs <dag_id> [--run id|--latest] [--task task_id] [--attempt N] [-f|--follow] [--short-time] [--json]
+
+# DAG Control
+dagforge pause <dag_id> [--json]
+dagforge unpause <dag_id> [--json]
+dagforge clear <dag_id> --run <run_id> [--task <task_id>] [--failed] [--all] [--downstream] [--dry-run] [--json]
+
+# Database Operations
+dagforge db init
+dagforge db migrate
+dagforge db prune-stale [--dry-run]
+
+# Validation
+dagforge validate [-c file | -f dag.toml] [--json]
+```
+
+---
+
+## 17. Troubleshooting
 
 ### `logs` shows no output after a successful run
 

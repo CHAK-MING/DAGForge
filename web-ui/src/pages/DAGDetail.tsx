@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { AppLayout } from "@/components/AppLayout";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -26,6 +26,7 @@ import { RunHistoryTab } from "@/components/dag-detail/RunHistoryTab";
 import { FlowGraphTab } from "@/components/dag-detail/FlowGraphTab";
 import { XComTab } from "@/components/dag-detail/XComTab";
 import { TaskDefinitionsTab } from "@/components/dag-detail/TaskDefinitionsTab";
+import { RunLogsTab } from "@/components/dag-detail/RunLogsTab";
 
 // API Types
 import { getTask, TaskConfig } from "@/lib/api";
@@ -40,7 +41,9 @@ export default function DAGDetail() {
   const { t } = useI18n();
 
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>();
+  const [followLatestRun, setFollowLatestRun] = useState(true);
   const [taskDefinitions, setTaskDefinitions] = useState<TaskDefinition[]>([]);
+  const previousLatestRunIdRef = useRef<string | undefined>(undefined);
 
   // TanStack Query: DAG Info
   const { data: dagInfo, isLoading: loadingDAG } = useDAGQuery(id);
@@ -76,6 +79,15 @@ export default function DAGDetail() {
             task_id: taskId,
             name: taskId,
             command: "",
+            executor: "shell" as const,
+            execution_timeout_sec: 0,
+            retry_interval_sec: 0,
+            max_retries: 0,
+            trigger_rule: "all_success",
+            is_branch: false,
+            depends_on_past: false,
+            xcom_push_count: 0,
+            xcom_pull_count: 0,
             dependencies: [],
             dagId: id,
           };
@@ -91,10 +103,27 @@ export default function DAGDetail() {
 
   // Auto-select first run when runs are loaded
   useEffect(() => {
-    if (runs.length > 0 && !selectedRunId) {
-      setSelectedRunId(runs[0].dag_run_id);
+    const latestRunId = runs[0]?.dag_run_id;
+    const previousLatestRunId = previousLatestRunIdRef.current;
+
+    if (!latestRunId) {
+      previousLatestRunIdRef.current = undefined;
+      return;
     }
-  }, [runs, selectedRunId]);
+
+    const latestChanged =
+      previousLatestRunId !== undefined && latestRunId !== previousLatestRunId;
+    const shouldSwitch =
+      !selectedRunId ||
+      followLatestRun ||
+      (latestChanged && selectedRunId === previousLatestRunId);
+
+    if (shouldSwitch && selectedRunId !== latestRunId) {
+      setSelectedRunId(latestRunId);
+    }
+
+    previousLatestRunIdRef.current = latestRunId;
+  }, [followLatestRun, runs, selectedRunId]);
 
   // WebSocket event handlers (integrated with TanStack Query) via singleton
   const handleWsTaskStatus = useCallback((data: WebSocketEventData) => {
@@ -123,8 +152,14 @@ export default function DAGDetail() {
 
   const handleTriggerDAG = () => {
     if (!id) return;
+    setFollowLatestRun(true);
     triggerDAGMutation.mutate(id);
   };
+
+  const handleSelectRun = useCallback((runId: string) => {
+    setSelectedRunId(runId);
+    setFollowLatestRun(runId === runs[0]?.dag_run_id);
+  }, [runs]);
 
   const handleTogglePause = () => {
     if (!id || !dagInfo) return;
@@ -156,6 +191,9 @@ export default function DAGDetail() {
           <div>
             <div className="flex items-center gap-2">
               <h1 className="text-2xl font-bold">{dagInfo.name}</h1>
+              {!dagInfo.cron && (
+                <Badge variant="secondary">{t.common.manualOnly}</Badge>
+              )}
               {dagInfo.is_paused && (
                 <Badge variant="outline">{t.common.paused}</Badge>
               )}
@@ -198,6 +236,7 @@ export default function DAGDetail() {
           <TabsTrigger value="tasks">{t.dagDetail.taskDefinitions}</TabsTrigger>
           <TabsTrigger value="graph">{t.dagDetail.flowGraph}</TabsTrigger>
           <TabsTrigger value="runs">{t.dagDetail.runInstances}</TabsTrigger>
+          <TabsTrigger value="logs">{t.dagDetail.logs}</TabsTrigger>
           <TabsTrigger value="xcom">{t.dagDetail.xcomData}</TabsTrigger>
         </TabsList>
 
@@ -211,7 +250,7 @@ export default function DAGDetail() {
             runs={runs}
             selectedRunId={selectedRunId}
             taskInstances={taskInstances}
-            onSelectRun={setSelectedRunId}
+            onSelectRun={handleSelectRun}
           />
         </TabsContent>
 
@@ -219,7 +258,16 @@ export default function DAGDetail() {
           <RunHistoryTab
             runs={runs}
             selectedRunId={selectedRunId}
-            onSelectRun={setSelectedRunId}
+            onSelectRun={handleSelectRun}
+          />
+        </TabsContent>
+
+        <TabsContent value="logs">
+          <RunLogsTab
+            runs={runs}
+            selectedRunId={selectedRunId}
+            taskDefinitions={taskDefinitions}
+            onSelectRun={handleSelectRun}
           />
         </TabsContent>
 
@@ -228,7 +276,7 @@ export default function DAGDetail() {
             runs={runs}
             selectedRunId={selectedRunId}
             xcomData={xcomData?.xcom || {}}
-            onSelectRun={setSelectedRunId}
+            onSelectRun={handleSelectRun}
           />
         </TabsContent>
       </Tabs>

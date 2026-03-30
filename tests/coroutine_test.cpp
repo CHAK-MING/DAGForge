@@ -83,8 +83,8 @@ TEST_F(CoroutineTest, WhenAll_MixedTypes) {
 // --- when_any (||) ---
 TEST_F(CoroutineTest, WhenAny_ImmediateCompletion) {
   auto fast = []() -> awaitable<int> { co_return 10; };
-  auto slow = [](asio::io_context &io) -> awaitable<int> {
-    asio::steady_timer t(io, std::chrono::seconds(10));
+  auto slow = [](asio::io_context &event_loop) -> awaitable<int> {
+    asio::steady_timer t(event_loop, std::chrono::seconds(10));
     co_await t.async_wait(use_awaitable);
     co_return 99;
   };

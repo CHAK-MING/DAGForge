@@ -1,7 +1,9 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/core/shard.hpp"
 #include "dagforge/util/id.hpp"
+#endif
 
 #include <optional>
 #include <unordered_map>

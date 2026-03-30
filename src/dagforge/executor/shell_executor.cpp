@@ -1,16 +1,12 @@
-#include "dagforge/core/asio_awaitable.hpp"
-#include "dagforge/core/coroutine.hpp"
 #include "dagforge/executor/executor.hpp"
 #include "dagforge/executor/executor_state.hpp"
 #include "dagforge/executor/executor_utils.hpp"
 #include "dagforge/executor/process_launch.hpp"
 #include "dagforge/executor/process_management.hpp"
-#include "dagforge/util/id.hpp"
 #include "dagforge/util/log.hpp"
 
 #include <boost/asio/bind_cancellation_slot.hpp>
 #include <boost/asio/buffer.hpp>
-#include <boost/asio/cancel_after.hpp>
 #include <boost/asio/cancellation_signal.hpp>
 #include <boost/asio/readable_pipe.hpp>
 #include <boost/process/v2/process.hpp>
@@ -18,8 +14,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstdlib>
+#include <experimental/scope>
 #include <format>
 #include <memory>
 #include <optional>
@@ -40,6 +38,7 @@ inline constexpr std::size_t kMaxOutputSize = 10UZ * 1024 * 1024;
 inline constexpr std::size_t kReadBufferSize = 4096;
 inline constexpr std::size_t kInitialOutputReserve = 8192;
 inline constexpr int kTimeoutExitCode = kExitCodeTimeout;
+inline constexpr auto kHeartbeatInterval = std::chrono::seconds(1);
 
 // is_valid_env_key is in executor_utils.hpp
 using ::dagforge::is_valid_env_key;
@@ -77,6 +76,35 @@ auto emit_stream_line(ExecutionSink &sink, const InstanceId &instance_id,
   if (sink.on_stderr) {
     streamed_any = true;
     sink.on_stderr(instance_id, line);
+  }
+}
+
+auto emit_heartbeat(
+    const std::shared_ptr<ExecutorHeartbeatCallback> &heartbeat_callback,
+    const InstanceId &instance_id) -> void {
+  if (heartbeat_callback && *heartbeat_callback) {
+    (*heartbeat_callback)(instance_id);
+  }
+}
+
+auto run_executor_heartbeat(
+    std::shared_ptr<ExecutorHeartbeatCallback> heartbeat_callback,
+    std::shared_ptr<std::atomic_bool> stop, InstanceId instance_id)
+    -> spawn_task {
+  if (!heartbeat_callback || !*heartbeat_callback) {
+    co_return;
+  }
+
+  while (!stop->load(std::memory_order_acquire)) {
+    try {
+      co_await async_sleep_on_timing_wheel(kHeartbeatInterval);
+    } catch (const std::exception &) {
+      co_return;
+    }
+    if (stop->load(std::memory_order_acquire)) {
+      co_return;
+    }
+    (*heartbeat_callback)(instance_id);
   }
 }
 
@@ -134,31 +162,46 @@ auto emit_stream_line(ExecutionSink &sink, const InstanceId &instance_id,
 wait_process_with_timeout(bp::process &proc, std::chrono::seconds timeout,
                           boost::asio::cancellation_signal &cancel_sig)
     -> task<ProcessWaitResult> {
-  auto [ec, exit_code] =
-      co_await proc.async_wait(boost::asio::cancel_after(timeout, use_nothrow));
-  if (!ec) {
-    co_return ProcessWaitResult{.exit_code = exit_code};
+  using namespace boost::asio::experimental::awaitable_operators;
+
+  auto outcome = co_await (reap_process(proc) ||
+                           async_sleep_on_timing_wheel(timeout));
+  if (outcome.index() == 0) {
+    co_return std::move(std::get<0>(outcome));
   }
-  if (ec == boost::asio::error::operation_aborted) {
-    cancel_sig.emit(boost::asio::cancellation_type::total);
-    auto result = co_await terminate_and_reap_process(proc, true);
-    result.exit_code = kTimeoutExitCode;
-    co_return result;
-  }
-  co_return ProcessWaitResult{.error = ec};
+
+  cancel_sig.emit(boost::asio::cancellation_type::total);
+  auto result = co_await terminate_and_reap_process(proc, true);
+  result.exit_code = kTimeoutExitCode;
+  co_return result;
 }
 
 auto execute_command(std::string cmd, std::string working_dir,
                      std::optional<bp::process_environment> env,
                      std::chrono::seconds timeout, InstanceId instance_id,
-                     ExecutionSink sink, ExecutionContext ctx,
-                     pmr::memory_resource *resource) -> spawn_task {
+                     ExecutionSink sink,
+                     std::shared_ptr<ExecutorHeartbeatCallback>
+                         heartbeat_callback,
+                     ExecutionContext ctx,
+                     std::shared_ptr<pmr::memory_resource> resource_owner,
+                     Runtime &runtime)
+    -> spawn_task {
+  auto *resource = resource_owner != nullptr ? resource_owner.get()
+                                             : current_memory_resource_or_default();
   auto &io = current_io_context();
   boost::asio::readable_pipe stdout_pipe(io);
   boost::asio::readable_pipe stderr_pipe(io);
   ExecutorResult result = make_executor_result(resource);
   result.stdout_output.reserve(kInitialOutputReserve);
   result.stderr_output.reserve(kInitialOutputReserve);
+  auto heartbeat_stop = std::make_shared<std::atomic_bool>(false);
+  const auto stop_heartbeat = std::experimental::scope_exit(
+      [heartbeat_stop] { heartbeat_stop->store(true, std::memory_order_release); });
+  emit_heartbeat(heartbeat_callback, instance_id);
+  if (heartbeat_callback && *heartbeat_callback) {
+    runtime.spawn(run_executor_heartbeat(heartbeat_callback, heartbeat_stop,
+                                         instance_id.clone()));
+  }
 
   std::optional<bp::process> proc;
   try {
@@ -180,7 +223,7 @@ auto execute_command(std::string cmd, std::string working_dir,
 
   const auto pid = proc->id();
   ctx.register_process(instance_id, pid);
-  log::info("shell process started pid={} instance_id={}", pid, instance_id);
+  log::debug("shell process started pid={} instance_id={}", pid, instance_id);
 
   boost::asio::cancellation_signal cancel_sig;
   bool stdout_streamed = false;
@@ -214,8 +257,8 @@ auto execute_command(std::string cmd, std::string working_dir,
   }
 
   ctx.unregister_process(instance_id);
-  log::info("shell finish: instance_id={} exit_code={} timed_out={} err='{}'",
-            instance_id, result.exit_code, result.timed_out, result.error);
+  log::debug("shell finish: instance_id={} exit_code={} timed_out={} err='{}'",
+             instance_id, result.exit_code, result.timed_out, result.error);
   if (sink.on_complete) {
     sink.on_complete(instance_id, std::move(result));
   }
@@ -239,12 +282,13 @@ public:
     if (!shell) {
       return fail(Error::InvalidArgument);
     }
+    auto resource_owner = req.memory_resource;
 
-    log::info("ShellExecutor start: instance_id={} timeout={}s cmd='{}'",
-              req.instance_id, shell->execution_timeout.count(),
-              cmd_preview(shell->command));
+    log::debug("ShellExecutor start: instance_id={} timeout={}s cmd='{}'",
+               req.instance_id, req.execution_timeout.count(),
+               cmd_preview(req.command));
 
-    std::string cmd = shell->command;
+    std::string cmd = req.command;
     std::optional<bp::process_environment> env;
     if (!shell->env.empty()) {
       for (const auto &[key, value] : shell->env) {
@@ -257,11 +301,16 @@ public:
     }
 
     auto sid = runtime_->is_current_shard() ? runtime_->current_shard() : 0;
-    auto t = execute_command(std::move(cmd), shell->working_dir, std::move(env),
-                             shell->execution_timeout, req.instance_id,
-                             std::move(sink),
+    std::shared_ptr<ExecutorHeartbeatCallback> heartbeat_callback;
+    if (sink.on_heartbeat) {
+      heartbeat_callback = std::make_shared<ExecutorHeartbeatCallback>(
+          std::move(sink.on_heartbeat));
+    }
+    auto t = execute_command(std::move(cmd), req.working_dir, std::move(env),
+                             req.execution_timeout, req.instance_id,
+                             std::move(sink), std::move(heartbeat_callback),
                              ExecutionContext{.state = &shard_states_[sid]},
-                             req.resource());
+                             resource_owner, *runtime_);
     runtime_->spawn(std::move(t));
     return ok();
   }
@@ -274,7 +323,7 @@ public:
                              return;
                            }
                            kill_process_group_or_process(it->second.pid);
-                           log::info("Cancelled process for instance {}", id);
+                           log::debug("Cancelled process for instance {}", id);
                          });
   }
 

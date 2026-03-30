@@ -18,6 +18,7 @@ import { DAGStatusBadge, DAGStatusIcon, formatDuration, formatTime } from "@/lib
 import { DAGRunState } from "@/types/dag";
 import { wsManager } from "@/lib/websocket";
 import { useI18n } from "@/contexts/I18nContext";
+import { matchesSearchQuery } from "@/lib/search";
 
 const TriggerTypeBadge = ({ type, t }: { type: string; t: Translations }) => {
     switch (type) {
@@ -60,7 +61,13 @@ export default function History() {
 
     const filteredHistory = history.filter((run) => {
         const dagName = run.dag_name || run.dag_id;
-        const matchesSearch = dagName.toLowerCase().includes(searchQuery.toLowerCase());
+        const matchesSearch = matchesSearchQuery(
+            searchQuery,
+            run.dag_id,
+            run.dag_name,
+            dagName,
+            run.dag_run_id
+        );
         const matchesStatus = statusFilter === "all" || run.state === statusFilter;
         return matchesSearch && matchesStatus;
     });

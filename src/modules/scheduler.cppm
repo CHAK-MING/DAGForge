@@ -1,0 +1,36 @@
+module;
+
+#include <boost/describe/enum.hpp>
+#include <boost/describe/enumerators.hpp>
+#include <boost/mp11/algorithm.hpp>
+
+#include <array>
+#include <bitset>
+#include <cctype>
+#include <charconv>
+#include <chrono>
+#include <concepts>
+#include <cstddef>
+#include <cstdint>
+#include <generator>
+#include <ranges>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#define DAGFORGE_BUILDING_MODULE_INTERFACE 1
+#include "dagforge/util/enum.hpp"
+#undef DAGFORGE_BUILDING_MODULE_INTERFACE
+
+export module dagforge.scheduler;
+
+export import dagforge.base;
+
+#define DAGFORGE_BUILDING_MODULE_INTERFACE 1
+export {
+#include "dagforge/scheduler/task_state.hpp"
+#include "dagforge/scheduler/cron.hpp"
+}
+#undef DAGFORGE_BUILDING_MODULE_INTERFACE

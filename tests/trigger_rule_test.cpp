@@ -514,6 +514,14 @@ TEST_F(TriggerRuleSerializationTest, ParseUnknownDefaultsToAllSuccess) {
   EXPECT_EQ(parse<TriggerRule>("invalid_rule"), TriggerRule::AllSuccess);
 }
 
+TEST_F(TriggerRuleSerializationTest, ParseNormalizesCaseAndSeparators) {
+  EXPECT_EQ(parse<TriggerRule>("ALL-SUCCESS"), TriggerRule::AllSuccess);
+  EXPECT_EQ(parse<TriggerRule>("none failed min one success"),
+            TriggerRule::NoneFailedMinOneSuccess);
+  EXPECT_EQ(dagforge::util::normalize_enum_token("All-Done Min_One-Success"),
+            "alldoneminonesuccess");
+}
+
 // ============================================================================
 // Test Cases: AllDoneMinOneSuccess (NEW)
 // ============================================================================

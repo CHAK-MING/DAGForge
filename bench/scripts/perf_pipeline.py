@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from benchlib.artifacts import compact_json, write_json
+
 
 @dataclass(frozen=True)
 class BenchSpec:
@@ -92,15 +94,6 @@ def results_root() -> Path:
             str(repo_root() / "bench_results" / "perf_pipeline"),
         )
     )
-
-
-def compact_json(data: Any) -> str:
-    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-
-
-def write_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(compact_json(data) + "\n", encoding="utf-8")
 
 
 def run_tag() -> str:

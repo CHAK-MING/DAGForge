@@ -1,6 +1,10 @@
 #pragma once
 
+
+#if !defined(DAGFORGE_CONSUME_NAMED_MODULES) ||                                  \
+    !DAGFORGE_CONSUME_NAMED_MODULES
 #include "dagforge/core/error.hpp"
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -8,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+
 
 namespace boost::interprocess {
 class file_lock;

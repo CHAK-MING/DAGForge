@@ -47,6 +47,6 @@ TEST(ShardTest, ContextExecutesPostedWork) {
   Shard shard(0);
   std::atomic<int> counter{0};
   boost::asio::post(shard.ctx(), [&] { counter.fetch_add(1); });
-  shard.ctx().run_one();
+  (void)shard.ctx().run_one();
   EXPECT_EQ(counter.load(), 1);
 }

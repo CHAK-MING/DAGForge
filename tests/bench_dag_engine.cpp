@@ -1,12 +1,13 @@
 // bench_dag_engine.cpp
 
 #include "dagforge/core/memory.hpp"
+#include "dagforge/dag/dag_manager.hpp"
 #include "dagforge/dag/dag.hpp"
 #include "dagforge/dag/dag_run.hpp"
 
 #include "test_utils.hpp"
 
-#include <benchmark/benchmark.h>
+#include "benchmark_compat.hpp"
 
 #include <cstdint>
 #include <format>
@@ -49,6 +50,35 @@ public:
 private:
   std::vector<InstanceId> ids_;
 };
+
+[[nodiscard]] auto make_bench_task_config(std::size_t dag_index,
+                                          std::size_t task_index)
+    -> TaskConfig {
+  const auto task_id_text =
+      std::format("bench_dag_{}_task_{}", dag_index, task_index);
+  std::vector<TaskId> dependencies;
+  if (task_index > 0) {
+    dependencies.emplace_back(
+        std::format("bench_dag_{}_task_{}", dag_index, task_index - 1));
+  }
+  return test::create_task_config(TaskId{task_id_text}, task_id_text,
+                                  "echo bench", std::move(dependencies));
+}
+
+[[nodiscard]] auto make_bench_dag_info(std::size_t dag_index,
+                                       std::size_t task_count) -> DAGInfo {
+  DAGInfo info;
+  info.dag_id = DAGId{
+      std::format("bench_dag_manager_{}_{}", dag_index, task_count)};
+  info.name = info.dag_id.str();
+  info.max_concurrent_runs = 4;
+  info.catchup = false;
+  info.tasks.reserve(task_count);
+  for (std::size_t i = 0; i < task_count; ++i) {
+    info.tasks.emplace_back(make_bench_task_config(dag_index, i));
+  }
+  return info;
+}
 
 [[nodiscard]] auto make_linear_dag(const TaskIdPool &ids, std::size_t nodes)
     -> DAG {
@@ -369,6 +399,68 @@ void BM_EndToEnd_Scheduling_Throughput(benchmark::State &state) {
   state.SetItemsProcessed(static_cast<int64_t>(nodes) * state.iterations());
 }
 
+// ===================================================================
+// BM_DagInfoPrepareRuntimeArtifacts
+// Measures: DAG compilation / runtime artifact preparation for a single DAG.
+// ===================================================================
+void BM_DagInfoPrepareRuntimeArtifacts(benchmark::State &state) {
+  const auto task_count = static_cast<std::size_t>(state.range(0));
+  if (task_count == 0) {
+    state.SkipWithError("requires task_count > 0");
+    return;
+  }
+
+  auto dag = make_bench_dag_info(0, task_count);
+
+  for (auto _ : state) {
+    auto prepared = dag.prepare_runtime_artifacts();
+    if (!prepared) {
+      state.SkipWithError(prepared.error().message().c_str());
+      return;
+    }
+    benchmark::DoNotOptimize(dag.compiled_graph);
+    benchmark::DoNotOptimize(dag.compiled_executor_configs);
+    benchmark::DoNotOptimize(dag.compiled_indexed_task_configs);
+  }
+
+  state.SetItemsProcessed(static_cast<int64_t>(task_count) *
+                          state.iterations());
+}
+
+// ===================================================================
+// BM_DagManagerListDags
+// Measures: snapshot copy cost for a manager with many compiled DAGs.
+// ===================================================================
+void BM_DagManagerListDags(benchmark::State &state) {
+  const auto dag_count = static_cast<std::size_t>(state.range(0));
+  const auto task_count = static_cast<std::size_t>(state.range(1));
+  if (dag_count == 0 || task_count == 0) {
+    state.SkipWithError("requires dag_count > 0 and task_count > 0");
+    return;
+  }
+
+  std::vector<DAGInfo> dags;
+  dags.reserve(dag_count);
+  for (std::size_t i = 0; i < dag_count; ++i) {
+    dags.emplace_back(make_bench_dag_info(i, task_count));
+  }
+
+  DAGManager manager;
+  if (auto r = manager.replace_all(std::move(dags)); !r) {
+    state.SkipWithError(r.error().message().c_str());
+    return;
+  }
+
+  for (auto _ : state) {
+    auto listed = manager.list_dags();
+    benchmark::DoNotOptimize(listed);
+    benchmark::DoNotOptimize(listed.size());
+  }
+
+  state.SetItemsProcessed(static_cast<int64_t>(dag_count) *
+                          state.iterations());
+}
+
 BENCHMARK(BM_DagBuildLinear)
     ->RangeMultiplier(10)
     ->Range(1000, 100000)
@@ -430,6 +522,18 @@ BENCHMARK(BM_EndToEnd_Scheduling_Throughput)
     ->Args({0, 10000, 1})
     ->Args({1, 100, 100})
     ->Unit(benchmark::kMillisecond);
+
+BENCHMARK(BM_DagInfoPrepareRuntimeArtifacts)
+    ->Arg(10)
+    ->Arg(100)
+    ->Arg(1000)
+    ->Unit(benchmark::kMicrosecond);
+
+BENCHMARK(BM_DagManagerListDags)
+    ->Args({100, 10})
+    ->Args({613, 10})
+    ->Args({1000, 10})
+    ->Unit(benchmark::kMicrosecond);
 
 } // namespace
 } // namespace dagforge

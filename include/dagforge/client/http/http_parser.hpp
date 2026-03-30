@@ -1,10 +1,13 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/client/http/http_types.hpp"
 #include "dagforge/core/error.hpp"
+#endif
 
 #include <memory>
 #include <span>
+
 
 namespace dagforge::http {
 

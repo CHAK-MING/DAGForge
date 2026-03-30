@@ -1,43 +1,127 @@
-import { useState } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { AppLayout } from "@/components/AppLayout";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { Search, Play, Pause, RefreshCw } from "lucide-react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { Search, RefreshCw } from "lucide-react";
+import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useI18n } from "@/contexts/I18nContext";
+import { DAGSummaryCard } from "@/components/DAGSummaryCard";
+import { computeDagHistoryOverview } from "@/lib/dag-overview";
+import { matchesSearchQuery } from "@/lib/search";
 import {
   useDAGsQuery,
   usePauseDAGMutation,
   useTriggerDAGMutation,
   useUnpauseDAGMutation,
 } from "@/hooks/useDAGQueries";
+import { useGlobalHistory } from "@/hooks/useSystemData";
+
+const ITEMS_PER_PAGE = 20;
+const SCROLL_STATE_KEY = "dagforge:dags:scroll-state";
 
 export default function DAGs() {
   const navigate = useNavigate();
+  const location = useLocation();
   const { t, tf } = useI18n();
-  const [searchParams] = useSearchParams();
-  const [searchQuery, setSearchQuery] = useState(searchParams.get("search") || "");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const restoredScrollRef = useRef(false);
+  const searchQuery = searchParams.get("search") || "";
+  const currentPageFromParams = Number.parseInt(searchParams.get("page") || "1", 10);
 
-  const { data: dags = [], isLoading: loading, refetch: fetchDAGs, isRefetching } = useDAGsQuery();
+  const { data: availableDAGs = [], isLoading: loading, refetch: fetchDAGs, isRefetching } = useDAGsQuery();
+  const { data: historyOverview } = useGlobalHistory(10000, {
+    select: computeDagHistoryOverview,
+  });
   const triggerDAGMutation = useTriggerDAGMutation();
   const pauseDAGMutation = usePauseDAGMutation();
   const unpauseDAGMutation = useUnpauseDAGMutation();
   const isRefreshing = loading || isRefetching;
+  const dagRunsMap = historyOverview?.dagRunsMap ?? new Map();
+  const dagHealthMap = historyOverview?.dagHealthMap ?? new Map();
 
-  const filteredDAGs = dags.filter((dag) => {
-    return (
-      dag.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      dag.description?.toLowerCase().includes(searchQuery.toLowerCase())
-    );
-  });
+  const filteredDAGs = useMemo(() => {
+    return availableDAGs.filter((dag) => {
+      return matchesSearchQuery(
+        searchQuery,
+        dag.dag_id,
+        dag.name,
+        dag.description,
+        dag.cron
+      );
+    });
+  }, [availableDAGs, searchQuery]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredDAGs.length / ITEMS_PER_PAGE));
+  const currentPage = Number.isFinite(currentPageFromParams) && currentPageFromParams > 0
+    ? Math.min(currentPageFromParams, totalPages)
+    : 1;
+
+  const pagedDAGs = useMemo(() => {
+    const startIndex = (currentPage - 1) * ITEMS_PER_PAGE;
+    return filteredDAGs.slice(startIndex, startIndex + ITEMS_PER_PAGE);
+  }, [currentPage, filteredDAGs]);
+
+  const updateSearchParams = (nextSearch: string, nextPage: number) => {
+    const next = new URLSearchParams(searchParams);
+    const normalizedSearch = nextSearch.trim();
+
+    if (normalizedSearch) {
+      next.set("search", normalizedSearch);
+    } else {
+      next.delete("search");
+    }
+
+    if (nextPage > 1) {
+      next.set("page", String(nextPage));
+    } else {
+      next.delete("page");
+    }
+
+    setSearchParams(next, { replace: true });
+  };
+
+  useEffect(() => {
+    if (currentPage !== currentPageFromParams && !(currentPage === 1 && !searchParams.get("page"))) {
+      updateSearchParams(searchQuery, currentPage);
+    }
+  }, [currentPage, currentPageFromParams, searchParams, searchQuery]);
+
+  useEffect(() => {
+    if (loading || restoredScrollRef.current) {
+      return;
+    }
+
+    const raw = sessionStorage.getItem(SCROLL_STATE_KEY);
+    if (!raw) {
+      restoredScrollRef.current = true;
+      return;
+    }
+
+    try {
+      const saved = JSON.parse(raw) as { path?: string; y?: number };
+      if (saved.path === `${location.pathname}${location.search}` && typeof saved.y === "number") {
+        requestAnimationFrame(() => window.scrollTo({ top: saved.y, behavior: "auto" }));
+      }
+    } catch {
+      // Ignore malformed persisted scroll state.
+    } finally {
+      restoredScrollRef.current = true;
+      sessionStorage.removeItem(SCROLL_STATE_KEY);
+    }
+  }, [loading, location.pathname, location.search]);
 
   const handleTriggerDAG = (id: string) => {
     triggerDAGMutation.mutate(id);
   };
 
   const handleViewDAG = (id: string) => {
+    sessionStorage.setItem(
+      SCROLL_STATE_KEY,
+      JSON.stringify({
+        path: `${location.pathname}${location.search}`,
+        y: window.scrollY,
+      })
+    );
     navigate(`/dags/${id}`);
   };
 
@@ -57,7 +141,7 @@ export default function DAGs() {
           <Input
             placeholder={t.dags.searchPlaceholder}
             value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+            onChange={(e) => updateSearchParams(e.target.value, 1)}
             className="pl-9"
           />
         </div>
@@ -70,66 +154,54 @@ export default function DAGs() {
 
       <p className="text-sm text-muted-foreground mb-4">{tf(t.dags.totalCount, { count: filteredDAGs.length })}</p>
 
-      {loading && dags.length === 0 ? (
+      {loading && availableDAGs.length === 0 ? (
         <div className="text-center py-8 text-muted-foreground">{t.common.loading}</div>
       ) : (
-        <div className="grid gap-4 sm:grid-cols-1 lg:grid-cols-2">
-          {filteredDAGs.map((dag) => {
+        <>
+          <div className="grid gap-4 sm:grid-cols-1 lg:grid-cols-2">
+          {pagedDAGs.map((dag) => {
+            const dagRuns = dagRunsMap.get(dag.dag_id) || [];
+            const dagHealth = dagHealthMap.get(dag.dag_id) || "healthy";
             return (
-              <Card
+              <DAGSummaryCard
                 key={dag.dag_id}
-                className="cursor-pointer hover:bg-accent/30 transition-colors"
-                onClick={() => handleViewDAG(dag.dag_id)}
-              >
-                <CardHeader className="pb-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <CardTitle className="text-base">{dag.name}</CardTitle>
-                    {dag.is_paused && (
-                      <Badge variant="outline" className="text-xs">
-                        {t.common.paused}
-                      </Badge>
-                    )}
-                  </div>
-                </CardHeader>
-                <CardContent>
-                  <p className="text-sm text-muted-foreground mb-3 line-clamp-2">
-                    {dag.description || t.dags.noDescription}
-                  </p>
-                  <div className="flex items-center justify-between">
-                    <div className="text-xs text-muted-foreground space-x-3">
-                      <span>{tf(t.dags.taskCount, { count: dag.tasks?.length || 0 })}</span>
-                      {dag.cron && <span className="font-mono">{dag.cron}</span>}
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleTogglePause(dag.dag_id, dag.is_paused);
-                        }}
-                      >
-                        <Pause className="h-3 w-3 mr-1" />
-                        {dag.is_paused ? t.common.resume : t.common.pause}
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleTriggerDAG(dag.dag_id);
-                        }}
-                      >
-                        <Play className="h-3 w-3 mr-1" />
-                        {t.common.run}
-                      </Button>
-                    </div>
-                  </div>
-                </CardContent>
-              </Card>
+                dag={dag}
+                runs={dagRuns}
+                health={dagHealth}
+                onOpen={handleViewDAG}
+                onTrigger={handleTriggerDAG}
+                onTogglePause={handleTogglePause}
+              />
             );
           })}
-        </div>
+          </div>
+
+          {filteredDAGs.length > ITEMS_PER_PAGE && (
+            <div className="mt-6 flex flex-col items-center justify-between gap-3 border-t border-border/60 pt-4 sm:flex-row">
+              <p className="text-sm text-muted-foreground">
+                {tf(t.dags.pageInfo, { page: currentPage, total: totalPages })}
+              </p>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => updateSearchParams(searchQuery, currentPage - 1)}
+                  disabled={currentPage <= 1}
+                >
+                  {t.dags.prevPage}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => updateSearchParams(searchQuery, currentPage + 1)}
+                  disabled={currentPage >= totalPages}
+                >
+                  {t.dags.nextPage}
+                </Button>
+              </div>
+            </div>
+          )}
+        </>
       )}
 
       {filteredDAGs.length === 0 && !loading && (

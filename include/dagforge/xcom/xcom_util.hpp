@@ -1,10 +1,15 @@
 #pragma once
 
-#include "dagforge/util/json.hpp"
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
+#include "dagforge/core/error.hpp"
+#endif
+
 #include <string>
+#include <string_view>
 
 namespace dagforge::xcom {
 
-[[nodiscard]] auto stringify(const JsonValue &value) -> std::string;
+[[nodiscard]] auto render_serialized_json(std::string_view json_text)
+    -> Result<std::string>;
 
 } // namespace dagforge::xcom

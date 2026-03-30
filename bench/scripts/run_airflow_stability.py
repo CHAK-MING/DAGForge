@@ -1,56 +1,31 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import re
 import statistics
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-import pymysql
-from bench_db_env import (
-    apply_dagforge_db_env,
-    get_bench_db_name,
-    open_bench_db_connection,
+from benchlib.artifacts import load_json
+from benchlib.db import apply_dagforge_db_env, get_bench_db_name, open_bench_db_connection
+from benchlib.scenarios import (
+    BURST_SWEEP_SCENARIOS,
+    OFFICIAL_TOTAL_LAG_S,
+    REALISTIC_SWEEP_SCENARIOS,
+    SCENE_CLASSIFICATION,
+    ensure_generated_scenarios,
+    expected_dag_ids,
 )
+from benchlib.sql import build_latest_attempts_cte, build_run_ids_clause, build_task_lag_distribution_query
+from benchlib.subprocess_utils import run_command
 
-
-OFFICIAL_TOTAL_LAG_S = {
-    "scene1_linear_100x10": {"airflow_2_0_beta": 11.6, "airflow_1_10_10": 200.0},
-    "scene2_linear_10x100": {"airflow_2_0_beta": 14.3, "airflow_1_10_10": 144.0},
-    "scene3_tree_100x10": {"airflow_2_0_beta": 12.0, "airflow_1_10_10": 200.0},
-}
-
-SCENE_CLASSIFICATION = {
-    "scene1_linear_100x10": "宽 DAG / 并行释放敏感",
-    "scene2_linear_10x100": "深 DAG / 长关键路径敏感",
-    "scene3_tree_100x10": "树型 DAG / 多后继传播敏感",
-    "scene4_burst_ready_1x100": "超宽层 burst-ready / ready 洪峰释放敏感",
-    "scene5_burst_ready_1x500": "超宽层 burst-ready / ready 洪峰释放敏感",
-    "scene6_burst_ready_1x1000": "超宽层 burst-ready / ready 洪峰释放敏感",
-    "scene7_diamond_100x10": "菱形 DAG / fan-out 后 fan-in 敏感",
-    "scene8_fanout_100x10": "扇出 DAG / 单点释放敏感",
-    "scene9_fanin_100x10": "扇入 DAG / 多前驱汇聚敏感",
-    "scene10_mesh_100x10": "网状 DAG / 密集依赖传播敏感",
-    "scene12_perf_pipeline_1x3": "真实场景 / perf pipeline stability",
-    "scene13_perf_pipeline_mixed_1x21": "真实场景 / perf + XCom + sensor + trigger rules",
-}
-
-BURST_SWEEP_SCENARIOS = [
-    "scene4_burst_ready_1x100",
-    "scene5_burst_ready_1x500",
-    "scene6_burst_ready_1x1000",
-]
-
-REALISTIC_SWEEP_SCENARIOS = [
-    "scene7_diamond_100x10",
-    "scene8_fanout_100x10",
-    "scene9_fanin_100x10",
-    "scene10_mesh_100x10",
-]
 
 DB_NAME = get_bench_db_name()
 
@@ -61,58 +36,24 @@ def parse_args() -> argparse.Namespace:
             "Run Airflow-style benchmark scenarios multiple times and summarize stability."
         )
     )
-    parser.add_argument(
-        "--config",
-        default="bench/airflow_bench.toml",
-        help="Base DAGForge config file",
-    )
-    parser.add_argument(
-        "--rounds",
-        type=int,
-        default=5,
-        help="Runs per scenario",
-    )
+    parser.add_argument("--config", default="bench/airflow_bench.toml", help="Base DAGForge config file")
+    parser.add_argument("--rounds", type=int, default=5, help="Runs per scenario")
     parser.add_argument(
         "--api-base",
         default=os.environ.get("DAGFORGE_BENCH_API_BASE", "http://127.0.0.1:8888"),
         help="HTTP API base (host:port)",
     )
-    parser.add_argument(
-        "--results-dir",
-        default="bench_results",
-        help="Directory of run_airflow_bench.py result artifacts",
-    )
-    parser.add_argument(
-        "--output-json",
-        default="/tmp/dagforge_airflow_stability.json",
-        help="Where to write aggregated JSON summary",
-    )
+    parser.add_argument("--results-dir", default="bench_results", help="Directory of run_airflow_bench.py result artifacts")
+    parser.add_argument("--output-json", default="/tmp/dagforge_airflow_stability.json", help="Where to write aggregated JSON summary")
     parser.add_argument(
         "--scenarios",
         nargs="+",
-        default=[
-            "scene1_linear_100x10",
-            "scene2_linear_10x100",
-            "scene3_tree_100x10",
-        ],
+        default=["scene1_linear_100x10", "scene2_linear_10x100", "scene3_tree_100x10"],
         help="Scenario names under bench/airflow_dags/",
     )
-    parser.add_argument(
-        "--taskset-cpus",
-        default="",
-        help="Optional CPU set for dagforge daemon, e.g. 0,2,4,6",
-    )
-    parser.add_argument(
-        "--startup-timeout",
-        type=float,
-        default=45.0,
-        help="Max seconds to wait for API and scenario DAGs",
-    )
-    parser.add_argument(
-        "--root-dir",
-        default=".",
-        help="Repository root",
-    )
+    parser.add_argument("--taskset-cpus", default="", help="Optional CPU set for dagforge daemon, e.g. 0,2,4,6")
+    parser.add_argument("--startup-timeout", type=float, default=45.0, help="Max seconds to wait for API and scenario DAGs")
+    parser.add_argument("--root-dir", default=".", help="Repository root")
     parser.add_argument(
         "--include-burst-sweep",
         action="store_true",
@@ -126,104 +67,24 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _run(cmd: list[str], cwd: Path, env: dict[str, str] | None = None, check: bool = True):
-    return subprocess.run(
-        cmd,
-        cwd=str(cwd),
-        env=env,
-        check=check,
-        text=True,
-        capture_output=False,
-    )
-
-
-def ensure_generated_bench_scenarios(repo_root: Path, scenario_name: str) -> None:
-    scenario_dir = repo_root / "bench" / "airflow_dags" / scenario_name
-    if scenario_dir.exists():
-        return
-    _run(["python3", "bench/scripts/gen_airflow_bench_dags.py"], cwd=repo_root)
-    _run(["python3", "bench/scripts/gen_realistic_bench_dags.py"], cwd=repo_root)
+def _run(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+    check: bool = True,
+):
+    return run_command(cmd, cwd=cwd, env=env, check=check, capture_output=False)
 
 
 def open_db_connection():
+    import pymysql
+
     return open_bench_db_connection(pymysql)
 
 
-def sql_quote(value: str) -> str:
-    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
-
-
-def build_run_ids_clause(run_ids: list[str]) -> str:
-    if not run_ids:
-        raise ValueError("run_ids must not be empty")
-    return ",".join(sql_quote(run_id) for run_id in run_ids)
-
-
-def build_latest_attempts_cte(run_ids: list[str]) -> str:
-    run_ids_clause = build_run_ids_clause(run_ids)
-    return f"""
-    WITH RankedAttempts AS (
-        SELECT
-            ti.run_rowid,
-            ti.task_rowid,
-            ti.attempt,
-            ti.started_at,
-            ti.finished_at,
-            ROW_NUMBER() OVER (
-                PARTITION BY ti.run_rowid, ti.task_rowid
-                ORDER BY ti.attempt DESC
-            ) AS attempt_rank
-        FROM task_instances ti
-        JOIN dag_runs r ON r.run_rowid = ti.run_rowid
-        WHERE r.dag_run_id IN ({run_ids_clause}) AND ti.attempt > 0
-    ),
-    LatestTaskInstances AS (
-        SELECT run_rowid, task_rowid, started_at, finished_at
-        FROM RankedAttempts
-        WHERE attempt_rank = 1
-    )
-    """
-
-
 def fetch_task_lag_distribution(run_ids: list[str]) -> list[tuple[int, int]]:
-    sql = (
-        build_latest_attempts_cte(run_ids)
-        + """
-    ,
-    TaskDeps AS (
-        SELECT
-            ti.run_rowid,
-            ti.task_rowid,
-            ti.started_at AS task_started_at,
-            COUNT(td.dep_rowid) AS dep_count,
-            MAX(up_ti.finished_at) AS max_upstream_finished_at
-        FROM LatestTaskInstances ti
-        JOIN dag_runs r ON r.run_rowid = ti.run_rowid
-        LEFT JOIN task_dependencies td
-            ON td.dag_rowid = r.dag_rowid
-            AND td.task_rowid = ti.task_rowid
-        LEFT JOIN LatestTaskInstances up_ti
-            ON up_ti.run_rowid = ti.run_rowid
-            AND up_ti.task_rowid = td.depends_on_task_rowid
-        WHERE ti.started_at > 0
-        GROUP BY ti.run_rowid, ti.task_rowid, ti.started_at
-    )
-    SELECT
-        CASE
-            WHEN task_started_at > 0 AND (
-                dep_count = 0 OR COALESCE(max_upstream_finished_at, 0) > 0
-            ) THEN GREATEST(
-                task_started_at - COALESCE(max_upstream_finished_at, r.started_at),
-                0
-            )
-            ELSE NULL
-        END AS lag_ms,
-        dep_count
-    FROM TaskDeps td
-    JOIN dag_runs r ON r.run_rowid = td.run_rowid
-    """
-    )
-
+    sql = build_task_lag_distribution_query(run_ids)
     conn = open_db_connection()
     try:
         with conn.cursor() as cursor:
@@ -247,7 +108,7 @@ def percentile(values: list[float], q: float) -> float:
     return float(arr[lo] * (1.0 - frac) + arr[hi] * frac)
 
 
-def summarize_lag_distribution(rows: list[tuple[int, int]]) -> dict:
+def summarize_lag_distribution(rows: list[tuple[int, int]]) -> dict[str, float]:
     all_lags = [float(lag) for lag, _ in rows]
     root_lags = [float(lag) for lag, dep_count in rows if dep_count == 0]
     downstream_lags = [float(lag) for lag, dep_count in rows if dep_count > 0]
@@ -262,8 +123,8 @@ def summarize_lag_distribution(rows: list[tuple[int, int]]) -> dict:
     }
 
 
-def fetch_makespan_raw(run_ids: list[str]) -> dict:
-    cte = build_latest_attempts_cte(run_ids)
+def fetch_makespan_raw(run_ids: list[str]) -> dict[str, list[tuple]]:
+    cte = build_latest_attempts_cte(run_ids, include_attempt=False, include_state=False)
     task_sql = (
         cte
         + """
@@ -300,14 +161,14 @@ def fetch_makespan_raw(run_ids: list[str]) -> dict:
     return {"task_rows": task_rows, "edge_rows": edge_rows}
 
 
-def compute_makespan_metrics(run_ids: list[str]) -> dict:
+def compute_makespan_metrics(run_ids: list[str]) -> dict[str, float]:
     raw = fetch_makespan_raw(run_ids)
     task_rows = raw["task_rows"]
     edge_rows = raw["edge_rows"]
 
-    tasks_by_run = {}
-    run_started = {}
-    run_last_finished = {}
+    tasks_by_run: dict[int, dict[int, float]] = {}
+    run_started: dict[int, float] = {}
+    run_last_finished: dict[int, float] = {}
     for run_rowid, task_rowid, duration_ms, started_at, last_finished in task_rows:
         rr = int(run_rowid)
         tr = int(task_rowid)
@@ -315,15 +176,15 @@ def compute_makespan_metrics(run_ids: list[str]) -> dict:
         run_started[rr] = float(started_at or 0.0)
         run_last_finished[rr] = float(last_finished or 0.0)
 
-    edges_by_run = {}
+    edges_by_run: dict[int, list[tuple[int, int]]] = {}
     for run_rowid, task_rowid, dep_task_rowid in edge_rows:
         rr = int(run_rowid)
         edges_by_run.setdefault(rr, []).append((int(dep_task_rowid), int(task_rowid)))
 
-    efficiency_values = []
-    amplification_values = []
-    ideal_cp_values = []
-    actual_e2e_values = []
+    efficiency_values: list[float] = []
+    amplification_values: list[float] = []
+    ideal_cp_values: list[float] = []
+    actual_e2e_values: list[float] = []
 
     for rr, durations in tasks_by_run.items():
         nodes = set(durations.keys())
@@ -346,9 +207,9 @@ def compute_makespan_metrics(run_ids: list[str]) -> dict:
             head += 1
             processed += 1
             for nxt in children[node]:
-                cand = dp[node] + durations[nxt]
-                if cand > dp[nxt]:
-                    dp[nxt] = cand
+                candidate = dp[node] + durations[nxt]
+                if candidate > dp[nxt]:
+                    dp[nxt] = candidate
                 indegree[nxt] -= 1
                 if indegree[nxt] == 0:
                     queue.append(nxt)
@@ -377,7 +238,7 @@ def compute_makespan_metrics(run_ids: list[str]) -> dict:
         }
 
     return {
-        "run_count": len(efficiency_values),
+        "run_count": float(len(efficiency_values)),
         "ideal_cp_ms_mean": statistics.fmean(ideal_cp_values),
         "actual_e2e_ms_mean": statistics.fmean(actual_e2e_values),
         "efficiency_mean": statistics.fmean(efficiency_values),
@@ -390,7 +251,7 @@ def compute_makespan_metrics(run_ids: list[str]) -> dict:
 
 def stop_existing_daemons(repo_root: Path) -> None:
     subprocess.run(
-        ["pkill", "-f", "./build/bin/dagforge serve start"],
+        ["pkill", "-f", "./bin/dagforge serve start"],
         cwd=str(repo_root),
         check=False,
         text=True,
@@ -428,14 +289,6 @@ def make_config_for_scenario(
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def expected_dag_ids(repo_root: Path, scenario_name: str) -> set[str]:
-    ensure_generated_bench_scenarios(repo_root, scenario_name)
-    scenario_dir = repo_root / "bench" / "airflow_dags" / scenario_name
-    if not scenario_dir.exists():
-        raise RuntimeError(f"scenario directory not found: {scenario_dir}")
-    return {p.stem for p in scenario_dir.glob("*.toml")}
-
-
 def fetch_loaded_dag_ids(api_base: str) -> set[str]:
     url = api_base.rstrip("/") + "/api/dags"
     with urllib.request.urlopen(url, timeout=2.0) as resp:
@@ -444,13 +297,9 @@ def fetch_loaded_dag_ids(api_base: str) -> set[str]:
     return {item.get("dag_id") for item in dags if item.get("dag_id")}
 
 
-def wait_scenario_ready(
-    api_base: str,
-    expect: set[str],
-    timeout_s: float,
-) -> None:
+def wait_scenario_ready(api_base: str, expect: set[str], timeout_s: float) -> None:
     deadline = time.monotonic() + timeout_s
-    last_loaded = set()
+    last_loaded: set[str] = set()
     while time.monotonic() < deadline:
         try:
             last_loaded = fetch_loaded_dag_ids(api_base)
@@ -478,7 +327,7 @@ def start_daemon_for_scenario(
         log_path.unlink()
 
     cmd = [
-        "./build/bin/dagforge",
+        "./bin/dagforge",
         "serve",
         "start",
         "-c",
@@ -494,43 +343,45 @@ def start_daemon_for_scenario(
     return log_path
 
 
-def run_one_round(repo_root: Path, scenario: str, results_dir: Path) -> dict:
+def run_one_round(repo_root: Path, scenario: str, results_dir: Path) -> dict[str, Any]:
     env = os.environ.copy()
     env["DAGFORGE_BENCH_RESET_SCENARIO_HISTORY"] = "1"
     env["DAGFORGE_BENCH_RESULTS_DIR"] = str(results_dir)
     cmd = [
-        "uv",
-        "run",
-        "--with",
-        "aiohttp",
-        "--with",
-        "pymysql",
+        "python3",
         "bench/scripts/run_airflow_bench.py",
         scenario,
+        "--results-dir",
+        str(results_dir),
     ]
-    t0 = time.monotonic()
+    started_at = time.monotonic()
     _run(cmd, cwd=repo_root, env=env)
-    wall_seconds = time.monotonic() - t0
+    driver_wall_seconds = time.monotonic() - started_at
 
     latest = results_dir / f"{scenario}.latest.json"
     if not latest.exists():
         raise RuntimeError(f"result artifact missing: {latest}")
-    payload = json.loads(latest.read_text(encoding="utf-8"))
+    payload = load_json(latest)
     run_ids = payload.get("run_ids", [])
     lag_rows = fetch_task_lag_distribution(run_ids)
     lag_dist = summarize_lag_distribution(lag_rows)
     makespan = compute_makespan_metrics(run_ids)
     total_tasks = int(payload["results"]["total_tasks"])
+    bench_wall_seconds = float(payload["results"].get("wall_seconds", 0.0))
+    bench_tps = float(payload["results"].get("effective_tasks_per_s", 0.0))
     payload["derived"] = {
-        "wall_seconds": wall_seconds,
-        "effective_tasks_per_s": (total_tasks / wall_seconds) if wall_seconds > 0 else 0.0,
+        "driver_wall_seconds": driver_wall_seconds,
+        "wall_seconds": bench_wall_seconds,
+        "effective_tasks_per_s": bench_tps
+        if bench_tps > 0.0
+        else ((total_tasks / bench_wall_seconds) if bench_wall_seconds > 0 else 0.0),
         "lag_distribution": lag_dist,
         "makespan": makespan,
     }
     return payload
 
 
-def summarize_scene(scene: str, run_payloads: list[dict]) -> dict:
+def summarize_scene(scene: str, run_payloads: list[dict[str, Any]]) -> dict[str, Any]:
     lags_ms = [float(p["results"]["total_lag_ms"]) for p in run_payloads]
     lags_s = [x / 1000.0 for x in lags_ms]
     warm_s = lags_s[1:] if len(lags_s) > 1 else lags_s
@@ -601,15 +452,12 @@ def summarize_scene(scene: str, run_payloads: list[dict]) -> dict:
     }
 
 
-def print_scene_summary(summary: dict) -> None:
+def print_scene_summary(summary: dict[str, Any]) -> None:
     scene = summary["scene"]
-    scene_class = summary.get("class", "")
     print(f"\n=== {scene} ===")
-    if scene_class:
-        print(f"class: {scene_class}")
-    print(
-        f"lags(s)={', '.join(f'{x:.3f}' for x in summary['lags_seconds'])}"
-    )
+    if summary.get("class"):
+        print(f"class: {summary['class']}")
+    print(f"lags(s)={', '.join(f'{x:.3f}' for x in summary['lags_seconds'])}")
     print(
         f"all-runs: mean={summary['mean_seconds']:.3f}s "
         f"stdev={summary['stdev_seconds']:.3f}s cv={summary['cv']*100:.2f}% "
@@ -644,11 +492,11 @@ def print_scene_summary(summary: dict) -> None:
         f"warm-runs: mean={summary['warm_mean_seconds']:.3f}s "
         f"stdev={summary['warm_stdev_seconds']:.3f}s cv={summary['warm_cv']*100:.2f}%"
     )
-    off = summary.get("official", {})
-    if off:
+    official = summary.get("official", {})
+    if official:
         print(
-            f"official: Airflow2.0={off.get('airflow_2_0_beta')}s "
-            f"Airflow1.10.10={off.get('airflow_1_10_10')}s"
+            f"official: Airflow2.0={official.get('airflow_2_0_beta')}s "
+            f"Airflow1.10.10={official.get('airflow_1_10_10')}s"
         )
         print(
             f"speedup vs Airflow2.0: all={summary['vs_airflow2x_mean']:.2f}x "
@@ -669,6 +517,7 @@ def main() -> int:
 
     if not base_config.exists():
         raise RuntimeError(f"config not found: {base_config}")
+
     scenarios = list(args.scenarios)
     if args.include_burst_sweep:
         for scene in BURST_SWEEP_SCENARIOS:
@@ -682,7 +531,7 @@ def main() -> int:
     all_summaries = []
 
     for scene in scenarios:
-        ensure_generated_bench_scenarios(repo_root, scene)
+        ensure_generated_scenarios(repo_root / "bench" / "airflow_dags" / scene)
         print(f"\n----- scenario {scene}: prepare daemon -----")
         scenario_expected = expected_dag_ids(repo_root, scene)
         temp_config = Path("/tmp") / f"dagforge_bench_{scene}.toml"
@@ -700,21 +549,14 @@ def main() -> int:
             expect=scenario_expected,
             timeout_s=args.startup_timeout,
         )
-        print(
-            f"daemon ready for {scene}; dags={len(scenario_expected)} log={log_path}"
-        )
+        print(f"daemon ready for {scene}; dags={len(scenario_expected)} log={log_path}")
 
-        run_payloads = []
+        run_payloads: list[dict[str, Any]] = []
         for idx in range(args.rounds):
             print(f"\n[{scene}] run {idx + 1}/{args.rounds}")
             try:
-                payload = run_one_round(
-                    repo_root=repo_root,
-                    scenario=scene,
-                    results_dir=results_dir,
-                )
+                payload = run_one_round(repo_root=repo_root, scenario=scene, results_dir=results_dir)
             except Exception:
-                # one fast retry after daemon restart for crash/segfault/no-listen cases
                 print(f"[{scene}] run {idx + 1}: failed once, restarting daemon and retrying")
                 stop_existing_daemons(repo_root)
                 log_path = start_daemon_for_scenario(
@@ -728,14 +570,11 @@ def main() -> int:
                     expect=scenario_expected,
                     timeout_s=args.startup_timeout,
                 )
-                payload = run_one_round(
-                    repo_root=repo_root,
-                    scenario=scene,
-                    results_dir=results_dir,
-                )
+                payload = run_one_round(repo_root=repo_root, scenario=scene, results_dir=results_dir)
             run_payloads.append(payload)
             lag_s = float(payload["results"]["total_lag_ms"]) / 1000.0
             wall_s = float(payload["derived"]["wall_seconds"])
+            driver_wall_s = float(payload["derived"]["driver_wall_seconds"])
             tps = float(payload["derived"]["effective_tasks_per_s"])
             p95 = float(payload["derived"]["lag_distribution"]["p95_ms"])
             p99 = float(payload["derived"]["lag_distribution"]["p99_ms"])
@@ -743,7 +582,8 @@ def main() -> int:
             amp = float(payload["derived"]["makespan"]["amplification_mean"])
             print(
                 f"[{scene}] run {idx + 1}: total_task_lag={lag_s:.3f}s "
-                f"wall={wall_s:.3f}s tps={tps:.1f} p95={p95:.2f}ms p99={p99:.2f}ms "
+                f"wall={wall_s:.3f}s driver_wall={driver_wall_s:.3f}s "
+                f"tps={tps:.1f} p95={p95:.2f}ms p99={p99:.2f}ms "
                 f"eff={eff:.3f} amp={amp:.2f}x"
             )
 
@@ -751,7 +591,7 @@ def main() -> int:
         print_scene_summary(summary)
         all_summaries.append(summary)
 
-    out = {
+    output = {
         "generated_at_epoch_s": time.time(),
         "config": str(base_config),
         "rounds": args.rounds,
@@ -760,7 +600,7 @@ def main() -> int:
         "summaries": all_summaries,
     }
     out_path = Path(args.output_json)
-    out_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    out_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
     print(f"\nWrote summary JSON: {out_path}")
 
     stop_existing_daemons(repo_root)

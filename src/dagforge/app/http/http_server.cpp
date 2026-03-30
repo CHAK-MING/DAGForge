@@ -1,9 +1,9 @@
 #include "dagforge/app/http/http_server.hpp"
-
 #include "dagforge/app/http/router.hpp"
 #include "dagforge/core/asio_awaitable.hpp"
 #include "dagforge/core/runtime.hpp"
 #include "dagforge/util/log.hpp"
+
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/cancel_after.hpp>
@@ -390,8 +390,8 @@ auto HttpServer::set_tls_credentials(std::string cert_chain_file,
   }
 
   impl_->tls_ctx = std::move(ctx);
-  log::info("TLS enabled for HTTP server (cert='{}', key='{}')",
-            cert_chain_file, private_key_file);
+  log::debug("TLS enabled for HTTP server (cert='{}', key='{}')",
+             cert_chain_file, private_key_file);
   return ok();
 }
 
@@ -491,8 +491,8 @@ auto HttpServer::start(std::string_view host, uint16_t port, bool reuse_port)
 
   impl->running = true;
 
-  log::info("HTTP server listening on {}:{} (acceptors={}, reuse_port={})",
-            host, port, acceptor_count, reuse_port);
+  log::debug("HTTP server listening on {}:{} (acceptors={}, reuse_port={})",
+             host, port, acceptor_count, reuse_port);
 
   for (unsigned i = 0; i < acceptor_count; ++i) {
     const auto shard_idx =
@@ -510,7 +510,7 @@ auto HttpServer::stop() -> void {
     return;
   }
 
-  log::info("Stopping HTTP server...");
+  log::debug("Stopping HTTP server...");
 
   for (unsigned i = 0; i < impl_->runtime.shard_count(); ++i) {
     boost::asio::post(impl_->runtime.executor_for(i), [impl = impl_, i]() {
@@ -522,7 +522,7 @@ auto HttpServer::stop() -> void {
     });
   }
 
-  log::info("HTTP server stopped");
+  log::debug("HTTP server stopped");
 }
 
 auto HttpServer::is_running() const -> bool { return impl_->running.load(); }

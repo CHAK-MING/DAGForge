@@ -2,19 +2,16 @@
 
 from __future__ import annotations
 
+import argparse
 import json
-import shutil
 from pathlib import Path
+from typing import Any
+
+from benchlib.scenarios import reset_dir
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BENCH_ROOT = REPO_ROOT / "bench" / "airflow_dags"
-
-
-def reset_dir(path: Path) -> None:
-    if path.exists():
-        shutil.rmtree(path)
-    path.mkdir(parents=True, exist_ok=True)
 
 
 def write(path: Path, text: str) -> None:
@@ -22,7 +19,12 @@ def write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def emit_header(name: str, dag_name: str, description: str, extra: list[str] | None = None) -> list[str]:
+def emit_header(
+    name: str,
+    dag_name: str,
+    description: str,
+    extra: list[str] | None = None,
+) -> list[str]:
     lines = [
         f'id = "{dag_name}"',
         f'name = "{name}"',
@@ -47,7 +49,7 @@ def emit_task(
     pull_policy: str | None = None,
     sensor_type: str | None = None,
     target: str | None = None,
-    xcom_pull: list[dict[str, str | bool]] | None = None,
+    xcom_pull: list[dict[str, Any]] | None = None,
     xcom_push: list[dict[str, str]] | None = None,
 ) -> list[str]:
     lines = ["[[tasks]]", f'id = "{task_id}"']
@@ -73,12 +75,14 @@ def emit_task(
     lines.append("")
     if xcom_pull:
         for pull in xcom_pull:
-            lines.extend([
-                "[[tasks.xcom_pull]]",
-                f'key = "{pull["key"]}"',
-                f'from = "{pull["from"]}"',
-                f'env = "{pull["env"]}"',
-            ])
+            lines.extend(
+                [
+                    "[[tasks.xcom_pull]]",
+                    f'key = "{pull["key"]}"',
+                    f'from = "{pull["from"]}"',
+                    f'env = "{pull["env"]}"',
+                ]
+            )
             if pull.get("required"):
                 lines.append("required = true")
             if "default_value" in pull:
@@ -86,11 +90,13 @@ def emit_task(
             lines.append("")
     if xcom_push:
         for push in xcom_push:
-            lines.extend([
-                "[[tasks.xcom_push]]",
-                f'key = "{push["key"]}"',
-                f'source = "{push["source"]}"',
-            ])
+            lines.extend(
+                [
+                    "[[tasks.xcom_push]]",
+                    f'key = "{push["key"]}"',
+                    f'source = "{push["source"]}"',
+                ]
+            )
             if "json_path" in push:
                 lines.append(f'json_path = "{push["json_path"]}"')
             if "regex" in push:
@@ -99,8 +105,8 @@ def emit_task(
     return lines
 
 
-def emit_docker_scene() -> None:
-    scenario = BENCH_ROOT / "scene15_docker_mixed_1x20"
+def emit_docker_scene(bench_root: Path) -> None:
+    scenario = bench_root / "scene15_docker_mixed_1x20"
     reset_dir(scenario)
 
     dag_id = "scene15_docker_mixed_1x20_dag_0"
@@ -119,11 +125,7 @@ def emit_docker_scene() -> None:
     )
 
     docker_image = "alpine:3.20"
-    for stage, previous_stage in (
-        ("a", None),
-        ("b", "a"),
-        ("c", "b"),
-    ):
+    for stage, previous_stage in (("a", None), ("b", "a"), ("c", "b")):
         for idx in range(6):
             task_id = f"docker_{stage}_{idx}"
             deps = ["prepare"] if previous_stage is None else [f"docker_{previous_stage}_{idx}"]
@@ -166,25 +168,12 @@ def emit_docker_scene() -> None:
         emit_task(
             "report",
             name="Render Docker Bench Report",
-            command=(
-                'printf "docker bench report run={{xcom.prepare.run_tag}} '
-                'last={{xcom.docker_c_5.result}}\\n"'
-            ),
+            command='printf "docker bench report run={{xcom.prepare.run_tag}} last={{xcom.docker_c_5.result}}\\n"',
             dependencies=[f"docker_c_{idx}" for idx in range(6)],
             trigger_rule="all_done",
             xcom_pull=[
-                {
-                    "key": "run_tag",
-                    "from": "prepare",
-                    "env": "RUN_TAG",
-                    "required": True,
-                },
-                {
-                    "key": "result",
-                    "from": "docker_c_5",
-                    "env": "LAST_RESULT",
-                    "required": True,
-                },
+                {"key": "run_tag", "from": "prepare", "env": "RUN_TAG", "required": True},
+                {"key": "result", "from": "docker_c_5", "env": "LAST_RESULT", "required": True},
             ],
             xcom_push=[{"key": "report", "source": "stdout"}],
         )
@@ -193,8 +182,8 @@ def emit_docker_scene() -> None:
     write(scenario / f"{dag_id}.toml", "\n".join(lines).rstrip() + "\n")
 
 
-def emit_cron_scene() -> None:
-    scenario = BENCH_ROOT / "scene16_cron_autoschedule_6x5"
+def emit_cron_scene(bench_root: Path) -> None:
+    scenario = bench_root / "scene16_cron_autoschedule_6x5"
     reset_dir(scenario)
 
     for i in range(6):
@@ -203,11 +192,7 @@ def emit_cron_scene() -> None:
             f"Cron Autoschedule Bench {i}",
             dag_id,
             "Cron auto-schedule bench with five tasks and a cleanup trigger-rule tail",
-            extra=[
-                'cron = "*/1 * * * *"',
-                'start_date = "2026-03-21"',
-                "catchup = false",
-            ],
+            extra=['cron = "*/1 * * * *"', 'start_date = "2026-03-21"', "catchup = false"],
         )
         lines.extend(
             emit_task(
@@ -223,14 +208,7 @@ def emit_cron_scene() -> None:
                 name="Validate",
                 command='printf "validate {{xcom.extract.marker}}\\n"',
                 dependencies=["extract"],
-                xcom_pull=[
-                    {
-                        "key": "marker",
-                        "from": "extract",
-                        "env": "EXTRACT_MARKER",
-                        "required": True,
-                    }
-                ],
+                xcom_pull=[{"key": "marker", "from": "extract", "env": "EXTRACT_MARKER", "required": True}],
                 xcom_push=[{"key": "marker", "source": "stdout"}],
             )
         )
@@ -240,14 +218,7 @@ def emit_cron_scene() -> None:
                 name="Transform",
                 command='printf "transform {{xcom.validate.marker}}\\n"',
                 dependencies=["validate"],
-                xcom_pull=[
-                    {
-                        "key": "marker",
-                        "from": "validate",
-                        "env": "VALIDATE_MARKER",
-                        "required": True,
-                    }
-                ],
+                xcom_pull=[{"key": "marker", "from": "validate", "env": "VALIDATE_MARKER", "required": True}],
                 xcom_push=[{"key": "marker", "source": "stdout"}],
             )
         )
@@ -257,14 +228,7 @@ def emit_cron_scene() -> None:
                 name="Publish",
                 command='printf "publish {{dag_id}} {{xcom.transform.marker}}\\n"',
                 dependencies=["transform"],
-                xcom_pull=[
-                    {
-                        "key": "marker",
-                        "from": "transform",
-                        "env": "TRANSFORM_MARKER",
-                        "required": True,
-                    }
-                ],
+                xcom_pull=[{"key": "marker", "from": "transform", "env": "TRANSFORM_MARKER", "required": True}],
                 xcom_push=[{"key": "marker", "source": "stdout"}],
             )
         )
@@ -288,10 +252,23 @@ def emit_cron_scene() -> None:
     write(scenario / "bench.meta.json", json.dumps(meta, indent=2, sort_keys=True) + "\n")
 
 
-def main() -> None:
-    emit_docker_scene()
-    emit_cron_scene()
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate realistic benchmark DAG scenarios")
+    parser.add_argument(
+        "--bench-root",
+        default=str(BENCH_ROOT),
+        help="Output root for generated realistic benchmark DAGs",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    bench_root = Path(args.bench_root)
+    emit_docker_scene(bench_root)
+    emit_cron_scene(bench_root)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

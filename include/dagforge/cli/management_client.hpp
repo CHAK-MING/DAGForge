@@ -1,20 +1,22 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/config/system_config.hpp"
 #include "dagforge/core/error.hpp"
 #include "dagforge/dag/dag_manager.hpp"
 #include "dagforge/dag/dag_run.hpp"
+#include "dagforge/io/context.hpp"
 #include "dagforge/storage/database_service.hpp"
 #include "dagforge/storage/mysql_database.hpp"
 #include "dagforge/storage/orm_models.hpp"
 #include "dagforge/xcom/xcom_types.hpp"
-
-#include <boost/asio/io_context.hpp>
+#endif
 
 #include <cstddef>
 #include <string>
 #include <string_view>
 #include <vector>
+
 
 namespace dagforge::cli {
 class ManagementClient {
@@ -69,7 +71,7 @@ public:
 
 private:
   DatabaseConfig db_config_;
-  mutable boost::asio::io_context io_{1};
+  mutable io::IoContext io_{1};
   mutable storage::MySQLDatabase db_;
 };
 

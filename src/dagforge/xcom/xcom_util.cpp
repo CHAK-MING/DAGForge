@@ -1,12 +1,19 @@
 #include "dagforge/xcom/xcom_util.hpp"
+#include "dagforge/util/json.hpp"
+
 
 namespace dagforge::xcom {
 
-auto stringify(const JsonValue &value) -> std::string {
-  if (value.is_string()) {
-    return value.as<std::string>();
+auto render_serialized_json(std::string_view json_text)
+    -> Result<std::string> {
+  auto parsed = parse_json(json_text);
+  if (!parsed) {
+    return fail(parsed.error());
   }
-  return dump_json(value);
+  if (parsed->is_string()) {
+    return ok(parsed->as<std::string>());
+  }
+  return ok(dump_json(*parsed));
 }
 
 } // namespace dagforge::xcom

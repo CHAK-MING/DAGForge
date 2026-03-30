@@ -1,0 +1,9 @@
+: 1
+name: dagforge
+version: 0.3.0
+language: c++
+summary: DAGForge build2 modules-first cutover package
+license: other: proprietary ; Internal project.
+description-file: README.md
+depends: * build2 >= 0.17.0
+depends: * bpkg >= 0.17.0

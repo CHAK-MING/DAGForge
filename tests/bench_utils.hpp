@@ -2,11 +2,11 @@
 
 #include "dagforge/core/coroutine.hpp"
 #include "dagforge/core/runtime.hpp"
+#include "dagforge/io/context.hpp"
 
-#include <benchmark/benchmark.h>
+#include "benchmark_compat.hpp"
 
 #include <boost/asio/co_spawn.hpp>
-#include <boost/asio/io_context.hpp>
 #include <boost/asio/use_future.hpp>
 
 #include <chrono>
@@ -27,21 +27,21 @@ constexpr int kLargeSize = 1000;
 constexpr int kVeryLargeSize = 10000;
 
 // ---------------------------------------------------------------------------
-// run_on_io — synchronously drive one coroutine on a local io_context.
+// run_on_io — synchronously drive one coroutine on a local IoContext.
 // Suitable for benchmarks that need to measure a single async path without
 // the overhead of spinning up a full Runtime.
 // ---------------------------------------------------------------------------
 template <typename T>
-[[nodiscard]] auto run_on_io(boost::asio::io_context &io, task<T> t) -> T {
+[[nodiscard]] auto run_on_io(io::IoContext &io, task<T> t) -> T {
   auto fut = boost::asio::co_spawn(io, std::move(t), boost::asio::use_future);
-  io.run();
+  (void)io.run();
   io.restart();
   return fut.get();
 }
 
-inline void run_on_io(boost::asio::io_context &io, task<void> t) {
+inline void run_on_io(io::IoContext &io, task<void> t) {
   auto fut = boost::asio::co_spawn(io, std::move(t), boost::asio::use_future);
-  io.run();
+  (void)io.run();
   io.restart();
   fut.get();
 }

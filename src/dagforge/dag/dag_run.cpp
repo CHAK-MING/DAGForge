@@ -1,14 +1,11 @@
 #include "dagforge/dag/dag_run.hpp"
-
-#include "dagforge/config/task_config.hpp"
-#include "dagforge/core/error.hpp"
+#include "dagforge/executor/executor_types.hpp"
+#include "dagforge/scheduler/retry_policy.hpp"
 #include "dagforge/util/log.hpp"
 
 #include <algorithm>
 #include <atomic>
-#include <boost/dynamic_bitset.hpp>
 #include <cassert>
-#include <deque>
 #include <ranges>
 #include <span>
 
@@ -29,39 +26,38 @@ struct DAGRunDependencyState {
 };
 
 struct DAGRunRuntimeState {
-  explicit DAGRunRuntimeState(std::size_t n)
-      : ready_mask(n), running_mask(n), completed_mask(n), failed_mask(n),
-        skipped_mask(n) {}
+  struct ReadyLink {
+    NodeIndex prev{kInvalidNode};
+    NodeIndex next{kInvalidNode};
+  };
+
+  explicit DAGRunRuntimeState(std::size_t n) : ready_links(n) {}
 
   DAGRunRuntimeState(const DAGRunRuntimeState &other)
-      : ready_mask(other.ready_mask), running_mask(other.running_mask),
-        completed_mask(other.completed_mask), failed_mask(other.failed_mask),
-        skipped_mask(other.skipped_mask),
-        pending_count(other.pending_count), ready_count(other.ready_count),
+      : ready_links(other.ready_links), ready_head(other.ready_head),
+        ready_tail(other.ready_tail), pending_count(other.pending_count),
+        retrying_count(other.retrying_count), ready_count(other.ready_count),
         running_count(other.running_count),
         completed_count(other.completed_count),
         failed_count(other.failed_count), skipped_count(other.skipped_count),
-        failed_count_fast(other.failed_count_fast.load(
-            std::memory_order_relaxed)),
-        ready_queue(other.ready_queue) {}
+        failed_count_fast(
+            other.failed_count_fast.load(std::memory_order_relaxed)) {}
 
   auto operator=(const DAGRunRuntimeState &other) -> DAGRunRuntimeState & {
     if (this != &other) {
-      ready_mask = other.ready_mask;
-      running_mask = other.running_mask;
-      completed_mask = other.completed_mask;
-      failed_mask = other.failed_mask;
-      skipped_mask = other.skipped_mask;
+      ready_links = other.ready_links;
+      ready_head = other.ready_head;
+      ready_tail = other.ready_tail;
       pending_count = other.pending_count;
+      retrying_count = other.retrying_count;
       ready_count = other.ready_count;
       running_count = other.running_count;
       completed_count = other.completed_count;
       failed_count = other.failed_count;
       skipped_count = other.skipped_count;
-      failed_count_fast.store(other.failed_count_fast.load(
-                                  std::memory_order_relaxed),
-                              std::memory_order_relaxed);
-      ready_queue = other.ready_queue;
+      failed_count_fast.store(
+          other.failed_count_fast.load(std::memory_order_relaxed),
+          std::memory_order_relaxed);
     }
     return *this;
   }
@@ -70,27 +66,25 @@ struct DAGRunRuntimeState {
     return completed_count + failed_count + skipped_count;
   }
 
-  boost::dynamic_bitset<> ready_mask;
-  boost::dynamic_bitset<> running_mask;
-  boost::dynamic_bitset<> completed_mask;
-  boost::dynamic_bitset<> failed_mask;
-  boost::dynamic_bitset<> skipped_mask;
+  std::vector<ReadyLink> ready_links;
+  NodeIndex ready_head{kInvalidNode};
+  NodeIndex ready_tail{kInvalidNode};
 
   std::size_t pending_count{0};
+  std::size_t retrying_count{0};
   std::size_t ready_count{0};
   std::size_t running_count{0};
   std::size_t completed_count{0};
   std::size_t failed_count{0};
   std::size_t skipped_count{0};
   std::atomic<std::size_t> failed_count_fast{0};
-
-  std::deque<NodeIndex> ready_queue;
 };
 
 struct DAGRun::Impl {
   Impl(DAGRunId dag_run_id, std::shared_ptr<const DAG> dag)
       : dag_run_id_(std::move(dag_run_id)), dag_(std::move(dag)),
-        deps_(dag_->size()), runtime_(dag_->size()) {
+        deps_(dag_->size()), runtime_(dag_->size()),
+        trigger_rules_(dag_->size()) {
     std::size_t n = dag_->size();
     task_info_.resize(n);
 
@@ -99,6 +93,7 @@ struct DAGRun::Impl {
       task_info_[i].task_idx = idx;
       task_info_[i].state = TaskState::Pending;
       deps_.in_degree[i] = static_cast<int>(dag_->get_deps_view(idx).size());
+      trigger_rules_[i] = dag_->get_trigger_rule(idx);
     }
 
     runtime_.pending_count = n;
@@ -113,24 +108,78 @@ struct DAGRun::Impl {
         data_interval_start_(other.data_interval_start_),
         data_interval_end_(other.data_interval_end_),
         trigger_type_(other.trigger_type_), deps_(other.deps_),
-        runtime_(other.runtime_),
+        runtime_(other.runtime_), trigger_rules_(other.trigger_rules_),
         task_info_(other.task_info_),
         run_rowid_(other.run_rowid_), dag_rowid_(other.dag_rowid_),
         dag_version_(other.dag_version_) {}
 
-  auto update_state() -> void {
-    if (runtime_.ready_count > 0 || runtime_.running_count > 0) {
+  auto reset_ready_list() -> void {
+    runtime_.ready_head = kInvalidNode;
+    runtime_.ready_tail = kInvalidNode;
+    for (auto &link : runtime_.ready_links) {
+      link.prev = kInvalidNode;
+      link.next = kInvalidNode;
+    }
+  }
+
+  auto link_ready_back(NodeIndex idx) -> void {
+    auto &link = runtime_.ready_links[idx];
+    link.prev = runtime_.ready_tail;
+    link.next = kInvalidNode;
+    if (runtime_.ready_tail != kInvalidNode) {
+      runtime_.ready_links[runtime_.ready_tail].next = idx;
+    } else {
+      runtime_.ready_head = idx;
+    }
+    runtime_.ready_tail = idx;
+  }
+
+  auto unlink_ready(NodeIndex idx) -> void {
+    auto &link = runtime_.ready_links[idx];
+    if (link.prev != kInvalidNode) {
+      runtime_.ready_links[link.prev].next = link.next;
+    } else {
+      runtime_.ready_head = link.next;
+    }
+    if (link.next != kInvalidNode) {
+      runtime_.ready_links[link.next].prev = link.prev;
+    } else {
+      runtime_.ready_tail = link.prev;
+    }
+    link.prev = kInvalidNode;
+    link.next = kInvalidNode;
+  }
+
+  auto transition_to_ready(NodeIndex idx,
+                           DAGRun::TransitionDelta *delta = nullptr) -> void {
+    auto &info = task_info_[idx];
+    if (info.state == TaskState::Ready) {
       return;
     }
 
-    if (runtime_.failed_count > 0 && runtime_.pending_count == 0) {
-      state_ = DAGRunState::Failed;
-      finished_at_ = std::chrono::system_clock::now();
+    if (info.state == TaskState::Pending) {
+      --runtime_.pending_count;
+    } else if (info.state == TaskState::Retrying) {
+      --runtime_.retrying_count;
+    }
+
+    info.state = TaskState::Ready;
+    link_ready_back(idx);
+    ++runtime_.ready_count;
+    if (delta != nullptr) {
+      delta->ready_tasks.emplace_back(idx);
+    }
+  }
+
+  auto update_state() -> void {
+    if (runtime_.pending_count > 0 || runtime_.retrying_count > 0 ||
+        runtime_.ready_count > 0 || runtime_.running_count > 0) {
       return;
     }
 
     if (runtime_.terminal_count() == dag_->size()) {
-      state_ = (runtime_.failed_count > 0) ? DAGRunState::Failed : DAGRunState::Success;
+      state_ = (runtime_.failed_count > 0) ? DAGRunState::Failed
+                                           : DAGRunState::Success;
       finished_at_ = std::chrono::system_clock::now();
     }
 #ifndef NDEBUG
@@ -139,24 +188,17 @@ struct DAGRun::Impl {
   }
 
   auto init_ready_set() -> void {
-    runtime_.ready_mask.reset();
     runtime_.ready_count = 0;
-    runtime_.ready_queue.clear();
+    reset_ready_list();
 
     for (auto [i, deg] : std::views::enumerate(deps_.in_degree)) {
       if (deg == 0) {
-        runtime_.ready_mask.set(static_cast<std::size_t>(i));
-        runtime_.ready_queue.push_back(static_cast<NodeIndex>(i));
-        ++runtime_.ready_count;
-      } else if (dag_->get_trigger_rule(static_cast<NodeIndex>(i)) ==
-                 TriggerRule::Always) {
+        transition_to_ready(static_cast<NodeIndex>(i));
+      } else if (trigger_rules_[i] == TriggerRule::Always) {
         // Airflow-compatible: ALWAYS does not wait for upstream completion.
-        runtime_.ready_mask.set(static_cast<std::size_t>(i));
-        runtime_.ready_queue.push_back(static_cast<NodeIndex>(i));
-        ++runtime_.ready_count;
+        transition_to_ready(static_cast<NodeIndex>(i));
       }
     }
-    runtime_.pending_count -= runtime_.ready_count;
 #ifndef NDEBUG
     verify_invariants();
 #endif
@@ -166,20 +208,65 @@ struct DAGRun::Impl {
   auto verify_invariants() const noexcept -> void {
     const auto n = dag_->size();
     const auto terminal_count = runtime_.terminal_count();
-    std::size_t ready_list_size = 0;
-    for (auto idx : runtime_.ready_queue) {
-      if (runtime_.ready_mask.test(idx)) {
-        ++ready_list_size;
+    std::size_t pending_count = 0;
+    std::size_t retrying_count = 0;
+    std::size_t ready_state_count = 0;
+    std::size_t running_count = 0;
+    std::size_t completed_count = 0;
+    std::size_t failed_count = 0;
+    std::size_t skipped_count = 0;
+
+    for (const auto &info : task_info_) {
+      switch (info.state) {
+      case TaskState::Pending:
+        ++pending_count;
+        break;
+      case TaskState::Retrying:
+        ++retrying_count;
+        break;
+      case TaskState::Ready:
+        ++ready_state_count;
+        break;
+      case TaskState::Running:
+        ++running_count;
+        break;
+      case TaskState::Success:
+        ++completed_count;
+        break;
+      case TaskState::Failed:
+        ++failed_count;
+        break;
+      case TaskState::Skipped:
+      case TaskState::UpstreamFailed:
+        ++skipped_count;
+        break;
       }
     }
+
+    std::vector<std::uint8_t> seen(task_info_.size(), 0);
+    std::size_t ready_list_size = 0;
+    for (NodeIndex idx = runtime_.ready_head; idx != kInvalidNode;
+         idx = runtime_.ready_links[idx].next) {
+      assert(static_cast<std::size_t>(idx) < task_info_.size());
+      assert(task_info_[idx].state == TaskState::Ready);
+      assert(!seen[idx]);
+      seen[idx] = 1;
+      ++ready_list_size;
+    }
+
+    assert((runtime_.ready_head == kInvalidNode) ==
+           (runtime_.ready_tail == kInvalidNode));
+    assert(runtime_.pending_count == pending_count);
+    assert(runtime_.retrying_count == retrying_count);
+    assert(runtime_.ready_count == ready_state_count);
     assert(runtime_.ready_count == ready_list_size);
-    assert(runtime_.ready_count == runtime_.ready_mask.count());
-    assert(runtime_.running_count == runtime_.running_mask.count());
-    assert(runtime_.completed_count == runtime_.completed_mask.count());
-    assert(runtime_.failed_count == runtime_.failed_mask.count());
-    assert(runtime_.skipped_count == runtime_.skipped_mask.count());
+    assert(runtime_.running_count == running_count);
+    assert(runtime_.completed_count == completed_count);
+    assert(runtime_.failed_count == failed_count);
+    assert(runtime_.skipped_count == skipped_count);
     assert(terminal_count <= n);
-    assert(runtime_.pending_count + runtime_.ready_count + runtime_.running_count + terminal_count ==
+    assert(runtime_.pending_count + runtime_.retrying_count +
+               runtime_.ready_count + runtime_.running_count + terminal_count ==
            n);
   }
 #endif
@@ -214,7 +301,7 @@ struct DAGRun::Impl {
     if (total == 0)
       return TriggerStatus::Ready;
 
-    TriggerRule rule = dag_->get_trigger_rule(task);
+    TriggerRule rule = trigger_rules_[task];
     const int success = deps_.success_dep_count[task];
     const int failed = deps_.failed_dep_count[task];
     const int upstream_failed = deps_.upstream_failed_dep_count[task];
@@ -225,66 +312,51 @@ struct DAGRun::Impl {
 
     switch (rule) {
     case TriggerRule::AllSuccess:
-      if (success == total)
-        return TriggerStatus::Ready;
       if (any_failed > 0)
         return TriggerStatus::UpstreamFailed;
       if (pure_skipped > 0)
         return TriggerStatus::Skipped;
-      return TriggerStatus::Waiting;
+      return is_all_done ? TriggerStatus::Ready : TriggerStatus::Waiting;
     case TriggerRule::AllFailed:
       if (any_failed == total)
         return TriggerStatus::Ready;
-      if (is_all_done) {
-        if (any_failed > 0)
-          return TriggerStatus::UpstreamFailed;
-        return TriggerStatus::Skipped;
-      }
-      return TriggerStatus::Waiting;
+      if (!is_all_done)
+        return TriggerStatus::Waiting;
+      return any_failed > 0 ? TriggerStatus::UpstreamFailed
+                            : TriggerStatus::Skipped;
     case TriggerRule::AllDone:
-      if (is_all_done)
-        return TriggerStatus::Ready;
-      return TriggerStatus::Waiting;
+      return is_all_done ? TriggerStatus::Ready : TriggerStatus::Waiting;
     case TriggerRule::OneFailed:
       if (any_failed > 0)
         return TriggerStatus::Ready;
-      if (is_all_done)
-        return TriggerStatus::Skipped;
-      return TriggerStatus::Waiting;
+      return is_all_done ? TriggerStatus::Skipped : TriggerStatus::Waiting;
     case TriggerRule::OneSuccess:
       if (success > 0)
         return TriggerStatus::Ready;
-      if (is_all_done) {
-        if (pure_skipped == total)
-          return TriggerStatus::Skipped;
-        return TriggerStatus::UpstreamFailed;
-      }
-      return TriggerStatus::Waiting;
+      if (!is_all_done)
+        return TriggerStatus::Waiting;
+      return pure_skipped == total ? TriggerStatus::Skipped
+                                   : TriggerStatus::UpstreamFailed;
     case TriggerRule::NoneFailed:
       if (any_failed > 0)
         return TriggerStatus::UpstreamFailed;
-      if (is_all_done)
-        return TriggerStatus::Ready;
-      return TriggerStatus::Waiting;
+      return is_all_done ? TriggerStatus::Ready : TriggerStatus::Waiting;
     case TriggerRule::Always:
       return TriggerStatus::Ready;
     case TriggerRule::NoneSkipped:
       if (pure_skipped > 0)
         return TriggerStatus::Skipped;
-      if (is_all_done)
-        return TriggerStatus::Ready;
-      return TriggerStatus::Waiting;
+      return is_all_done ? TriggerStatus::Ready : TriggerStatus::Waiting;
     case TriggerRule::AllDoneMinOneSuccess:
-      if (is_all_done) {
-        if (success > 0)
-          return TriggerStatus::Ready;
-        if (any_failed > 0)
-          return TriggerStatus::UpstreamFailed;
-        if (pure_skipped > 0)
-          return TriggerStatus::Skipped;
+      if (!is_all_done)
+        return TriggerStatus::Waiting;
+      if (success > 0)
+        return TriggerStatus::Ready;
+      if (any_failed > 0)
         return TriggerStatus::UpstreamFailed;
-      }
-      return TriggerStatus::Waiting;
+      if (pure_skipped > 0)
+        return TriggerStatus::Skipped;
+      return TriggerStatus::UpstreamFailed;
     case TriggerRule::AllSkipped:
       if (pure_skipped == total)
         return TriggerStatus::Ready;
@@ -296,83 +368,68 @@ struct DAGRun::Impl {
     case TriggerRule::OneDone:
       if (success > 0 || any_failed > 0)
         return TriggerStatus::Ready;
-      if (is_all_done)
-        return TriggerStatus::Skipped;
-      return TriggerStatus::Waiting;
+      return is_all_done ? TriggerStatus::Skipped : TriggerStatus::Waiting;
     case TriggerRule::NoneFailedMinOneSuccess:
       if (any_failed > 0)
         return TriggerStatus::UpstreamFailed;
-      if (is_all_done)
-        return (success > 0) ? TriggerStatus::Ready : TriggerStatus::Skipped;
-      return TriggerStatus::Waiting;
+      if (!is_all_done)
+        return TriggerStatus::Waiting;
+      return (success > 0) ? TriggerStatus::Ready : TriggerStatus::Skipped;
     }
     return TriggerStatus::Waiting;
   }
 
-  auto propagate_terminal_to_downstream(NodeIndex terminal_task) -> void {
+  auto
+  propagate_terminal_to_downstream(NodeIndex terminal_task,
+                                   DAGRun::TransitionDelta *delta = nullptr)
+      -> void {
     for (NodeIndex dep : dag_->get_dependents_view(terminal_task)) {
-      if (runtime_.ready_mask.test(dep) || runtime_.running_mask.test(dep) ||
-          runtime_.completed_mask.test(dep) || runtime_.failed_mask.test(dep) ||
-          runtime_.skipped_mask.test(dep)) {
-        continue;
-      }
-
-      if (dag_->get_trigger_rule(dep) == TriggerRule::AllSuccess) {
-        const int total = deps_.in_degree[dep];
-        if (deps_.success_dep_count[dep] == total) {
-          runtime_.ready_mask.set(dep);
-          runtime_.ready_queue.push_back(dep);
-          ++runtime_.ready_count;
-          --runtime_.pending_count;
-          continue;
-        }
-
-        const int any_failed =
-            deps_.failed_dep_count[dep] + deps_.upstream_failed_dep_count[dep];
-        if (any_failed > 0) {
-          auto mark_res = mark_task_upstream_failed(dep);
-          if (!mark_res) {
-            continue;
-          }
-          continue;
-        }
-
-        const int pure_skipped =
-            deps_.skipped_dep_count[dep] - deps_.upstream_failed_dep_count[dep];
-        if (pure_skipped > 0) {
-          auto mark_res = mark_task_branch_skipped(dep);
-          if (!mark_res) {
-            continue;
-          }
-        }
+      if (task_info_[dep].state != TaskState::Pending) {
         continue;
       }
 
       auto status = evaluate_trigger_rule(dep);
       if (status == TriggerStatus::Ready) {
-        runtime_.ready_mask.set(dep);
-        runtime_.ready_queue.push_back(dep);
-        ++runtime_.ready_count;
-        --runtime_.pending_count;
+        transition_to_ready(dep, delta);
       } else if (status == TriggerStatus::UpstreamFailed) {
-        (void)mark_task_upstream_failed(dep);
+        (void)mark_task_upstream_failed(dep, delta);
       } else if (status == TriggerStatus::Skipped) {
-        (void)mark_task_branch_skipped(dep);
+        (void)mark_task_branch_skipped(dep, delta);
       }
     }
   }
 
-  auto mark_task_upstream_failed(NodeIndex idx) -> Result<void> {
+  auto mark_task_upstream_failed(NodeIndex idx, DAGRun::TransitionDelta *delta)
+      -> Result<void> {
     if (static_cast<std::size_t>(idx) >= task_info_.size())
       return fail(Error::NotFound);
 
-    runtime_.skipped_mask.set(idx);
+    auto &info = task_info_[idx];
+    switch (info.state) {
+    case TaskState::Pending:
+      --runtime_.pending_count;
+      break;
+    case TaskState::Ready:
+      unlink_ready(idx);
+      --runtime_.ready_count;
+      break;
+    case TaskState::Running:
+    case TaskState::Retrying:
+    case TaskState::Success:
+    case TaskState::Failed:
+    case TaskState::Skipped:
+    case TaskState::UpstreamFailed:
+      return ok();
+    }
+
     ++runtime_.skipped_count;
-    --runtime_.pending_count;
-    task_info_[idx].state = TaskState::UpstreamFailed;
+    info.state = TaskState::UpstreamFailed;
+    if (delta != nullptr) {
+      delta->terminal_tasks.emplace_back(idx);
+    }
     update_dependent_counters(idx, TaskState::UpstreamFailed, +1);
 
-    propagate_terminal_to_downstream(idx);
+    propagate_terminal_to_downstream(idx, delta);
     update_state();
 #ifndef NDEBUG
     verify_invariants();
@@ -380,36 +437,37 @@ struct DAGRun::Impl {
     return ok();
   }
 
-  auto mark_task_branch_skipped(NodeIndex idx) -> Result<void> {
+  auto mark_task_branch_skipped(NodeIndex idx, DAGRun::TransitionDelta *delta)
+      -> Result<void> {
     if (static_cast<std::size_t>(idx) >= task_info_.size())
       return fail(Error::NotFound);
 
-    if (runtime_.completed_mask.test(idx) || runtime_.failed_mask.test(idx) ||
-        runtime_.skipped_mask.test(idx)) {
-      return ok();
-    }
-
-    if (runtime_.running_mask.test(idx)) {
-      return ok();
-    }
-
-    if (runtime_.ready_mask.test(idx)) {
-      runtime_.ready_mask.reset(idx);
+    auto &info = task_info_[idx];
+    switch (info.state) {
+    case TaskState::Ready:
+      unlink_ready(idx);
       --runtime_.ready_count;
-    } else {
-      const auto state = task_info_[idx].state;
-      if (state != TaskState::Pending && state != TaskState::Retrying) {
-        return ok();
-      }
+      break;
+    case TaskState::Pending:
       --runtime_.pending_count;
+      break;
+    case TaskState::Running:
+    case TaskState::Retrying:
+    case TaskState::Success:
+    case TaskState::Failed:
+    case TaskState::Skipped:
+    case TaskState::UpstreamFailed:
+      return ok();
     }
 
-    runtime_.skipped_mask.set(idx);
     ++runtime_.skipped_count;
-    task_info_[idx].state = TaskState::Skipped;
+    info.state = TaskState::Skipped;
+    if (delta != nullptr) {
+      delta->terminal_tasks.emplace_back(idx);
+    }
     update_dependent_counters(idx, TaskState::Skipped, +1);
 
-    propagate_terminal_to_downstream(idx);
+    propagate_terminal_to_downstream(idx, delta);
     update_state();
 #ifndef NDEBUG
     verify_invariants();
@@ -418,12 +476,7 @@ struct DAGRun::Impl {
   }
 
   auto rebuild_runtime_state_from_task_info() -> void {
-    runtime_.ready_mask.reset();
-    runtime_.running_mask.reset();
-    runtime_.completed_mask.reset();
-    runtime_.failed_mask.reset();
-    runtime_.skipped_mask.reset();
-    runtime_.ready_queue.clear();
+    reset_ready_list();
 
     std::ranges::fill(deps_.terminal_dep_count, 0);
     std::ranges::fill(deps_.success_dep_count, 0);
@@ -432,6 +485,7 @@ struct DAGRun::Impl {
     std::ranges::fill(deps_.upstream_failed_dep_count, 0);
 
     runtime_.pending_count = 0;
+    runtime_.retrying_count = 0;
     runtime_.ready_count = 0;
     runtime_.running_count = 0;
     runtime_.completed_count = 0;
@@ -443,52 +497,43 @@ struct DAGRun::Impl {
       const auto state = task_info_[i].state;
       switch (state) {
       case TaskState::Pending:
-      case TaskState::Retrying:
         ++runtime_.pending_count;
         break;
+      case TaskState::Retrying:
+        ++runtime_.retrying_count;
+        break;
+      case TaskState::Ready:
+        link_ready_back(idx);
+        ++runtime_.ready_count;
+        break;
       case TaskState::Running:
-        runtime_.running_mask.set(i);
         ++runtime_.running_count;
         break;
       case TaskState::Success:
-        runtime_.completed_mask.set(i);
         ++runtime_.completed_count;
         update_dependent_counters(idx, TaskState::Success, +1);
         break;
       case TaskState::Failed:
-        runtime_.failed_mask.set(i);
         ++runtime_.failed_count;
         update_dependent_counters(idx, TaskState::Failed, +1);
         break;
       case TaskState::Skipped:
-        runtime_.skipped_mask.set(i);
         ++runtime_.skipped_count;
         update_dependent_counters(idx, TaskState::Skipped, +1);
         break;
       case TaskState::UpstreamFailed:
-        runtime_.skipped_mask.set(i);
         ++runtime_.skipped_count;
         update_dependent_counters(idx, TaskState::UpstreamFailed, +1);
         break;
       }
     }
-    runtime_.failed_count_fast.store(runtime_.failed_count, std::memory_order_relaxed);
-
-    auto mark_ready = [&](NodeIndex idx) {
-      if (runtime_.ready_mask.test(idx)) {
-        return;
-      }
-      runtime_.ready_mask.set(idx);
-      runtime_.ready_queue.push_back(idx);
-      ++runtime_.ready_count;
-      --runtime_.pending_count;
-    };
+    runtime_.failed_count_fast.store(runtime_.failed_count,
+                                     std::memory_order_relaxed);
 
     auto try_resolve_pending = [&](NodeIndex idx,
                                    std::vector<NodeIndex> &terminal_queue) {
       auto &info = task_info_[idx];
-      if (info.state != TaskState::Pending &&
-          info.state != TaskState::Retrying) {
+      if (info.state != TaskState::Pending) {
         return;
       }
 
@@ -497,7 +542,7 @@ struct DAGRun::Impl {
         return;
       }
       if (status == TriggerStatus::Ready) {
-        mark_ready(idx);
+        transition_to_ready(idx);
         return;
       }
 
@@ -507,7 +552,6 @@ struct DAGRun::Impl {
       if (info.finished_at == std::chrono::system_clock::time_point{}) {
         info.finished_at = std::chrono::system_clock::now();
       }
-      runtime_.skipped_mask.set(idx);
       ++runtime_.skipped_count;
       --runtime_.pending_count;
       update_dependent_counters(idx, info.state, +1);
@@ -555,6 +599,7 @@ struct DAGRun::Impl {
 
   DAGRunDependencyState deps_;
   DAGRunRuntimeState runtime_;
+  std::vector<TriggerRule> trigger_rules_;
   std::vector<TaskInstanceInfo> task_info_;
   int64_t run_rowid_{-1};
   int64_t dag_rowid_{-1};
@@ -607,31 +652,15 @@ auto DAGRun::copy_ready_tasks(pmr::vector<NodeIndex> &out) const -> void {
   }
 
   out.reserve(impl_->runtime_.ready_count);
-  for (auto idx : impl_->runtime_.ready_queue) {
-    if (impl_->runtime_.ready_mask.test(idx)) {
-      out.emplace_back(idx);
-    }
+  for (NodeIndex idx = impl_->runtime_.ready_head; idx != kInvalidNode;
+       idx = impl_->runtime_.ready_links[idx].next) {
+    out.emplace_back(idx);
   }
 }
 
 auto DAGRun::is_task_ready(NodeIndex task_idx) const noexcept -> bool {
   return static_cast<std::size_t>(task_idx) < impl_->task_info_.size() &&
-         impl_->runtime_.ready_mask.test(task_idx);
-}
-
-auto DAGRun::ready_task_stream() const -> std::generator<Result<NodeIndex>> {
-  std::vector<NodeIndex> snapshot;
-  {
-    snapshot.reserve(impl_->runtime_.ready_count);
-    for (auto idx : impl_->runtime_.ready_queue) {
-      if (impl_->runtime_.ready_mask.test(idx)) {
-        snapshot.emplace_back(idx);
-      }
-    }
-  }
-  for (auto idx : snapshot) {
-    co_yield ok(idx);
-  }
+         impl_->task_info_[task_idx].state == TaskState::Ready;
 }
 
 auto DAGRun::ready_count() const noexcept -> size_t {
@@ -640,13 +669,20 @@ auto DAGRun::ready_count() const noexcept -> size_t {
 
 auto DAGRun::mark_task_started(NodeIndex task_idx,
                                const InstanceId &instance_id) -> Result<void> {
+  return mark_task_started(task_idx, instance_id,
+                           std::chrono::system_clock::now());
+}
+
+auto DAGRun::mark_task_started(NodeIndex task_idx,
+                               const InstanceId &instance_id,
+                               std::chrono::system_clock::time_point started_at)
+    -> Result<void> {
   if (static_cast<std::size_t>(task_idx) >= impl_->task_info_.size())
     return fail(Error::NotFound);
-  if (!impl_->runtime_.ready_mask.test(task_idx))
+  if (impl_->task_info_[task_idx].state != TaskState::Ready)
     return fail(Error::InvalidState);
 
-  impl_->runtime_.ready_mask.reset(task_idx);
-  impl_->runtime_.running_mask.set(task_idx);
+  impl_->unlink_ready(task_idx);
 
   --impl_->runtime_.ready_count;
   ++impl_->runtime_.running_count;
@@ -654,20 +690,22 @@ auto DAGRun::mark_task_started(NodeIndex task_idx,
   auto &info = impl_->task_info_[task_idx];
   info.instance_id = instance_id;
   info.state = TaskState::Running;
-  info.started_at = std::chrono::system_clock::now();
+  info.started_at = started_at;
+  info.finished_at = {};
+  info.exit_code = 0;
+  info.error_message.clear();
+  info.error_type.clear();
   info.attempt++;
   return ok();
 }
 
 auto DAGRun::mark_task_completed(NodeIndex task_idx, int exit_code)
-    -> Result<void> {
+    -> Result<TransitionDelta> {
+  TransitionDelta delta;
   if (static_cast<std::size_t>(task_idx) >= impl_->task_info_.size())
     return fail(Error::NotFound);
-  if (!impl_->runtime_.running_mask.test(task_idx))
+  if (impl_->task_info_[task_idx].state != TaskState::Running)
     return fail(Error::InvalidState);
-
-  impl_->runtime_.running_mask.reset(task_idx);
-  impl_->runtime_.completed_mask.set(task_idx);
 
   --impl_->runtime_.running_count;
   ++impl_->runtime_.completed_count;
@@ -678,21 +716,19 @@ auto DAGRun::mark_task_completed(NodeIndex task_idx, int exit_code)
   info.finished_at = std::chrono::system_clock::now();
 
   impl_->update_dependent_counters(task_idx, TaskState::Success, +1);
-  impl_->propagate_terminal_to_downstream(task_idx);
+  impl_->propagate_terminal_to_downstream(task_idx, &delta);
   impl_->update_state();
-  return ok();
+  return ok(std::move(delta));
 }
 
 auto DAGRun::mark_task_completed_with_branch(
     NodeIndex task_idx, int exit_code,
-    std::span<const TaskId> selected_branches) -> Result<void> {
+    std::span<const TaskId> selected_branches) -> Result<TransitionDelta> {
+  TransitionDelta delta;
   if (static_cast<std::size_t>(task_idx) >= impl_->task_info_.size())
     return fail(Error::NotFound);
-  if (!impl_->runtime_.running_mask.test(task_idx))
+  if (impl_->task_info_[task_idx].state != TaskState::Running)
     return fail(Error::InvalidState);
-
-  impl_->runtime_.running_mask.reset(task_idx);
-  impl_->runtime_.completed_mask.set(task_idx);
 
   --impl_->runtime_.running_count;
   ++impl_->runtime_.completed_count;
@@ -714,68 +750,62 @@ auto DAGRun::mark_task_completed_with_branch(
       }
 
       if (!selected) {
-        (void)impl_->mark_task_branch_skipped(dep_idx);
+        (void)impl_->mark_task_branch_skipped(dep_idx, &delta);
       }
     }
   }
 
   impl_->update_dependent_counters(task_idx, TaskState::Success, +1);
-  impl_->propagate_terminal_to_downstream(task_idx);
+  impl_->propagate_terminal_to_downstream(task_idx, &delta);
   impl_->update_state();
-  return ok();
+  return ok(std::move(delta));
 }
 
 auto DAGRun::mark_task_failed(NodeIndex task_idx, std::string_view error,
-                              int max_retries, int exit_code) -> Result<void> {
+                              int max_retries, int exit_code)
+    -> Result<TransitionDelta> {
+  TransitionDelta delta;
   if (static_cast<std::size_t>(task_idx) >= impl_->task_info_.size())
     return fail(Error::NotFound);
-  if (!impl_->runtime_.running_mask.test(task_idx))
+  if (impl_->task_info_[task_idx].state != TaskState::Running)
     return fail(Error::InvalidState);
 
   auto &info = impl_->task_info_[task_idx];
-  info.error_message = std::string(error);
+  info.error_message.assign(error.data(), error.size());
   info.exit_code = exit_code;
+  const auto error_type =
+      to_string_view(classify_task_failure_category(error, exit_code));
+  info.error_type.assign(error_type.data(), error_type.size());
 
-  if (info.attempt < max_retries) {
-    impl_->runtime_.running_mask.reset(task_idx);
-
+  if (info.attempt <= max_retries) {
     --impl_->runtime_.running_count;
-    ++impl_->runtime_.pending_count;
+    ++impl_->runtime_.retrying_count;
 
     info.state = TaskState::Retrying;
     info.started_at = {};
     info.finished_at = {};
   } else {
-    impl_->runtime_.running_mask.reset(task_idx);
-    impl_->runtime_.failed_mask.set(task_idx);
-
     --impl_->runtime_.running_count;
     ++impl_->runtime_.failed_count;
     impl_->runtime_.failed_count_fast.store(impl_->runtime_.failed_count,
-                                    std::memory_order_relaxed);
+                                            std::memory_order_relaxed);
 
     info.state = TaskState::Failed;
     info.finished_at = std::chrono::system_clock::now();
 
     impl_->update_dependent_counters(task_idx, TaskState::Failed, +1);
-    impl_->propagate_terminal_to_downstream(task_idx);
+    impl_->propagate_terminal_to_downstream(task_idx, &delta);
     impl_->update_state();
   }
 
-  return ok();
+  return ok(std::move(delta));
 }
 
-auto DAGRun::mark_task_retry_ready(NodeIndex task_idx) -> Result<void> {
+auto DAGRun::mark_task_retry_ready(NodeIndex task_idx)
+    -> Result<TransitionDelta> {
+  TransitionDelta delta;
   if (static_cast<std::size_t>(task_idx) >= impl_->task_info_.size()) {
     return fail(Error::NotFound);
-  }
-
-  if (impl_->runtime_.ready_mask.test(task_idx) ||
-      impl_->runtime_.running_mask.test(task_idx) ||
-      impl_->runtime_.completed_mask.test(task_idx) ||
-      impl_->runtime_.failed_mask.test(task_idx) ||
-      impl_->runtime_.skipped_mask.test(task_idx)) {
-    return fail(Error::InvalidState);
   }
 
   auto &info = impl_->task_info_[task_idx];
@@ -783,50 +813,44 @@ auto DAGRun::mark_task_retry_ready(NodeIndex task_idx) -> Result<void> {
     return fail(Error::InvalidState);
   }
 
-  impl_->runtime_.ready_mask.set(task_idx);
-  impl_->runtime_.ready_queue.push_back(task_idx);
-  ++impl_->runtime_.ready_count;
-  if (impl_->runtime_.pending_count > 0) {
-    --impl_->runtime_.pending_count;
-  }
-
-  info.state = TaskState::Pending;
-  return ok();
+  impl_->transition_to_ready(task_idx, &delta);
+  return ok(std::move(delta));
 }
 
-auto DAGRun::mark_task_skipped(NodeIndex task_idx) -> Result<void> {
+auto DAGRun::mark_task_skipped(NodeIndex task_idx) -> Result<TransitionDelta> {
+  TransitionDelta delta;
   if (static_cast<std::size_t>(task_idx) >= impl_->task_info_.size())
     return fail(Error::NotFound);
 
-  bool was_ready = impl_->runtime_.ready_mask.test(task_idx);
-  bool was_running = impl_->runtime_.running_mask.test(task_idx);
-
-  if (!was_ready && !was_running) {
-    // Task is neither ready nor running, so it's an invalid state to skip from.
+  auto &info = impl_->task_info_[task_idx];
+  if (info.state != TaskState::Ready && info.state != TaskState::Running) {
     return fail(Error::InvalidState);
   }
 
-  if (was_ready) {
-    impl_->runtime_.ready_mask.reset(task_idx);
+  if (info.state == TaskState::Ready) {
+    impl_->unlink_ready(task_idx);
     --impl_->runtime_.ready_count;
-  } else { // was_running
-    impl_->runtime_.running_mask.reset(task_idx);
+  } else {
     --impl_->runtime_.running_count;
   }
 
-  impl_->runtime_.skipped_mask.set(task_idx);
   ++impl_->runtime_.skipped_count;
 
-  impl_->task_info_[task_idx].state = TaskState::Skipped;
+  info.state = TaskState::Skipped;
 
   impl_->update_dependent_counters(task_idx, TaskState::Skipped, +1);
-  impl_->propagate_terminal_to_downstream(task_idx);
+  impl_->propagate_terminal_to_downstream(task_idx, &delta);
   impl_->update_state();
-  return ok();
+  return ok(std::move(delta));
 }
 
-auto DAGRun::mark_task_upstream_failed(NodeIndex task_idx) -> Result<void> {
-  return impl_->mark_task_upstream_failed(task_idx);
+auto DAGRun::mark_task_upstream_failed(NodeIndex task_idx)
+    -> Result<TransitionDelta> {
+  TransitionDelta delta;
+  if (auto r = impl_->mark_task_upstream_failed(task_idx, &delta); !r) {
+    return fail(r.error());
+  }
+  return ok(std::move(delta));
 }
 
 auto DAGRun::restore_task_instance(const TaskInstanceInfo &info)
@@ -844,14 +868,20 @@ auto DAGRun::has_failed() const noexcept -> bool {
 }
 
 auto DAGRun::all_task_info() const -> std::vector<TaskInstanceInfo> {
-  return impl_->task_info_;
+  auto out = impl_->task_info_;
+  for (auto &info : out) {
+    info.run_rowid = impl_->run_rowid_;
+  }
+  return out;
 }
 
 auto DAGRun::get_task_info(NodeIndex task_idx) const
     -> Result<TaskInstanceInfo> {
   if (static_cast<std::size_t>(task_idx) >= impl_->task_info_.size())
     return fail(Error::NotFound);
-  return impl_->task_info_[task_idx];
+  auto info = impl_->task_info_[task_idx];
+  info.run_rowid = impl_->run_rowid_;
+  return info;
 }
 
 auto DAGRun::set_instance_id(NodeIndex task_idx, const InstanceId &instance_id)
@@ -942,9 +972,6 @@ auto DAGRun::run_rowid() const noexcept -> int64_t { return impl_->run_rowid_; }
 
 auto DAGRun::set_run_rowid(int64_t rowid) noexcept -> void {
   impl_->run_rowid_ = rowid;
-  for (auto &info : impl_->task_info_) {
-    info.run_rowid = rowid;
-  }
 }
 
 auto DAGRun::dag_rowid() const noexcept -> int64_t { return impl_->dag_rowid_; }

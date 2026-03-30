@@ -8,9 +8,11 @@ import {
     Terminal,
     AlertTriangle,
     RotateCcw,
+    PlayCircle,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
+import { useI18n } from "@/contexts/I18nContext";
 import {
     DAGDisplayStatus,
     dagStatusLabels,
@@ -21,8 +23,32 @@ import {
     ExecutorType,
 } from "@/types/dag";
 
+export const triggerRuleLabels: Record<string, string> = {
+    all_success: "All success",
+    all_failed: "All failed",
+    all_done: "All done",
+    one_success: "One success",
+    one_failed: "One failed",
+    none_failed: "None failed",
+    none_skipped: "None skipped",
+    all_done_min_one_success: "All done + one success",
+    all_skipped: "All skipped",
+    one_done: "One done",
+    none_failed_min_one_success: "None failed + one success",
+    always: "Always",
+};
+
 export const executorLabels: Record<ExecutorType, string> = {
     shell: "Shell",
+    docker: "Docker",
+    sensor: "Sensor",
+    noop: "Noop",
+};
+
+export const sensorTypeLabels: Record<string, string> = {
+    file: "File sensor",
+    http: "HTTP sensor",
+    command: "Command sensor",
 };
 
 export const dagStatusIcons: Record<DAGDisplayStatus, React.ElementType> = {
@@ -35,6 +61,7 @@ export const dagStatusIcons: Record<DAGDisplayStatus, React.ElementType> = {
 
 export const taskStatusIcons: Record<TaskState, React.ElementType> = {
     pending: Clock,
+    ready: PlayCircle,
     running: Loader2,
     success: CheckCircle2,
     failed: XCircle,
@@ -45,6 +72,9 @@ export const taskStatusIcons: Record<TaskState, React.ElementType> = {
 
 export const executorIcons: Record<ExecutorType, React.ElementType> = {
     shell: Terminal,
+    docker: Terminal,
+    sensor: Timer,
+    noop: MinusCircle,
 };
 
 interface DAGStatusBadgeProps {
@@ -53,7 +83,15 @@ interface DAGStatusBadgeProps {
 }
 
 export function DAGStatusBadge({ status, className }: DAGStatusBadgeProps) {
+    const { t } = useI18n();
     const Icon = dagStatusIcons[status];
+    const labels: Record<DAGDisplayStatus, string> = {
+        running: t.runStatus.running,
+        success: t.runStatus.success,
+        failed: t.runStatus.failed,
+        no_run: t.runStatus.noRun,
+        inactive: t.runStatus.inactive,
+    };
     return (
         <Badge
             variant="outline"
@@ -64,7 +102,7 @@ export function DAGStatusBadge({ status, className }: DAGStatusBadgeProps) {
             )}
         >
             <Icon className={cn("h-3.5 w-3.5", status === "running" && "animate-spin")} />
-            {dagStatusLabels[status]}
+            {labels[status] ?? dagStatusLabels[status]}
         </Badge>
     );
 }
@@ -75,7 +113,18 @@ interface TaskStatusBadgeProps {
 }
 
 export function TaskStatusBadge({ status, className }: TaskStatusBadgeProps) {
+    const { t } = useI18n();
     const Icon = taskStatusIcons[status];
+    const labels: Record<TaskState, string> = {
+        pending: t.runStatus.pending,
+        ready: t.runStatus.ready,
+        running: t.runStatus.running,
+        success: t.runStatus.success,
+        failed: t.runStatus.failed,
+        upstream_failed: t.runStatus.upstreamFailed,
+        retrying: t.runStatus.retrying,
+        skipped: t.runStatus.skipped,
+    };
     return (
         <Badge
             variant="outline"
@@ -86,7 +135,7 @@ export function TaskStatusBadge({ status, className }: TaskStatusBadgeProps) {
             )}
         >
             <Icon className={cn("h-3 w-3", (status === "running" || status === "retrying") && "animate-spin")} />
-            {taskStatusLabels[status]}
+            {labels[status] ?? taskStatusLabels[status]}
         </Badge>
     );
 }
@@ -120,7 +169,8 @@ export function TaskStatusIcon({ status, className }: TaskStatusIconProps) {
     const Icon = taskStatusIcons[status];
     const colorClass = status === "success" ? "text-success" :
         (status === "failed" || status === "upstream_failed") ? "text-destructive" :
-            status === "running" ? "text-primary" : "text-muted-foreground";
+            status === "running" ? "text-primary" :
+                status === "ready" ? "text-amber-600" : "text-muted-foreground";
     return (
         <Icon className={cn(
             "h-5 w-5",

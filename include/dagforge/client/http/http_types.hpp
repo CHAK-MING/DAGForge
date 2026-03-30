@@ -1,14 +1,25 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/core/error.hpp"
 #include "dagforge/util/string_hash.hpp"
+#endif
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
+#include <boost/algorithm/string/predicate.hpp>
+#include <boost/beast/http/status.hpp>
+#include <boost/url/params_view.hpp>
+
+#include <cstddef>
 #include <cstdint>
 #include <format>
+#include <iterator>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
+#endif
 
 namespace dagforge::http {
 
@@ -21,6 +32,28 @@ enum class HttpMethod : std::uint8_t {
   OPTIONS,
   HEAD
 };
+
+[[nodiscard]] constexpr auto http_method_name(HttpMethod method) noexcept
+    -> std::string_view {
+  using enum HttpMethod;
+  switch (method) {
+  case GET:
+    return "GET";
+  case POST:
+    return "POST";
+  case PUT:
+    return "PUT";
+  case DELETE:
+    return "DELETE";
+  case PATCH:
+    return "PATCH";
+  case OPTIONS:
+    return "OPTIONS";
+  case HEAD:
+    return "HEAD";
+  }
+  return "UNKNOWN";
+}
 
 enum class HttpStatus : std::uint16_t {
   Ok = 200,
@@ -49,13 +82,40 @@ using HttpHeaders =
     std::unordered_map<std::string, std::string, dagforge::StringHash,
                        dagforge::StringEqual>;
 
+[[nodiscard]] inline auto status_reason_phrase(HttpStatus status)
+    -> std::string_view {
+  namespace beast_http = boost::beast::http;
+  return beast_http::obsolete_reason(static_cast<beast_http::status>(status));
+}
+
 class QueryParams {
 public:
   QueryParams() = default;
-  explicit QueryParams(std::string_view query_string);
+  explicit QueryParams(std::string_view query_string) {
+    if (query_string.empty()) {
+      return;
+    }
+    try {
+      boost::urls::params_view parsed(query_string);
+      for (const auto &param : parsed) {
+        params_[std::string(param.key)] = std::string(param.value);
+      }
+    } catch (...) {
+      return;
+    }
+  }
 
-  [[nodiscard]] auto get(std::string_view key) const -> Result<std::string>;
-  [[nodiscard]] auto has(std::string_view key) const -> bool;
+  [[nodiscard]] auto get(std::string_view key) const -> Result<std::string> {
+    auto it = params_.find(key);
+    if (it != params_.end()) {
+      return ok(it->second);
+    }
+    return fail(Error::NotFound);
+  }
+
+  [[nodiscard]] auto has(std::string_view key) const -> bool {
+    return params_.contains(key);
+  }
   [[nodiscard]] auto size() const -> std::size_t { return params_.size(); }
 
 private:
@@ -71,40 +131,164 @@ struct HttpRequest {
   int version_major{1};
   int version_minor{1};
   HttpHeaders headers;
-  std::vector<uint8_t> body;
+  std::vector<std::uint8_t> body;
   // Mutable: populated by Router during const route() method
   mutable std::unordered_map<std::string, std::string, dagforge::StringHash,
                              dagforge::StringEqual>
       path_params;
 
-  [[nodiscard]] auto header(std::string_view key) const -> Result<std::string>;
-  [[nodiscard]] auto is_websocket_upgrade() const -> bool;
-  [[nodiscard]] auto body_as_string() const -> std::string_view;
-  [[nodiscard]] auto path_param(std::string_view key) const
-      -> Result<std::string>;
+  [[nodiscard]] auto header(std::string_view key) const -> Result<std::string> {
+    if (auto it = headers.find(std::string(key)); it != headers.end()) {
+      return ok(it->second);
+    }
 
-  [[nodiscard]] auto serialize() const -> std::vector<uint8_t>;
+    for (const auto &[header_key, value] : headers) {
+      if (boost::algorithm::iequals(header_key, key)) {
+        return ok(value);
+      }
+    }
+    return fail(Error::NotFound);
+  }
+
+  [[nodiscard]] auto is_websocket_upgrade() const -> bool {
+    auto upgrade = header("Upgrade");
+    auto connection = header("Connection");
+
+    if (!upgrade || !connection) {
+      return false;
+    }
+
+    return boost::algorithm::iequals(*upgrade, "websocket") &&
+           boost::algorithm::icontains(*connection, "upgrade");
+  }
+
+  [[nodiscard]] auto body_as_string() const -> std::string_view {
+    return {reinterpret_cast<const char *>(body.data()), body.size()};
+  }
+
+  [[nodiscard]] auto path_param(std::string_view key) const
+      -> Result<std::string> {
+    auto it = path_params.find(key);
+    if (it != path_params.end()) {
+      return ok(it->second);
+    }
+    return fail(Error::NotFound);
+  }
+
+  [[nodiscard]] auto serialize() const -> std::vector<std::uint8_t> {
+    std::vector<std::uint8_t> result;
+
+    result.reserve(256 + body.size());
+    std::format_to(std::back_inserter(result), "{} {} HTTP/1.1\r\n",
+                   http_method_name(method), path);
+
+    bool has_content_length = false;
+    bool has_host = false;
+
+    for (const auto &[key, value] : headers) {
+      std::format_to(std::back_inserter(result), "{}: {}\r\n", key, value);
+      if (key == "Content-Length") {
+        has_content_length = true;
+      }
+      if (key == "Host") {
+        has_host = true;
+      }
+    }
+
+    if (!has_host) {
+      constexpr std::string_view host_header = "Host: localhost\r\n";
+      result.insert(result.end(), host_header.begin(), host_header.end());
+    }
+
+    if (!has_content_length && !body.empty()) {
+      std::format_to(std::back_inserter(result), "Content-Length: {}\r\n",
+                     body.size());
+    }
+
+    result.emplace_back('\r');
+    result.emplace_back('\n');
+    result.insert(result.end(), body.begin(), body.end());
+    return result;
+  }
 };
 
 struct HttpResponse {
   HttpStatus status{HttpStatus::Ok};
   HttpHeaders headers;
-  std::vector<uint8_t> body;
+  std::vector<std::uint8_t> body;
 
-  [[nodiscard]] static auto ok() -> HttpResponse;
-  [[nodiscard]] static auto json(std::string_view json_str) -> HttpResponse;
-  [[nodiscard]] static auto not_found() -> HttpResponse;
-  [[nodiscard]] static auto bad_request() -> HttpResponse;
-  [[nodiscard]] static auto internal_error() -> HttpResponse;
+  [[nodiscard]] static auto ok() -> HttpResponse {
+    return {.status = HttpStatus::Ok, .headers = {}, .body = {}};
+  }
 
-  auto set_header(std::string key, std::string value) -> HttpResponse &;
-  auto set_body(std::string body_str) -> HttpResponse &;
-  auto set_body(std::vector<uint8_t> body_data) -> HttpResponse &;
+  [[nodiscard]] static auto json(std::string_view json_str) -> HttpResponse {
+    HttpResponse resp{.status = HttpStatus::Ok, .headers = {}, .body = {}};
+    resp.headers["Content-Type"] = "application/json";
+    resp.body.assign(json_str.begin(), json_str.end());
+    return resp;
+  }
 
-  [[nodiscard]] auto serialize() const -> std::vector<uint8_t>;
+  [[nodiscard]] static auto not_found() -> HttpResponse {
+    return {.status = HttpStatus::NotFound, .headers = {}, .body = {}};
+  }
+
+  [[nodiscard]] static auto bad_request() -> HttpResponse {
+    return {.status = HttpStatus::BadRequest, .headers = {}, .body = {}};
+  }
+
+  [[nodiscard]] static auto internal_error() -> HttpResponse {
+    return {
+        .status = HttpStatus::InternalServerError, .headers = {}, .body = {}};
+  }
+
+  auto set_header(std::string key, std::string value) -> HttpResponse & {
+    headers[std::move(key)] = std::move(value);
+    return *this;
+  }
+
+  auto set_body(std::string body_str) -> HttpResponse & {
+    body.assign(body_str.begin(), body_str.end());
+    return *this;
+  }
+
+  auto set_body(std::vector<std::uint8_t> body_data) -> HttpResponse & {
+    body = std::move(body_data);
+    return *this;
+  }
+
+  [[nodiscard]] auto serialize() const -> std::vector<std::uint8_t> {
+    std::vector<std::uint8_t> result;
+
+    result.reserve(256 + body.size());
+    std::format_to(std::back_inserter(result), "HTTP/1.1 {} {}\r\n",
+                   static_cast<std::uint16_t>(status),
+                   status_reason_phrase(status));
+
+    bool has_content_length = false;
+    for (const auto &[key, value] : headers) {
+      std::format_to(std::back_inserter(result), "{}: {}\r\n", key, value);
+      if (key == "Content-Length") {
+        has_content_length = true;
+      }
+    }
+
+    if (!has_content_length && !body.empty()) {
+      std::format_to(std::back_inserter(result), "Content-Length: {}\r\n",
+                     body.size());
+    }
+
+    constexpr std::string_view kSecurityHeaders =
+        "X-Frame-Options: DENY\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
+        "Cache-Control: no-store\r\n";
+    result.insert(result.end(), kSecurityHeaders.begin(), kSecurityHeaders.end());
+
+    result.emplace_back('\r');
+    result.emplace_back('\n');
+    result.insert(result.end(), body.begin(), body.end());
+    return result;
+  }
 };
-
-[[nodiscard]] auto status_reason_phrase(HttpStatus status) -> std::string_view;
 
 } // namespace dagforge::http
 
@@ -113,25 +297,7 @@ struct std::formatter<dagforge::http::HttpMethod>
     : std::formatter<std::string_view> {
   auto format(dagforge::http::HttpMethod method, auto &ctx) const {
     using enum dagforge::http::HttpMethod;
-    std::string_view name = [method] {
-      switch (method) {
-      case GET:
-        return "GET";
-      case POST:
-        return "POST";
-      case PUT:
-        return "PUT";
-      case DELETE:
-        return "DELETE";
-      case PATCH:
-        return "PATCH";
-      case OPTIONS:
-        return "OPTIONS";
-      case HEAD:
-        return "HEAD";
-      }
-      return "UNKNOWN";
-    }();
+    std::string_view name = dagforge::http::http_method_name(method);
     return std::formatter<std::string_view>::format(name, ctx);
   }
 };

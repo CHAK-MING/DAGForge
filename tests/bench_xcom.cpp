@@ -13,7 +13,7 @@
 #include "dagforge/xcom/template_resolver.hpp"
 #include "dagforge/xcom/xcom_types.hpp"
 
-#include <benchmark/benchmark.h>
+#include "benchmark_compat.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -141,7 +141,7 @@ public:
 
     try {
       auto save_res = service_.sync_wait(
-          service_.save_xcom(run_id_, task_id_, key, *parsed));
+          service_.save_xcom(run_id_, task_id_, key, value_json));
       if (!save_res) {
         last_error_ = save_res.error().message();
       }
@@ -272,7 +272,7 @@ void BM_XComCacheHit(benchmark::State &state) {
   for (std::size_t i = 0; i < count; ++i) {
     keys.emplace_back(std::format("key_{}", i));
     cache.set(run_id, task_id, keys.back(),
-              JsonValue{std::format("value_{}", i)});
+              dump_json(JsonValue{std::format("value_{}", i)}));
   }
 
   for (auto _ : state) {
@@ -324,7 +324,7 @@ void BM_XComCacheMiss(benchmark::State &state) {
   for (std::size_t i = 0; i < count; ++i) {
     existing_keys.emplace_back(std::format("key_{}", i));
     cache.set(run_id, task_id, existing_keys.back(),
-              JsonValue{std::format("value_{}", i)});
+              dump_json(JsonValue{std::format("value_{}", i)}));
     keys.emplace_back(std::format("missing_key_{}", i));
   }
 

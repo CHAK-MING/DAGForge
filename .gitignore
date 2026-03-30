@@ -3,8 +3,19 @@ web-ui/dist
 web-ui/package-lock.json
 
 .vscode
+.codex
+bin/
 build
 build-*
+.bdep/
+.bpkg/
+gcm.cache/
 
 .cache
 *.db
+!bin/buildfile
+
+dist/
+tests/__pycache__/
+bench/scripts/__pycache__/
+bench/scripts/benchlib/

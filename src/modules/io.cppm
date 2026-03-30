@@ -1,0 +1,15 @@
+module;
+
+#include <cstdint>
+#include <string>
+#include <system_error>
+#include <type_traits>
+#include <utility>
+
+export module dagforge.io;
+
+#define DAGFORGE_BUILDING_MODULE_INTERFACE 1
+export {
+#include "dagforge/io/result.hpp"
+}
+#undef DAGFORGE_BUILDING_MODULE_INTERFACE

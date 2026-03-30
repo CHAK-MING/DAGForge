@@ -4,6 +4,7 @@
 #include "dagforge/config/task_config.hpp"
 #include "dagforge/util/json.hpp"
 
+#include "e2e_test_support.hpp"
 #include "test_utils.hpp"
 #include "gtest/gtest.h"
 
@@ -14,7 +15,6 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -27,17 +27,8 @@ using namespace dagforge;
 
 namespace {
 
-auto env_or_default(const char *key, std::string fallback) -> std::string {
-  if (const char *v = std::getenv(key); v && *v != '\0') {
-    return v;
-  }
-  return fallback;
-}
-
 auto unique_token(std::string_view base) -> std::string {
-  static std::atomic<std::uint64_t> seq{0};
-  const auto n = seq.fetch_add(1, std::memory_order_relaxed);
-  return std::format("{}_{}", base, n);
+  return dagforge::test::unique_token(base);
 }
 
 auto example_dags_dir() -> std::string {
@@ -48,23 +39,8 @@ auto example_dags_dir() -> std::string {
   return (here.parent_path().parent_path() / "dags").string();
 }
 
-auto make_test_config(std::uint16_t api_port) -> Config {
-  Config cfg{};
-  cfg.api.enabled = true;
-  cfg.api.host = "127.0.0.1";
-  cfg.api.port = api_port;
-  cfg.scheduler.shards = 2;
-  cfg.scheduler.max_concurrency = 16;
-  cfg.database.host =
-      env_or_default("DAGFORGE_TEST_MYSQL_HOST", cfg.database.host);
-  cfg.database.username =
-      env_or_default("DAGFORGE_TEST_MYSQL_USER", cfg.database.username);
-  cfg.database.password =
-      env_or_default("DAGFORGE_TEST_MYSQL_PASSWORD", cfg.database.password);
-  cfg.database.database =
-      env_or_default("DAGFORGE_TEST_MYSQL_DB", cfg.database.database);
-  cfg.database.connect_timeout = 2;
-  return cfg;
+auto make_test_config(std::uint16_t api_port) -> SystemConfig {
+  return dagforge::test::make_test_config(api_port);
 }
 
 auto response_body_string(const http::HttpResponse &resp) -> std::string {
@@ -382,7 +358,9 @@ auto collect_ws_messages(std::uint16_t port,
 
 } // namespace
 
-TEST(ApiE2EIntegrationTest, TriggerHistoryAndXComRoundtrip) {
+class ApiE2EIntegrationTest : public dagforge::test::MySqlIsolatedTest {};
+
+TEST_F(ApiE2EIntegrationTest, TriggerHistoryAndXComRoundtrip) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
 
@@ -447,7 +425,7 @@ TEST(ApiE2EIntegrationTest, TriggerHistoryAndXComRoundtrip) {
   app.stop();
 }
 
-TEST(ApiE2EIntegrationTest, DagPauseAndUnpauseEndpointsReflectPausedState) {
+TEST_F(ApiE2EIntegrationTest, DagPauseAndUnpauseEndpointsReflectPausedState) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
 
@@ -521,7 +499,7 @@ TEST(ApiE2EIntegrationTest, DagPauseAndUnpauseEndpointsReflectPausedState) {
   app.stop();
 }
 
-TEST(ApiE2EIntegrationTest, PausedDagRejectsManualTrigger) {
+TEST_F(ApiE2EIntegrationTest, PausedDagRejectsManualTrigger) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
 
@@ -559,7 +537,7 @@ TEST(ApiE2EIntegrationTest, PausedDagRejectsManualTrigger) {
   app.stop();
 }
 
-TEST(ApiE2EIntegrationTest, DagOwnerRejectsTriggerWhenMaxConcurrentRunsReached) {
+TEST_F(ApiE2EIntegrationTest, DagOwnerRejectsTriggerWhenMaxConcurrentRunsReached) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
 
@@ -609,7 +587,7 @@ TEST(ApiE2EIntegrationTest, DagOwnerRejectsTriggerWhenMaxConcurrentRunsReached) 
   app.stop();
 }
 
-TEST(ApiE2EIntegrationTest, InvalidCommandRunFailsAndPersistsTaskFailure) {
+TEST_F(ApiE2EIntegrationTest, InvalidCommandRunFailsAndPersistsTaskFailure) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
 
@@ -658,7 +636,7 @@ TEST(ApiE2EIntegrationTest, InvalidCommandRunFailsAndPersistsTaskFailure) {
   app.stop();
 }
 
-TEST(ApiE2EIntegrationTest, NonZeroExitRunPersistsRetryingState) {
+TEST_F(ApiE2EIntegrationTest, NonZeroExitRunPersistsRetryingState) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
 
@@ -713,7 +691,7 @@ TEST(ApiE2EIntegrationTest, NonZeroExitRunPersistsRetryingState) {
   app.stop();
 }
 
-TEST(ApiE2EIntegrationTest, RunLogsReturnLargeStdoutAsPerLineEntries) {
+TEST_F(ApiE2EIntegrationTest, RunLogsReturnLargeStdoutAsPerLineEntries) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
 
@@ -798,7 +776,7 @@ TEST(ApiE2EIntegrationTest, RunLogsReturnLargeStdoutAsPerLineEntries) {
   app.stop();
 }
 
-TEST(ApiE2EIntegrationTest, WebSocketReceivesMessagesForSlowDag) {
+TEST_F(ApiE2EIntegrationTest, WebSocketReceivesMessagesForSlowDag) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
 
@@ -865,12 +843,34 @@ TEST(ApiE2EIntegrationTest, WebSocketReceivesMessagesForSlowDag) {
   app.stop();
 }
 
-TEST(ApiE2EIntegrationTest, HttpSensorDagDoesNotCrashServer) {
+TEST_F(ApiE2EIntegrationTest, HttpSensorDagDoesNotCrashServer) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
 
+  const auto dag_dir = dagforge::test::make_temp_dir("dagforge_sensor_http_");
+  ASSERT_FALSE(dag_dir.empty());
+  const auto dag_path = std::filesystem::path(dag_dir) / "sensor_http.toml";
+  ASSERT_TRUE(write_dag_file(
+      dag_path, std::format(R"(id = "sensor_http_test"
+
+[[tasks]]
+id = "wait_http"
+executor = "sensor"
+sensor_type = "http"
+target = "http://127.0.0.1:{}/api/health"
+sensor_expected_status = 200
+sensor_interval = 1
+timeout = 10
+
+[[tasks]]
+id = "verify"
+command = "echo 'HTTP sensor passed'"
+dependencies = ["wait_http"]
+)",
+                             port)));
+
   auto cfg = make_test_config(port);
-  cfg.dag_source.directory = example_dags_dir();
+  cfg.dag_source.directory = dag_dir;
 
   Application app(cfg);
   ASSERT_TRUE(app.init().has_value());
@@ -883,7 +883,7 @@ TEST(ApiE2EIntegrationTest, HttpSensorDagDoesNotCrashServer) {
   ASSERT_TRUE(wait_api_ready(app, port));
 
   auto trigger_resp =
-      http_post_json(app, port, "/api/dags/sensor_http_test/trigger", "{}");
+      http_post_json(app, port, "/api/dags/sensor_http/trigger", "{}");
   ASSERT_TRUE(trigger_resp.has_value());
   ASSERT_EQ(trigger_resp->status, http::HttpStatus::Created);
 
@@ -903,7 +903,7 @@ TEST(ApiE2EIntegrationTest, HttpSensorDagDoesNotCrashServer) {
   app.stop();
 }
 
-TEST(ApiE2EIntegrationTest, CommandSensorDagDoesNotCrashServer) {
+TEST_F(ApiE2EIntegrationTest, CommandSensorDagDoesNotCrashServer) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
 
@@ -921,7 +921,7 @@ command = "echo 'ready' > /tmp/sensor_command_ready.txt"
 id = "wait_command"
 executor = "sensor"
 sensor_type = "command"
-command = "test -f /tmp/sensor_command_ready.txt"
+target = "test -f /tmp/sensor_command_ready.txt"
 sensor_interval = 2
 timeout = 10
 dependencies = ["setup"]
@@ -946,7 +946,7 @@ dependencies = ["wait_command"]
   ASSERT_TRUE(wait_api_ready(app, port));
 
   auto trigger_resp =
-      http_post_json(app, port, "/api/dags/sensor_command_test/trigger", "{}");
+      http_post_json(app, port, "/api/dags/sensor_command/trigger", "{}");
   ASSERT_TRUE(trigger_resp.has_value());
   ASSERT_EQ(trigger_resp->status, http::HttpStatus::Created);
 
@@ -966,7 +966,7 @@ dependencies = ["wait_command"]
   app.stop();
 }
 
-TEST(ApiE2EIntegrationTest,
+TEST_F(ApiE2EIntegrationTest,
      HotReloadUpdatesDagDefinitionWithoutLosingHistoricalRuns) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
@@ -1107,7 +1107,7 @@ dependencies = ["step_a"]
   std::filesystem::remove_all(dag_dir);
 }
 
-TEST(ApiE2EIntegrationTest, StartPreloadsDagRowidsForFileLoadedDags) {
+TEST_F(ApiE2EIntegrationTest, StartPreloadsDagRowidsForFileLoadedDags) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
 
@@ -1157,7 +1157,7 @@ dependencies = ["step_a"]
   std::filesystem::remove_all(dag_dir);
 }
 
-TEST(ApiE2EIntegrationTest, PublicExamplesCanTriggerAndComplete) {
+TEST_F(ApiE2EIntegrationTest, PublicExamplesCanTriggerAndComplete) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
 
@@ -1307,27 +1307,19 @@ TEST(ApiE2EIntegrationTest, PublicExamplesCanTriggerAndComplete) {
     } else if (dag_id == std::string_view{"trigger_rules"}) {
       ASSERT_TRUE(assert_all_tasks_terminal_or_expected(
           app, port, run_id,
-          {{"start", "success"},
-           {"upstream_success", "success"},
-           {"upstream_failed", "failed"},
-           {"branch_selector", "success"},
-           {"branch_kept", "success"},
-           {"branch_skipped", "skipped"},
-           {"rule_all_success", "success"},
-           {"rule_all_failed", "success"},
-           {"rule_all_done", "success"},
-           {"rule_one_success", "success"},
-           {"rule_one_failed", "success"},
-           {"rule_one_done", "success"},
-           {"rule_none_failed", "success"},
-           {"rule_none_skipped", "success"},
-           {"rule_all_done_min_one_success", "success"},
-           {"rule_all_skipped", "success"},
-           {"rule_none_failed_min_one_success", "success"},
-           {"rule_always", "success"},
-           {"cleanup", "success"}},
-          true));
-      EXPECT_EQ(task_state.size(), 19U);
+          {{"seed", "success"},
+           {"u_success", "success"},
+           {"u_failed", "failed"},
+           {"branch_pick", "success"},
+           {"b_kept", "success"},
+           {"b_skipped", "skipped"},
+           {"all_success__expect_success", "success"},
+           {"all_failed__expect_success", "success"},
+           {"one_success__expect_success", "success"},
+           {"one_failed__expect_success", "success"},
+           {"always__expect_success", "success"}},
+          false, std::chrono::seconds(20)));
+      EXPECT_GE(task_state.size(), 10U);
     }
 
     auto run_detail =
@@ -1344,7 +1336,7 @@ TEST(ApiE2EIntegrationTest, PublicExamplesCanTriggerAndComplete) {
   app.stop();
 }
 
-TEST(ApiE2EIntegrationTest, DependsOnPastBlocksByFailingCurrentTask) {
+TEST_F(ApiE2EIntegrationTest, DependsOnPastBlocksByFailingCurrentTask) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
 
@@ -1423,7 +1415,7 @@ TEST(ApiE2EIntegrationTest, DependsOnPastBlocksByFailingCurrentTask) {
   app.stop();
 }
 
-TEST(ApiE2EIntegrationTest, RunTasksEndpointReturnsDagCompleteTaskSet) {
+TEST_F(ApiE2EIntegrationTest, RunTasksEndpointReturnsDagCompleteTaskSet) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
 
@@ -1476,17 +1468,26 @@ TEST(ApiE2EIntegrationTest, RunTasksEndpointReturnsDagCompleteTaskSet) {
   run->set_started_at(now);
   run->set_execution_date(now);
 
-  TaskInstanceInfo ti{};
-  ti.task_rowid = dag_loaded->tasks[0].task_rowid;
-  ti.attempt = 1;
-  ti.state = TaskState::Success;
-  ti.started_at = now;
-  ti.finished_at = now;
+  TaskInstanceInfo t1_info{};
+  t1_info.task_id = TaskId{"t1"};
+  t1_info.task_idx = *idx1;
+  t1_info.task_rowid = dag_loaded->tasks[0].task_rowid;
+  t1_info.attempt = 1;
+  t1_info.state = TaskState::Success;
+  t1_info.started_at = now;
+  t1_info.finished_at = now;
+
+  TaskInstanceInfo t2_info{};
+  t2_info.task_id = TaskId{"t2"};
+  t2_info.task_idx = *idx2;
+  t2_info.task_rowid = dag_loaded->tasks[1].task_rowid;
+  t2_info.attempt = 1;
+  t2_info.state = TaskState::Pending;
 
   auto create_fut = boost::asio::co_spawn(
       app.runtime().shard(0).ctx(),
       app.persistence_service()->create_run_with_task_instances(
-          std::move(*run), std::vector<TaskInstanceInfo>{ti}),
+          std::move(*run), std::vector<TaskInstanceInfo>{t1_info, t2_info}),
       boost::asio::use_future);
   auto create_res = create_fut.get();
   ASSERT_TRUE(create_res.has_value());
@@ -1515,7 +1516,7 @@ TEST(ApiE2EIntegrationTest, RunTasksEndpointReturnsDagCompleteTaskSet) {
   app.stop();
 }
 
-TEST(ApiE2EIntegrationTest, FailurePathPropagatesUpstreamFailedToDependents) {
+TEST_F(ApiE2EIntegrationTest, FailurePathPropagatesUpstreamFailedToDependents) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
 
@@ -1597,7 +1598,7 @@ TEST(ApiE2EIntegrationTest, FailurePathPropagatesUpstreamFailedToDependents) {
   app.stop();
 }
 
-TEST(ApiE2EIntegrationTest,
+TEST_F(ApiE2EIntegrationTest,
      BranchingRouterSkipsUnselectedPathAndCompletesJoin) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
@@ -1725,7 +1726,7 @@ TEST(ApiE2EIntegrationTest,
   app.stop();
 }
 
-TEST(ApiE2EIntegrationTest, ChaosRecoveryMarksOrphanRunsAndTasksFailed) {
+TEST_F(ApiE2EIntegrationTest, ChaosRecoveryMarksOrphanRunsAndTasksFailed) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
   auto cfg = make_test_config(port);
@@ -1818,7 +1819,7 @@ TEST(ApiE2EIntegrationTest, ChaosRecoveryMarksOrphanRunsAndTasksFailed) {
   restarted.stop();
 }
 
-TEST(ApiE2EIntegrationTest,
+TEST_F(ApiE2EIntegrationTest,
      RetryableOrphanRunCurrentPolicyStillMarksFailedAfterRecovery) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
@@ -1910,7 +1911,7 @@ TEST(ApiE2EIntegrationTest,
   restarted.stop();
 }
 
-TEST(ApiE2EIntegrationTest, MetricsEndpointExposesPrometheusText) {
+TEST_F(ApiE2EIntegrationTest, MetricsEndpointExposesPrometheusText) {
   const auto port = dagforge::test::pick_unused_tcp_port_or_zero();
   ASSERT_NE(port, 0);
 

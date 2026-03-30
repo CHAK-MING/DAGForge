@@ -1,11 +1,11 @@
 #include "dagforge/config/config_watcher.hpp"
-
 #include "dagforge/core/constants.hpp"
-#include "dagforge/core/coroutine.hpp"
 #include "dagforge/core/runtime.hpp"
 #include "dagforge/util/log.hpp"
 
+
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
 #include <boost/asio/posix/stream_descriptor.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/redirect_error.hpp>
@@ -59,7 +59,7 @@ auto ConfigWatcher::start() -> Result<void> {
 
   auto wd = sys_check(inotify_add_watch(
       state->inotify_fd, state->directory.c_str(),
-      IN_CREATE | IN_CLOSE_WRITE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO));
+      IN_CLOSE_WRITE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO));
   if (!wd) {
     log::error("Failed to add watch on {}: {}", state->directory.string(),
                wd.error().message());
@@ -106,7 +106,8 @@ auto ConfigWatcher::start() -> Result<void> {
       },
       boost::asio::detached);
 
-  log::info("ConfigWatcher started for: {} (mode: async)", directory_.string());
+  log::debug("ConfigWatcher started for: {} (mode: async)",
+             directory_.string());
   return ok();
 }
 
@@ -251,13 +252,15 @@ auto ConfigWatcher::process_events(WatchState &state, const char *buf,
       auto ext = file_path.extension().string();
 
       if (ext == ".toml") {
-        if (event->mask & (IN_CREATE | IN_CLOSE_WRITE | IN_MOVED_TO)) {
-          log::info("File changed: {}", file_path.string());
+        // Ignore IN_CREATE so newly created DAG files are observed only after
+        // their contents are durable enough to parse.
+        if (event->mask & (IN_CLOSE_WRITE | IN_MOVED_TO)) {
+          log::debug("File changed: {}", file_path.string());
           if (state.on_file_changed) {
             state.on_file_changed(file_path);
           }
         } else if (event->mask & (IN_DELETE | IN_MOVED_FROM)) {
-          log::info("File removed: {}", file_path.string());
+          log::debug("File removed: {}", file_path.string());
           if (state.on_file_removed) {
             state.on_file_removed(file_path);
           }

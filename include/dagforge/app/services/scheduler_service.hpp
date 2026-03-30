@@ -1,15 +1,19 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/core/coroutine.hpp"
 #include "dagforge/core/error.hpp"
 #include "dagforge/dag/dag_manager.hpp"
 #include "dagforge/executor/executor.hpp"
 #include "dagforge/scheduler/engine.hpp"
+#endif
 
 #include <atomic>
 #include <cstdint>
+#include <chrono>
 #include <memory>
 #include <unordered_map>
+
 
 namespace dagforge {
 
@@ -50,6 +54,10 @@ public:
   auto stop() -> void;
   [[nodiscard]] auto is_running() const -> bool;
 
+  [[nodiscard]] auto queue_depth() const -> std::size_t;
+  [[nodiscard]] auto missed_schedules_total() const -> std::uint64_t;
+  [[nodiscard]] auto cron_parse_errors_total() const -> std::uint64_t;
+
   [[nodiscard]] auto engine() -> Engine &;
 
 private:
@@ -74,6 +82,7 @@ private:
   int zombie_heartbeat_timeout_sec_{75};
   std::atomic<bool> zombie_reaper_running_{false};
   std::atomic<int> zombie_reaper_inflight_{0};
+  std::atomic<std::uint64_t> cron_parse_errors_total_{0};
   std::unordered_map<DAGId, TaskId> registered_root_tasks_;
 };
 

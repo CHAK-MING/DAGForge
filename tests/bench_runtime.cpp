@@ -5,7 +5,7 @@
 #include "dagforge/core/coroutine.hpp"
 #include "dagforge/core/runtime.hpp"
 
-#include <benchmark/benchmark.h>
+#include "benchmark_compat.hpp"
 
 #include <atomic>
 #include <chrono>

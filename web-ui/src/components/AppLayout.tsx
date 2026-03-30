@@ -27,11 +27,13 @@ interface Notification {
     type: "success" | "error" | "info";
     message: string;
     time: Date;
+    read: boolean;
 }
 
 export function AppLayout({ children, title, subtitle }: AppLayoutProps) {
     const { t } = useI18n();
     const MAX_NOTIFICATIONS = 20;
+    const [notificationsOpen, setNotificationsOpen] = useState(false);
     const [notifications, setNotifications] = useState<Notification[]>([]);
 
     const handleRunCompleted = useCallback((data: WebSocketEventData) => {
@@ -43,13 +45,25 @@ export function AppLayout({ children, title, subtitle }: AppLayoutProps) {
             type: isError ? "error" : isSuccess ? "success" : "info",
             message: `DAG run ${isSuccess ? "completed" : isError ? "failed" : "finished"}`,
             time: new Date(),
+            read: notificationsOpen,
         };
         setNotifications(prev => [notif, ...prev].slice(0, MAX_NOTIFICATIONS));
-    }, []);
+    }, [notificationsOpen]);
 
     useWebSocket("dag_run_completed", handleRunCompleted);
 
-    const clearNotifications = () => setNotifications([]);
+    const unreadCount = notifications.filter((n) => !n.read).length;
+
+    const handleNotificationsOpenChange = useCallback((open: boolean) => {
+        setNotificationsOpen(open);
+        if (open) {
+            setNotifications((prev) =>
+                prev.map((notification) =>
+                    notification.read ? notification : { ...notification, read: true }
+                )
+            );
+        }
+    }, []);
 
     const notificationIcon = (type: string) => {
         switch (type) {
@@ -78,13 +92,13 @@ export function AppLayout({ children, title, subtitle }: AppLayoutProps) {
                         </div>
 
                         <div className="flex items-center gap-3">
-                            <DropdownMenu>
+                            <DropdownMenu open={notificationsOpen} onOpenChange={handleNotificationsOpenChange}>
                                 <DropdownMenuTrigger asChild>
                                     <Button variant="ghost" size="icon" className="relative h-9 w-9" aria-label={t.settings.notifications}>
                                         <Bell className="h-5 w-5" />
-                                        {notifications.length > 0 && (
+                                        {unreadCount > 0 && (
                                             <span className="absolute -top-0.5 -right-0.5 h-4 w-4 rounded-full bg-destructive text-[10px] font-medium text-destructive-foreground flex items-center justify-center">
-                                                {notifications.length > 9 ? "9+" : notifications.length}
+                                                {unreadCount > 9 ? "9+" : unreadCount}
                                             </span>
                                         )}
                                     </Button>
@@ -93,9 +107,9 @@ export function AppLayout({ children, title, subtitle }: AppLayoutProps) {
                                     <div className="flex items-center justify-between px-3 py-2">
                                         <span className="font-medium">{t.settings.notifications}</span>
                                         {notifications.length > 0 && (
-                                            <button onClick={clearNotifications} className="text-xs text-muted-foreground hover:text-foreground" aria-label={t.settings.clearAll}>
-                                                {t.settings.clearAll}
-                                            </button>
+                                            <span className="text-xs text-muted-foreground">
+                                                {notifications.length}
+                                            </span>
                                         )}
                                     </div>
                                     <DropdownMenuSeparator />

@@ -2,6 +2,23 @@
 
 All notable changes to DAGForge will be documented in this file.
 
+## [0.3.0] - 2026-03-30
+
+### Changed
+- Rebuilt the core around C++20 modules and moved the local build/release flow to build2.
+- Refreshed packaging for the new modules-first release layout.
+
+### Improved
+- Expanded observability across runtime, scheduler, API, logging, WebSocket, and benchmark surfaces.
+- Refreshed the web UI dashboard with clearer log visibility and a smoother day-to-day workflow.
+- Improved hot-path performance and fixed several correctness and edge-case bugs.
+
+### Added
+- Broader benchmark coverage and updated benchmark artifacts for the 0.3.0 baseline.
+
+### Deployment & Artifacts
+- Refreshed the prebuilt Linux x86_64 tarball with the current binary, config, and web UI bundle.
+
 ## [0.2.0] - 2026-03-18
 
 ### Changed

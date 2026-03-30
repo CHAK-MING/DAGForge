@@ -1,7 +1,5 @@
 #include "dagforge/util/daemon.hpp"
 
-#include "dagforge/core/constants.hpp"
-#include "dagforge/io/result.hpp"
 
 #include <boost/filesystem.hpp>
 #include <boost/interprocess/sync/file_lock.hpp>
@@ -11,14 +9,36 @@
 #include <cstdlib>
 #include <fstream>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+
 
 namespace dagforge {
 
 std::atomic<bool> g_shutdown_requested{false};
 
 namespace {
+[[nodiscard]] auto is_zombie_process(std::int64_t pid) -> bool {
+#ifdef __linux__
+  std::ifstream in(std::format("/proc/{}/stat", pid));
+  if (!in.is_open()) {
+    return false;
+  }
+
+  std::string line;
+  std::getline(in, line);
+  const auto close_paren = line.rfind(')');
+  if (close_paren == std::string::npos || close_paren + 2 >= line.size()) {
+    return false;
+  }
+  return line[close_paren + 2] == 'Z';
+#else
+  (void)pid;
+  return false;
+#endif
+}
+
 auto ensure_parent_directory(std::string_view path) -> Result<void> {
   boost::system::error_code ec;
   const boost::filesystem::path p{std::string(path)};
@@ -181,6 +201,9 @@ auto is_process_alive(std::int64_t pid) -> bool {
     return false;
   }
   if (::kill(static_cast<pid_t>(pid), 0) == 0) {
+    if (is_zombie_process(pid)) {
+      return false;
+    }
     return true;
   }
   return errno == EPERM;
@@ -200,6 +223,12 @@ auto wait_for_process_exit(std::int64_t pid, std::chrono::milliseconds timeout)
     -> bool {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < deadline) {
+    int status = 0;
+    const auto waited =
+        ::waitpid(static_cast<pid_t>(pid), &status, WNOHANG);
+    if (waited == static_cast<pid_t>(pid)) {
+      return true;
+    }
     if (!is_process_alive(pid)) {
       return true;
     }

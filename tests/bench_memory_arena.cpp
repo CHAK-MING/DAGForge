@@ -3,7 +3,7 @@
 #include "dagforge/core/arena.hpp"
 #include "dagforge/core/memory.hpp"
 
-#include <benchmark/benchmark.h>
+#include "benchmark_compat.hpp"
 #include <glaze/json.hpp>
 
 #include <cstddef>

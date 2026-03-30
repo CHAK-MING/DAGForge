@@ -1,10 +1,9 @@
 #include "dagforge/app/config_builder.hpp"
-
-#include "dagforge/dag/dag.hpp"
 #include "dagforge/dag/dag_manager.hpp"
 
 #include <string>
 #include <variant>
+
 
 namespace dagforge {
 

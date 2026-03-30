@@ -1,14 +1,14 @@
 #include "dagforge/cli/commands.hpp"
+#include "dagforge/cli/context.hpp"
 #include "dagforge/cli/formatting.hpp"
-#include "dagforge/config/config.hpp"
-#include "dagforge/config/dag_file_loader.hpp"
-#include "dagforge/dag/dag.hpp"
+#include "dagforge/config/dag_info_loader.hpp"
 #include "dagforge/util/json.hpp"
 #include "dagforge/util/log.hpp"
 
 #include <filesystem>
 #include <print>
 #include <vector>
+
 
 namespace dagforge::cli {
 
@@ -30,29 +30,28 @@ auto validate_single_file(const std::filesystem::path &path)
                       .error = {}};
 
   std::string diagnostic;
-  auto res =
-      DAGDefinitionLoader::load_from_file(path.string(), &diagnostic)
-          .and_then([&](const auto &def) -> Result<void> {
-            if (def.tasks.empty()) {
-              return fail(Error::InvalidArgument);
-            }
+  auto res = DAGInfoLoader::load_from_file(path.string(), &diagnostic)
+                 .and_then([&](const auto &def) -> Result<void> {
+                   if (def.tasks.empty()) {
+                     return fail(Error::InvalidArgument);
+                   }
 
-            DAG dag;
-            for (const auto &task : def.tasks) {
-              [[maybe_unused]] auto idx =
-                  dag.add_node(task.task_id, task.trigger_rule);
-            }
+                   DAG dag;
+                   for (const auto &task : def.tasks) {
+                     [[maybe_unused]] auto idx =
+                         dag.add_node(task.task_id, task.trigger_rule);
+                   }
 
-            for (const auto &task : def.tasks) {
-              for (const auto &dep : task.dependencies) {
-                if (auto r = dag.add_edge(dep.task_id, task.task_id); !r) {
-                  return fail(r.error());
-                }
-              }
-            }
+    for (const auto &task : def.tasks) {
+      for (const auto &dep : task.dependencies) {
+        if (auto r = dag.add_edge(dep.task_id, task.task_id); !r) {
+          return fail(r.error());
+        }
+      }
+    }
 
-            return dag.is_valid();
-          });
+                   return dag.is_valid();
+                 });
 
   vr.valid = res.has_value();
   if (!vr.valid) {
@@ -70,9 +69,8 @@ auto cmd_validate(const ValidateOptions &opts) -> int {
   if (opts.file.has_value()) {
     results.emplace_back(validate_single_file(*opts.file));
   } else {
-    auto config_res = ConfigLoader::load_from_file(opts.config_file);
+    auto config_res = load_config_or_print(opts.config_file);
     if (!config_res) {
-      std::println(stderr, "Error: {}", config_res.error().message());
       return 1;
     }
 

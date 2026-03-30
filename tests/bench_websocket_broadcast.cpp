@@ -3,7 +3,7 @@
 #include "dagforge/app/http/websocket.hpp"
 #include "dagforge/core/runtime.hpp"
 
-#include <benchmark/benchmark.h>
+#include "benchmark_compat.hpp"
 
 #include <atomic>
 #include <cstdint>

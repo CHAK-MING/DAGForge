@@ -1,250 +1,142 @@
-> [!NOTE]
-> **DAGForge is in Active Development.**
-> DAGForge is a high-performance single-node DAG engine built with modern C++23.
-> It focuses on low-latency scheduling for small to medium pipelines.
+# DAGForge
 
 <div align="center">
 
-# DAGForge
+**High-performance, low-latency DAG orchestration engine built with modern C++23.**
+
+[![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg?style=flat-square&logo=c%2B%2B)](https://en.cppreference.com/w/cpp/23)
+[![License](https://img.shields.io/badge/license-Apache--2.0-white?labelColor=black&style=flat-square)](LICENSE)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/CHAK-MING/DAGForge)
+[![Release](https://img.shields.io/github/v/release/CHAK-MING/dagforge?include_prereleases&style=flat-square)](https://github.com/CHAK-MING/dagforge/releases)
+
+[English](README.md) | [简体中文](README_CN.md)
+
+---
 
 [![DAGForge Web UI](./image/web-ui.png)](#)
 
 </div>
 
-> DAGForge uses a Seastar-inspired sharded async runtime where each CPU core has its own `io_context` (Boost.Asio) and memory resource.
->
-> DAGForge provides a fast DAG engine with TOML-based definitions, async persistence, and a modern React 19 dashboard for efficient workflow orchestration.
+---
 
-<div align="center">
+## ⚡ What is DAGForge?
 
-[![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg?style=flat-square&logo=c%2B%2B)](https://en.cppreference.com/w/cpp/23)
-[![License](https://img.shields.io/badge/license-Apache--2.0-white?labelColor=black&style=flat-square)](LICENSE)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/CHAK-MING/DAGForge)
+**DAGForge** is a sharded, asynchronous workflow engine designed for high-throughput, low-latency task scheduling. Inspired by the **Seastar** architectural model and built on **C++23 coroutines**, it aims to minimize lock contention and maximize core utilization for modern multi-core systems.
 
-[English](README.md) | [简体中文](README_CN.md)
-
-</div>
+Whether you're managing complex data pipelines, orchestrating microservices, or building automated CI/CD workflows, DAGForge provides the speed and reliability needed for high-frequency operations.
 
 ---
 
 ## ✨ Key Features
 
-- **Sharded Runtime:** Core-local `io_context` via Boost.Asio to minimize lock contention.
-- **DAG Engine:** TOML-based DAGs supporting dependencies, trigger rules, branching, and sensors.
-- **Executors:** Native support for Shell, Docker, and Sensor execution modes.
-- **XCom:** Cross-task communication mechanism using template variables (e.g., `{{ds}}`, `{{xcom.task.key}}`).
-- **HTTP API + WebSocket:** Built-in REST endpoints, metrics, and real-time event/log streaming.
-- **Web UI:** Real-time visualization and management powered by React 19, Tailwind CSS, and React Flow.
+- **🚀 Sharded Async Runtime:** Inspired by **Seastar**, utilizing core-local `io_context` (Boost.Asio) to eliminate cross-core lock contention and maximize multi-core throughput.
+- **🛠️ Declarative Pipelines:** Express complex logic via clean **TOML** definitions with native support for task dependencies, conditional branching, and polling sensors.
+- **🔌 Pluggable Executors:** Orchestrate diverse workloads with first-class support for **Shell**, **Docker**, and **Sensor** execution modes in isolated environments.
+- **📡 Interactive Control Plane:** A high-fidelity **React 19** dashboard powered by **React Flow** for dynamic DAG exploration and **WebSockets** for sub-second, live log telemetry.
+- **🔄 Seamless Data Exchange:** Robust **XCom** mechanism for task-to-task communication with flexible template variable support (e.g., `{{xcom.task.key}}`).
+- **📊 Cloud-Native Observability:** Native **Prometheus** metrics, rich REST APIs, and structured JSON logging designed for seamless integration with modern monitoring stacks.
+
+---
 
 ## 📈 Performance Snapshot
 
-| Scenario | Topology | DAG Runs | Tasks / DAG | Total Tasks | Total Scheduling Lag | Avg Scheduling Lag / Task | Max Scheduling Lag | Throughput |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `scene1_linear_100x10` | 10 linear chains | 100 | 10 | 1000 | 1437.0 ms | 1.437 ms | 26.0 ms | 1179.7 tasks/s |
-| `scene2_linear_10x100` | 100 linear chains | 10 | 100 | 1000 | 108.0 ms | 0.108 ms | 5.0 ms | 2242.5 tasks/s |
-| `scene3_tree_100x10` | tree DAG | 100 | 10 | 1000 | 1889.0 ms | 1.889 ms | 25.0 ms | 1804.8 tasks/s |
-| `scene7_diamond_100x10` | diamond DAG | 100 | 10 | 1000 | 1748.0 ms | 1.748 ms | 19.0 ms | 1920.8 tasks/s |
-| `scene8_fanout_100x10` | fan-out DAG | 100 | 10 | 1000 | 2163.0 ms | 2.163 ms | 25.0 ms | 1897.2 tasks/s |
-| `scene9_fanin_100x10` | fan-in DAG | 100 | 10 | 1000 | 10958.0 ms | 10.958 ms | 23.0 ms | 1870.1 tasks/s |
-| `scene10_mesh_100x10` | mesh DAG | 100 | 10 | 1000 | 4195.0 ms | 4.195 ms | 24.0 ms | 2011.9 tasks/s |
+DAGForge is built for speed. In the latest NUMA-local 5-run benchmark sweep, it keeps p95 scheduling lag in the low single-digit milliseconds while sustaining throughput around 7,200 tasks/s in burst-ready workloads.
 
-### Test Environment
+| Scenario | Topology | Total Tasks | Mean Total Lag | p95 Lag | Throughput | vs Airflow 2.0 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `scene1_linear` | 100 DAGs × 10 linear tasks | 1,000 | 0.660 s | 5.40 ms | **4,872 tasks/s** | **~17.6x faster** |
+| `scene2_linear` | 10 DAGs × 100 linear tasks | 1,000 | 0.231 s | 1.00 ms | **6,933 tasks/s** | **~62.0x faster** |
+| `scene6_burst` | 1 DAG × 1,001 burst-ready tasks | 1,001 | 1.608 s | 1.60 ms | **7,215 tasks/s** | **N/A** |
 
-- CPU: 32 logical CPUs, 2 sockets, 16 cores/socket
-- CPU model: Intel Xeon Gold 5218 @ 2.30GHz
-- Kernel: Linux 6.17.0-19-generic
-- Scheduler shards: `1`
-- Runtime shards: `4`
-- CPU affinity: `pin_shards_to_cores = false`
-- Database: `MariaDB 11.8.3`
-- Database pool size: `16`
-- API port: `8888`
+> For the complete benchmark results, see the full report: [Benchmark Report](docs/BENCH_REPORT.md).
+
+> [!TIP]
+> **Check out the [Benchmark Report](docs/BENCH_REPORT.md)** for a detailed analysis and comparison with other workflow engines.
+
+---
+
+## 🚀 Quickstart
+
+### 1) Prerequisites
+- **Linux** (x86-64 or ARM64)
+- **MySQL 8.0+** or **MariaDB 11+**
+- **build2 0.17+** (Mandatory for building from source)
+
+### 2) Download & Run
+The fastest way to get started is by using our **[Release Package](https://github.com/CHAK-MING/dagforge/releases)**.
+
+```bash
+# 1. Download & Extract
+curl -LO https://github.com/CHAK-MING/dagforge/releases/download/0.3.0/dagforge-0.3.0-linux-x86_64.tar.gz
+tar -xzf dagforge-0.3.0-linux-x86_64.tar.gz && cd dagforge-0.3.0
+
+# 2. Init DB (ensure MySQL is running)
+./bin/dagforge db init
+
+# 3. Start the service
+./bin/dagforge serve start --shards 4
+```
+
+Visit **[http://localhost:8888](http://localhost:8888)** to view your dashboard.
+
+### 3) Alternative: Build From Source (build2)
+```bash
+# Initialize build configuration
+bdep init -C build @gcc cc config.cxx=g++
+# Build and update
+bdep update @gcc
+# Start the service
+./bin/dagforge serve start -c system_config.toml
+```
+
+### 4) Alternative: Docker Compose
+```bash
+docker compose up -d
+```
+
+---
 
 ## 📚 Documentation
 
-### Getting Started
-- **[Quickstart Guide](docs/USER_GUIDE.md#1-first-time-setup)** - Get started quickly.
-- **[Detailed User Guide](docs/USER_GUIDE.md)** - In-depth usage, patterns, and troubleshooting.
-- **[Configuration Guide](docs/USER_GUIDE.md#2-running-the-service)** - Settings and customization for the runtime.
+Detailed guides and references are available in the **[`docs/`](docs/)** directory:
 
-### Core Features
-- **[Trigger Rules](docs/USER_GUIDE.md#5-trigger-rules--when-to-use-each)** - Control when tasks become eligible to run.
-- **[XCom Examples](docs/USER_GUIDE.md#6-xcom--complete-examples)** - Share data between tasks via MySQL `xcom_values`.
-- **[Sensor Tasks](docs/USER_GUIDE.md#7-sensor-tasks)** - Block and poll on external conditions.
-- **[Docker Tasks](docs/USER_GUIDE.md#8-docker-tasks)** - Run tasks inside isolated Docker containers.
-- **[Branching DAGs](docs/USER_GUIDE.md#10-branching-dags)** - Conditional logic paths within pipelines.
-- **[Benchmark Report](docs/BENCH_REPORT.md)** - Aggregated stability and throughput report.
-
-### Integration
-- **[API Reference](docs/API.md)** - HTTP REST and WebSocket API endpoints.
-- **[Docker Deployment](docs/USER_GUIDE.md#8-docker-tasks)** - `docker-compose` orchestration.
-
-### Troubleshooting
-- **[Troubleshooting Guide](docs/USER_GUIDE.md#16-troubleshooting)** - Common issues and solutions.
+- **[Getting Started Guide](docs/USER_GUIDE.md#1-first-time-setup)** - Step-by-step setup and configuration.
+- **[Core Features Guide](docs/USER_GUIDE.md#5-trigger-rules--when-to-use-each)** - Trigger rules, XCom, Sensors, and Docker tasks.
+- **[API Reference](docs/API.md)** - Explore our REST and WebSocket endpoints.
+- **[CLI Cheatsheet](docs/USER_GUIDE.md#16-cli-cheatsheet)** - Master the `dagforge` command-line tool.
 
 ---
 
-## 🚀 Quickstart (Minimal)
+## 🗺️ Roadmap
 
-### 1) Download Release Package (Recommended)
-
-```bash
-# Download from GitHub Releases (replace version as needed)
-curl -LO https://github.com/CHAK-MING/dagforge/releases/download/0.2.0/dagforge-0.2.0-linux-x86_64.tar.gz
-tar -xzf dagforge-0.2.0-linux-x86_64.tar.gz
-cd dagforge-0.2.0-linux-x86_64
-```
-
-Binary: `./bin/dagforge`
-
-### 2) Prepare MySQL
-
-```sql
--- Run as MySQL root
-CREATE DATABASE dagforge CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER 'dagforge'@'%' IDENTIFIED BY 'dagforge';
-GRANT ALL PRIVILEGES ON dagforge.* TO 'dagforge'@'%';
-FLUSH PRIVILEGES;
-```
-
-### 3) Configure
-
-```bash
-cp system_config.toml my_config.local.toml
-export DAGFORGE_CONFIG=my_config.local.toml
-```
-
-Edit at least the `[database]` section before starting. The sample config also exposes:
-
-- `database.connect_timeout`
-- `scheduler.log_file` / `scheduler.pid_file`
-- `scheduler.zombie_reaper_interval_sec`
-- `scheduler.zombie_heartbeat_timeout_sec`
-- `scheduler.pin_shards_to_cores`, `scheduler.cpu_affinity_offset`
-- `api.tls_enabled`, `api.tls_cert_file`, `api.tls_key_file`
-- `dag_source.mode = "File" | "Api" | "Hybrid"`
-
-### 4) Init DB + Validate DAGs
-
-```bash
-dagforge db init
-dagforge validate
-```
-
-### 5) Start Service (Release Package)
-
-```bash
-dagforge serve start
-
-# Optional overrides
-dagforge serve start --log-level debug --shards 4
-# Daemon mode
-dagforge serve start --daemon --log-file dagforge.log
-```
-
-Note:
-- `--daemon` requires a log file destination. Pass `--log-file` or set `scheduler.log_file` in the config first.
-
-API/UI: `http://127.0.0.1:8888`
-
-Prometheus metrics: `http://127.0.0.1:8888/metrics`
-
-### 6) Trigger and Inspect
-
-```bash
-dagforge trigger hello_world --wait
-dagforge inspect hello_world --latest
-dagforge logs hello_world --latest
-```
-
-### 7) Alternative: Build From Source
-
-```bash
-cmake --preset default
-cmake --build --preset default
-./build/bin/dagforge serve start -c system_config.toml
-```
-
-### 8) Alternative: Docker Compose
-
-```bash
-docker compose up -d
-docker compose logs -f dagforge
-```
-
----
-
-## 💻 CLI Cheatsheet
-
-```bash
-# Service
-dagforge serve start  [-c file] [--pid-file path] [--daemon/-d] [--log-file path] [--no-api] [--log-level trace|debug|info|warn|error] [--shards N]
-dagforge serve status [-c file] [--pid-file path] [--json]
-dagforge serve stop   [-c file] [--pid-file path] [--timeout N] [--force]
-
-# Trigger & Test
-dagforge trigger <dag_id> [--wait] [-e execution_date] [--no-api] [--json]
-dagforge test <dag_id> <task_id> [--json]
-
-# Listing
-dagforge list dags  [--include-stale] [--limit N] [--json]
-dagforge list runs  [dag_id] [--state failed|success|running] [--limit N] [--json]
-dagforge list tasks [dag_id] [--json]
-
-# Inspection and Logs
-dagforge inspect <dag_id> [--run id|--latest] [--xcom] [--details] [--json]
-dagforge logs <dag_id> [--run id|--latest] [--task task_id] [--attempt N] [-f|--follow] [--short-time] [--json]
-
-# DAG Control
-dagforge pause <dag_id> [--json]
-dagforge unpause <dag_id> [--json]
-dagforge clear <dag_id> --run <run_id> [--task id|--failed|--all] [--downstream] [--json]
-
-# Database
-dagforge db init
-dagforge db migrate
-dagforge db prune-stale [--dry-run]
-
-# Validate
-dagforge validate [-c file | -f dag.toml] [--json]
-```
-
-`-c/--config` is required unless `DAGFORGE_CONFIG` is set.
-
-Notes:
-- `dagforge serve start --daemon` requires `--log-file` or `scheduler.log_file` in config.
-
----
-
-## 🗺️ Official Roadmap
-
-See what's coming next for DAGForge:
-
-1. **Enhance API Security:** Implement authentication and authorization mechanisms.
-2. **PostgreSQL Support:** Add support for PostgreSQL alongside MySQL.
-3. **Configuration Optimization:** Support more efficient one-click deployments.
-4. **Additional executor support:** Add more types of executors, such as a native Kubernetes (k8s) executor, to enable large-scale horizontal scalability.
-5. **Observability Integration:** Deep integration with OpenTelemetry and improved metrics.
-6. **Performance Optimization:** Ongoing work on the C++23 coroutine runtime to further drop latencies.
+- [x] **OpenTelemetry:** Deep tracing and observability integration.
+- [ ] **API Security:** Role-based access control (RBAC) and authentication.
+- [ ] **PostgreSQL Support:** Native support for Postgres as a backend store.
+- [ ] **Kubernetes Executor:** Scalable task execution in K8s clusters.
+- [ ] **Coroutine Optimization:** Further latency reductions in the C++23 runtime.
 
 ---
 
 ## 🤝 Contributing
 
-We welcome contributions! DAGForge is fully open source (Apache 2.0), and we encourage the community to:
+We love contributions! Whether it's a bug report, a feature request, or a documentation fix, we value your input.
 
-- Report bugs and suggest features.
-- Improve documentation.
-- Submit code improvements and optimization PRs.
-- Create new Executors and Sensors.
+1. Fork the repo.
+2. Create your feature branch (`git checkout -b feature/amazing-feature`).
+3. Commit your changes (`git commit -m 'Add amazing feature'`).
+4. Push to the branch (`git push origin feature/amazing-feature`).
+5. Open a Pull Request.
 
-Check our **[Official Roadmap](#-official-roadmap)** for planned features and priorities.
+Check out our **[Official Roadmap](#-roadmap)** for high-priority items.
 
-## 📎 Resources
+---
 
-- **[Changelog](CHANGELOG.md)** - See recent notable updates.
-- **[GitHub Issues](https://github.com/CHAK-MING/dagforge/issues)** - Report bugs or request features.
+## 📄 License
 
-## 📄 Legal
+Distributed under the **Apache License 2.0**. See `LICENSE` for more information.
 
-- **License:** [Apache License 2.0](LICENSE)
+---
+
+<div align="center">
+  Built with ❤️ by the DAGForge Team
+</div>

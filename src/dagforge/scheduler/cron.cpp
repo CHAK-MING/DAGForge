@@ -4,9 +4,14 @@
 #include <array>
 #include <bitset>
 #include <boost/algorithm/string/predicate.hpp>
-#include <boost/algorithm/string/trim.hpp>
+#include <chrono>
+#include <cstddef>
+#include <generator>
+#include <optional>
 #include <ranges>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace dagforge {
@@ -27,6 +32,15 @@ constexpr std::array<std::string_view, 12> kMonthNames{
 
 constexpr std::array<std::string_view, 7> kDowNames{"sun", "mon", "tue", "wed",
                                                     "thu", "fri", "sat"};
+
+[[nodiscard]] auto trim_ascii(std::string_view value) -> std::string_view {
+  const auto first = value.find_first_not_of(" \t\n\r\f\v");
+  if (first == std::string_view::npos) {
+    return {};
+  }
+  const auto last = value.find_last_not_of(" \t\n\r\f\v");
+  return value.substr(first, last - first + 1);
+}
 
 auto parse_name(std::string_view s,
                 const std::array<std::string_view, 12> &names12,
@@ -74,7 +88,7 @@ auto parse_field(std::string_view field, std::bitset<N> &bs, int min_val,
 
   std::vector<std::string> parts;
   for (auto chunk : std::string_view(field) | std::views::split(',')) {
-    parts.emplace_back(boost::trim_copy(std::string_view(chunk)));
+    parts.emplace_back(trim_ascii(std::string_view(chunk)));
   }
   for (auto &part : parts) {
     if (part.empty())
@@ -97,10 +111,8 @@ auto parse_field(std::string_view field, std::bitset<N> &bs, int min_val,
       if (step == 1)
         is_restricted = false;
     } else if (auto dash = part.find('-'); dash != std::string::npos) {
-      auto left = part.substr(0, dash);
-      auto right = part.substr(dash + 1);
-      left = boost::trim_copy(left);
-      right = boost::trim_copy(right);
+      auto left = trim_ascii(part.substr(0, dash));
+      auto right = trim_ascii(part.substr(dash + 1));
       auto a = parse_value(left);
       auto b = parse_value(right);
       if (!a || !b)
@@ -167,7 +179,7 @@ CronExpr::CronExpr(std::string raw, Fields fields)
     : raw_(std::move(raw)), fields_(fields) {}
 
 auto CronExpr::parse(std::string_view expr) -> Result<CronExpr> {
-  std::string trimmed(boost::trim_copy(expr));
+  std::string trimmed(trim_ascii(expr));
   if (trimmed.empty())
     return fail(Error::InvalidArgument);
 
@@ -252,63 +264,83 @@ auto CronExpr::next_after(std::chrono::system_clock::time_point after) const
       continue;
     }
 
-    ymd = year_month_day{day_tp};
-    const int dim =
-        days_in_month(static_cast<int>(ymd.year()),
-                      static_cast<int>(static_cast<unsigned>(ymd.month())));
-    if (static_cast<int>(static_cast<unsigned>(ymd.day())) > dim) {
+    const int y = static_cast<int>(ymd.year());
+    const int m = static_cast<int>(static_cast<unsigned>(ymd.month()));
+    const int last_dom = days_in_month(y, m);
+    const int current_dom = static_cast<int>(static_cast<unsigned>(ymd.day()));
+    if (current_dom > last_dom) {
       candidate = day_tp + days{1};
       continue;
     }
 
-    const int dow = static_cast<int>(weekday{day_tp}.c_encoding());
-    if (!day_ok(ymd, dow)) {
+    const auto weekday_index =
+        static_cast<int>(std::chrono::weekday{day_tp}.c_encoding());
+    if (!day_ok(ymd, weekday_index)) {
       candidate = day_tp + days{1};
       continue;
     }
 
-    const auto min_of_day = duration_cast<minutes>(candidate - day_tp).count();
-    int cur_hour = static_cast<int>(min_of_day / 60);
-    int cur_min = static_cast<int>(min_of_day % 60);
+    const auto tod = candidate - day_tp;
+    const int current_hour =
+        static_cast<int>(duration_cast<hours>(tod).count());
+    const int current_minute =
+        static_cast<int>(duration_cast<minutes>(tod - hours{current_hour})
+                             .count());
 
-    if (auto h = next_set(fields_.hour, cur_hour, 23)) {
-      cur_hour = *h;
-      const int minute_start =
-          (cur_hour == static_cast<int>(min_of_day / 60)) ? cur_min : 0;
-      if (auto m = next_set(fields_.minute, minute_start, 59)) {
-        return day_tp + hours{cur_hour} + minutes{*m};
-      }
-
-      if (auto next_h = next_set(fields_.hour, cur_hour + 1, 23)) {
-        return day_tp + hours{*next_h} +
-               minutes{first_set(fields_.minute, 0, 59)};
-      }
+    auto hour = next_set(fields_.hour, current_hour, 23);
+    if (!hour) {
+      candidate = day_tp + days{1};
+      continue;
     }
 
-    candidate = day_tp + days{1};
+    if (*hour != current_hour) {
+      candidate = day_tp + hours{*hour} +
+                  minutes{first_set(fields_.minute, 0, 59)};
+      continue;
+    }
+
+    auto minute = next_set(fields_.minute, current_minute, 59);
+    if (!minute) {
+      if (current_hour >= 23) {
+        candidate = day_tp + days{1};
+        continue;
+      }
+      auto next_hour = next_set(fields_.hour, current_hour + 1, 23);
+      if (!next_hour) {
+        candidate = day_tp + days{1};
+        continue;
+      }
+      candidate = day_tp + hours{*next_hour} +
+                  minutes{first_set(fields_.minute, 0, 59)};
+      continue;
+    }
+
+    return day_tp + hours{*hour} + minutes{*minute};
   }
 
-  return std::chrono::system_clock::time_point::max();
+  return candidate;
+}
+
+auto CronExpr::upcoming_runs(std::chrono::system_clock::time_point start) const
+    -> std::generator<std::chrono::system_clock::time_point> {
+  auto next = next_after(start - std::chrono::minutes{1});
+  for (;;) {
+    co_yield next;
+    next = next_after(next);
+  }
 }
 
 auto CronExpr::all_between(std::chrono::system_clock::time_point start,
                            std::chrono::system_clock::time_point end,
-                           size_t max_count) const
+                           std::size_t max_count) const
     -> std::vector<std::chrono::system_clock::time_point> {
-  std::vector<std::chrono::system_clock::time_point> result;
-  result.reserve(std::min(max_count, size_t{64}));
-
-  auto current = start - std::chrono::minutes(1);
-  while (result.size() < max_count) {
+  std::vector<std::chrono::system_clock::time_point> out;
+  auto current = next_after(start - std::chrono::minutes{1});
+  while (current < end && out.size() < max_count) {
+    out.push_back(current);
     current = next_after(current);
-    if (current >= end ||
-        current == std::chrono::system_clock::time_point::max()) {
-      break;
-    }
-    result.emplace_back(current);
   }
-
-  return result;
+  return out;
 }
 
 } // namespace dagforge

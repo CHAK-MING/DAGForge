@@ -1,11 +1,12 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/config/task_config.hpp"
-#include "dagforge/core/error.hpp"
 #include "dagforge/dag/dag.hpp"
-#include "dagforge/dag/dag_domain.hpp"
 #include "dagforge/executor/executor.hpp"
+#include "dagforge/storage/dag_state_adapter.hpp"
 #include "dagforge/util/id.hpp"
+#endif
 
 #include <ankerl/unordered_dense.h>
 
@@ -17,6 +18,7 @@
 #include <string>
 #include <vector>
 
+
 namespace dagforge {
 
 class PersistenceService;
@@ -24,7 +26,7 @@ class Runtime;
 
 struct DAGInfo {
   int64_t dag_rowid{0};
-  DAGId dag_id;
+  DAGId dag_id{};
   int version{1};
   std::string name;
   std::string description;
@@ -32,49 +34,31 @@ struct DAGInfo {
   std::string cron;
   std::string timezone{"UTC"};
   int max_concurrent_runs{1};
-  std::optional<std::chrono::system_clock::time_point> start_date;
-  std::optional<std::chrono::system_clock::time_point> end_date;
+  std::optional<std::chrono::system_clock::time_point> start_date{};
+  std::optional<std::chrono::system_clock::time_point> end_date{};
   bool catchup{false};
   bool is_paused{false};
   int retention_days{30};
-  std::chrono::system_clock::time_point created_at;
-  std::chrono::system_clock::time_point updated_at;
-  std::vector<TaskConfig> tasks;
-  ankerl::unordered_dense::map<TaskId, std::size_t> task_index;
-  std::shared_ptr<const DAG> compiled_graph;
-  std::shared_ptr<const std::vector<ExecutorConfig>> compiled_executor_configs;
-  std::shared_ptr<const std::vector<TaskConfig>> compiled_indexed_task_configs;
+  std::chrono::system_clock::time_point created_at{};
+  std::chrono::system_clock::time_point updated_at{};
+  std::vector<TaskConfig> tasks{};
+  ankerl::unordered_dense::map<TaskId, std::size_t> task_index{};
+  std::shared_ptr<const DAG> compiled_graph{};
+  std::shared_ptr<const std::vector<ExecutorConfig>> compiled_executor_configs{};
+  std::shared_ptr<const std::vector<TaskConfig::Compiled>>
+      compiled_indexed_task_configs{};
 
-  auto rebuild_task_index() -> void {
-    task_index.clear();
-    for (auto [i, task] : tasks | std::views::enumerate) {
-      task_index.emplace(task.task_id, static_cast<std::size_t>(i));
-    }
-  }
+  auto rebuild_task_index() -> void;
 
   [[nodiscard]] auto prepare_runtime_artifacts() -> Result<void>;
 
   [[nodiscard]] auto compute_reverse_adj() const
-      -> ankerl::unordered_dense::map<TaskId, std::vector<TaskId>> {
-    ankerl::unordered_dense::map<TaskId, std::vector<TaskId>> result;
-    for (const auto &task : tasks) {
-      for (const auto &dep : task.dependencies) {
-        result[dep.task_id].push_back(task.task_id);
-      }
-    }
-    return result;
-  }
+      -> ankerl::unordered_dense::map<TaskId, std::vector<TaskId>>;
 
-  [[nodiscard]] auto find_task(const TaskId &task_id) -> TaskConfig * {
-    auto it = task_index.find(task_id);
-    return it != task_index.end() ? &tasks[it->second] : nullptr;
-  }
+  [[nodiscard]] auto find_task(const TaskId &task_id) -> TaskConfig *;
 
   [[nodiscard]] auto find_task(const TaskId &task_id) const
-      -> const TaskConfig * {
-    auto it = task_index.find(task_id);
-    return it != task_index.end() ? &tasks[it->second] : nullptr;
-  }
+      -> const TaskConfig *;
 };
 
 class DAGManager {
@@ -101,6 +85,7 @@ public:
   [[nodiscard]] auto get_dag(const DAGId &dag_id) const -> Result<DAGInfo>;
   [[nodiscard]] auto list_dags() const -> std::vector<DAGInfo>;
   [[nodiscard]] auto delete_dag(const DAGId &dag_id) -> Result<void>;
+  [[nodiscard]] auto replace_all(std::vector<DAGInfo> dags) -> Result<void>;
   auto clear_all() -> void;
 
   // Task CRUD within DAG
@@ -186,9 +171,9 @@ private:
   [[nodiscard]] auto mutable_dag_in(State &state, const DAGId &dag_id)
       -> DAGInfo *;
   [[nodiscard]] auto persistence_available() const noexcept -> bool;
-  [[nodiscard]] auto persist_dag_definition(DAGId dag_id, DAGInfo dag,
-                                            bool existed_pre,
-                                            std::string_view action)
+  [[nodiscard]] auto persist_dag_info(DAGId dag_id, DAGInfo dag,
+                                      bool existed_pre,
+                                      std::string_view action)
       -> Result<DAGInfo>;
   [[nodiscard]] auto persist_dag_delete(const DAGId &dag_id) -> Result<void>;
   [[nodiscard]] auto persist_task_if_needed(const DAGId &dag_id,

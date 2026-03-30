@@ -1,11 +1,12 @@
 #include "dagforge/client/http/http_parser.hpp"
-
 #include "dagforge/util/log.hpp"
+
 
 #include <boost/asio/buffer.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/url/parse.hpp>
 #include <iterator>
+
 
 namespace dagforge::http {
 
@@ -49,11 +50,9 @@ auto to_request(
       std::distance(msg.base().begin(), msg.base().end())));
 
   std::string target(msg.target());
-  if (auto parsed = boost::urls::parse_origin_form(target); parsed) {
-    out.path = std::string(parsed->encoded_path());
-    if (auto query = parsed->encoded_query(); !query.empty()) {
-      out.query_string.assign(query.data(), query.size());
-    }
+  if (const auto query_pos = target.find('?'); query_pos != std::string::npos) {
+    out.path = target.substr(0, query_pos);
+    out.query_string = target.substr(query_pos + 1);
   } else {
     out.path = std::move(target);
   }

@@ -1,19 +1,12 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/core/coroutine.hpp"
+#endif
 
 #include <boost/asio/io_context.hpp>
 
 #include <chrono>
+#include <utility>
 
-namespace dagforge::io {
-
-/// IoContext is directly boost::asio::io_context — no wrapper overhead.
-using IoContext = boost::asio::io_context;
-
-template <typename Rep, typename Period>
-[[nodiscard]] auto async_sleep(IoContext &ctx,
-                               std::chrono::duration<Rep, Period> duration)
-    -> spawn_task;
-
-} // namespace dagforge::io
+#include "dagforge/core/detail/io_context.inc"

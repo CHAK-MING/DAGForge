@@ -5,6 +5,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <thread>
 #include <unistd.h>
 
@@ -107,9 +108,11 @@ TEST_F(ConfigWatcherTest, DestructorStopsWatcher) {
 TEST_F(ConfigWatcherTest, DetectsNewTomlFile) {
   std::atomic<int> change_count{0};
   fs::path changed_file;
+  std::mutex changed_file_mutex;
 
   ConfigWatcher watcher(runtime_, test_dir_.string());
   watcher.set_on_file_changed([&](const fs::path &path) {
+    std::lock_guard lock(changed_file_mutex);
     changed_file = path;
     change_count.fetch_add(1);
   });
@@ -120,9 +123,10 @@ TEST_F(ConfigWatcherTest, DetectsNewTomlFile) {
   auto file = create_toml_file("new_dag.toml");
 
   ASSERT_TRUE(wait_for(change_count, 1));
-  EXPECT_EQ(changed_file.filename(), "new_dag.toml");
-
   watcher.stop();
+
+  std::lock_guard lock(changed_file_mutex);
+  EXPECT_EQ(changed_file.filename(), "new_dag.toml");
 }
 
 TEST_F(ConfigWatcherTest, DetectsModifiedTomlFile) {
@@ -149,9 +153,11 @@ TEST_F(ConfigWatcherTest, DetectsDeletedTomlFile) {
 
   std::atomic<int> remove_count{0};
   fs::path removed_file;
+  std::mutex removed_file_mutex;
 
   ConfigWatcher watcher(runtime_, test_dir_.string());
   watcher.set_on_file_removed([&](const fs::path &path) {
+    std::lock_guard lock(removed_file_mutex);
     removed_file = path;
     remove_count.fetch_add(1);
   });
@@ -162,9 +168,10 @@ TEST_F(ConfigWatcherTest, DetectsDeletedTomlFile) {
   fs::remove(file);
 
   ASSERT_TRUE(wait_for(remove_count, 1));
-  EXPECT_EQ(removed_file.filename(), "to_delete.toml");
-
   watcher.stop();
+
+  std::lock_guard lock(removed_file_mutex);
+  EXPECT_EQ(removed_file.filename(), "to_delete.toml");
 }
 
 TEST_F(ConfigWatcherTest, IgnoresNonTomlFiles) {

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "dagforge/core/error.hpp"
+
 #include "dagforge/util/log.hpp"
 
 #include <glaze/toml.hpp>
@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+
 
 namespace dagforge::toml_util {
 

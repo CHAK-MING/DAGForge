@@ -1,12 +1,16 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <string_view>
+#include <type_traits>
+#endif
 
 namespace dagforge::util {
 
-// MurmurHash3 32-bit finalizer - byte-level mixing for pointer-like values
 [[nodiscard]] inline constexpr auto murmur3_mix32(std::uint32_t h) noexcept
     -> std::uint32_t {
   h ^= h >> 16;
@@ -17,7 +21,6 @@ namespace dagforge::util {
   return h;
 }
 
-// MurmurHash3 64-bit finalizer
 [[nodiscard]] inline constexpr auto murmur3_mix64(std::uint64_t h) noexcept
     -> std::uint64_t {
   h ^= h >> 33;
@@ -28,39 +31,57 @@ namespace dagforge::util {
   return h;
 }
 
-// Hash pointer-sized values with proper mixing
 template <typename T>
 [[nodiscard]] inline auto hash_value(T value) noexcept -> std::size_t {
-  if constexpr (sizeof(T) <= 4) {
-    return murmur3_mix32(
-        static_cast<std::uint32_t>(std::bit_cast<std::uintptr_t>(value)));
+  std::uintptr_t raw = 0;
+  if constexpr (std::is_pointer_v<T>) {
+    raw = reinterpret_cast<std::uintptr_t>(value);
   } else {
-    return murmur3_mix64(
-        static_cast<std::uint64_t>(std::bit_cast<std::uintptr_t>(value)));
+    raw = static_cast<std::uintptr_t>(value);
   }
+
+  if constexpr (sizeof(std::uintptr_t) <= 4) {
+    return murmur3_mix32(static_cast<std::uint32_t>(raw));
+  }
+  return static_cast<std::size_t>(
+      murmur3_mix64(static_cast<std::uint64_t>(raw)));
 }
 
-// Shard calculation (Seastar-style) - better distribution than modulo of raw
-// pointer
 template <typename T>
 [[nodiscard]] inline auto shard_of(T value, unsigned shard_count) noexcept
     -> unsigned {
   return hash_value(value) % shard_count;
 }
 
-// Generic hash combination
 template <typename T>
 inline auto mix_into(std::size_t &seed, const T &value) noexcept -> void {
   constexpr std::size_t kMagic = 0x9e3779b97f4a7c15ULL;
   seed ^= std::hash<T>{}(value) + kMagic + (seed << 6) + (seed >> 2);
 }
 
-// Combine multiple values into a single hash
 template <typename... Ts>
 [[nodiscard]] inline auto combine(const Ts &...values) noexcept -> std::size_t {
   std::size_t seed = 0;
   (mix_into(seed, values), ...);
   return seed;
 }
+
+struct TransparentStringHash {
+  using is_transparent = void;
+
+  [[nodiscard]] auto operator()(std::string_view value) const noexcept
+      -> std::size_t {
+    return std::hash<std::string_view>{}(value);
+  }
+};
+
+struct TransparentStringEqual {
+  using is_transparent = void;
+
+  [[nodiscard]] auto operator()(std::string_view lhs,
+                                std::string_view rhs) const noexcept -> bool {
+    return lhs == rhs;
+  }
+};
 
 } // namespace dagforge::util

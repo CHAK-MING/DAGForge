@@ -1,17 +1,14 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/core/memory.hpp"
 #include "dagforge/dag/dag.hpp"
-#include "dagforge/scheduler/task.hpp"
-#include "dagforge/util/enum.hpp"
-#include "dagforge/util/id.hpp"
+#include "dagforge/dag/run_types.hpp"
+#endif
 
-#include <boost/describe/enum.hpp>
 #include <chrono>
-#include <cstdint>
-#include <generator>
+#include <boost/container/small_vector.hpp>
 #include <memory>
-#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -20,44 +17,22 @@ namespace dagforge {
 
 struct DAGRunPrivateTag {};
 
-enum class DAGRunState : std::uint8_t {
-  Queued,
-  Running,
-  Success,
-  Failed,
-  Skipped,
-  Cancelled,
-};
-BOOST_DESCRIBE_ENUM(DAGRunState, Queued, Running, Success, Failed, Skipped,
-                    Cancelled)
-DAGFORGE_DEFINE_ENUM_SERDE(DAGRunState, DAGRunState::Running)
-
-enum class TriggerType : std::uint8_t {
-  Manual,
-  Schedule,
-  Api,
-  Backfill,
-};
-BOOST_DESCRIBE_ENUM(TriggerType, Manual, Schedule, Api, Backfill)
-DAGFORGE_DEFINE_ENUM_SERDE(TriggerType, TriggerType::Manual)
-
-struct TaskInstanceInfo {
-  InstanceId instance_id;
-  NodeIndex task_idx{kInvalidNode}; // In-memory graph index (runtime only)
-  int64_t task_rowid{0}; // Stable DB reference (FK -> dag_tasks.task_rowid)
-  TaskState state{TaskState::Pending};
-  int attempt{0};
-  std::chrono::system_clock::time_point started_at;
-  std::chrono::system_clock::time_point finished_at;
-  int exit_code{0};
-  std::string error_message;
-  std::string error_type;
-
-  int64_t run_rowid{-1};
-};
-
 class DAGRun {
 public:
+  struct TransitionDelta {
+    using NodeList = boost::container::small_vector<NodeIndex, 4>;
+
+    NodeList ready_tasks;
+    NodeList terminal_tasks;
+
+    [[nodiscard]] auto has_ready_tasks() const noexcept -> bool {
+      return !ready_tasks.empty();
+    }
+    [[nodiscard]] auto has_terminal_tasks() const noexcept -> bool {
+      return !terminal_tasks.empty();
+    }
+  };
+
   [[nodiscard]] static auto create(DAGRunId dag_run_id,
                                    std::shared_ptr<const DAG> dag)
       -> Result<DAGRun>;
@@ -72,31 +47,36 @@ public:
   [[nodiscard]] auto state() const noexcept -> DAGRunState;
   [[nodiscard]] auto dag() const noexcept -> const DAG &;
 
-  [[nodiscard]] auto get_ready_tasks(pmr::memory_resource *resource =
-                                         pmr::get_default_resource()) const
+  [[nodiscard]] auto get_ready_tasks(
+      pmr::memory_resource *resource = pmr::get_default_resource()) const
       -> pmr::vector<NodeIndex>;
   auto copy_ready_tasks(pmr::vector<NodeIndex> &out) const -> void;
   [[nodiscard]] auto is_task_ready(NodeIndex task_idx) const noexcept -> bool;
-  [[nodiscard]] auto ready_task_stream() const
-      -> std::generator<Result<NodeIndex>>;
   [[nodiscard]] auto ready_count() const noexcept -> size_t;
 
   [[nodiscard]] auto mark_task_started(NodeIndex task_idx,
                                        const InstanceId &instance_id)
       -> Result<void>;
-  [[nodiscard]] auto mark_task_completed(NodeIndex task_idx, int exit_code)
+  [[nodiscard]] auto
+  mark_task_started(NodeIndex task_idx, const InstanceId &instance_id,
+                    std::chrono::system_clock::time_point started_at)
       -> Result<void>;
+  [[nodiscard]] auto mark_task_completed(NodeIndex task_idx, int exit_code)
+      -> Result<TransitionDelta>;
   [[nodiscard]] auto
   mark_task_completed_with_branch(NodeIndex task_idx, int exit_code,
                                   std::span<const TaskId> selected_branches)
-      -> Result<void>;
+      -> Result<TransitionDelta>;
   [[nodiscard]] auto mark_task_failed(NodeIndex task_idx,
                                       std::string_view error, int max_retries,
-                                      int exit_code = 1) -> Result<void>;
-  [[nodiscard]] auto mark_task_retry_ready(NodeIndex task_idx) -> Result<void>;
-  [[nodiscard]] auto mark_task_skipped(NodeIndex task_idx) -> Result<void>;
+                                      int exit_code = 1)
+      -> Result<TransitionDelta>;
+  [[nodiscard]] auto mark_task_retry_ready(NodeIndex task_idx)
+      -> Result<TransitionDelta>;
+  [[nodiscard]] auto mark_task_skipped(NodeIndex task_idx)
+      -> Result<TransitionDelta>;
   [[nodiscard]] auto mark_task_upstream_failed(NodeIndex task_idx)
-      -> Result<void>;
+      -> Result<TransitionDelta>;
   [[nodiscard]] auto restore_task_instance(const TaskInstanceInfo &info)
       -> Result<void>;
 

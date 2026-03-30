@@ -1,92 +1,36 @@
 #pragma once
 
-#include "dagforge/executor/executor.hpp"
-#include "dagforge/util/enum.hpp"
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
+#include "dagforge/config/task_types.hpp"
+#include "dagforge/config/task_policies.hpp"
+#include "dagforge/executor/executor_types.hpp"
+#endif
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/util/id.hpp"
-#include "dagforge/xcom/xcom_types.hpp"
-
-#include "dagforge/core/error.hpp"
-#include <boost/describe/enum.hpp>
+#endif
 #include <chrono>
-#include <memory>
-#include <regex>
-#include <ranges>
 #include <string>
 #include <vector>
 
+
 namespace dagforge {
 
-namespace task_defaults {
-inline constexpr std::chrono::seconds kExecutionTimeout{3600};
-inline constexpr std::chrono::seconds kRetryInterval{60};
-inline constexpr int kMaxRetries{3};
-} // namespace task_defaults
-
-enum class TriggerRule : std::uint8_t {
-  AllSuccess,              // Default: all upstream tasks succeeded
-  AllFailed,               // All upstream tasks failed
-  AllDone,                 // All upstream tasks completed (success or failed)
-  OneSuccess,              // At least one upstream task succeeded
-  OneFailed,               // At least one upstream task failed
-  NoneFailed,              // No upstream task failed (may have skipped)
-  NoneSkipped,             // No upstream task was skipped
-  AllDoneMinOneSuccess,    // All done and at least one succeeded
-  AllSkipped,              // All upstream tasks were skipped
-  OneDone,                 // At least one upstream completed (success or fail)
-  NoneFailedMinOneSuccess, // None failed and at least one succeeded
-  Always,                  // Always trigger regardless of upstream states
-};
-BOOST_DESCRIBE_ENUM(TriggerRule, AllSuccess, AllFailed, AllDone, OneSuccess,
-                    OneFailed, NoneFailed, NoneSkipped, AllDoneMinOneSuccess,
-                    AllSkipped, OneDone, NoneFailedMinOneSuccess, Always)
-DAGFORGE_DEFINE_ENUM_SERDE(TriggerRule, TriggerRule::AllSuccess)
-
-enum class XComSource : std::uint8_t { Stdout, Stderr, ExitCode, Json };
-BOOST_DESCRIBE_ENUM(XComSource, Stdout, Stderr, ExitCode, Json)
-DAGFORGE_DEFINE_ENUM_SERDE(XComSource, XComSource::Stdout)
-
-struct XComPushConfig {
-  std::string key;
-  XComSource source{XComSource::Stdout};
-  std::string json_path;
-  std::string regex_pattern;
-  int regex_group{0};
-  std::shared_ptr<const std::regex> compiled_regex;
-
-  [[nodiscard]] auto compile_regex() -> Result<void> {
-    if (regex_pattern.empty()) {
-      compiled_regex.reset();
-      return ok();
-    }
-    try {
-      compiled_regex = std::make_shared<const std::regex>(regex_pattern);
-      return ok();
-    } catch (const std::regex_error &) {
-      return fail(Error::InvalidArgument);
-    }
-  }
-};
-
-struct TaskDependency {
-  TaskId task_id;
-  std::string label;
-
-  bool operator==(const TaskId &other) const { return task_id == other; }
-  bool operator==(const TaskDependency &other) const = default;
-};
-
-inline auto get_dep_task_ids(const std::vector<TaskDependency> &deps) {
-  return deps |
-         std::views::transform([](const TaskDependency &d) -> const TaskId & {
-           return d.task_id;
-         });
-}
-
-using ShellTaskConfig = ShellExecutorConfig;
-using DockerTaskConfig = DockerExecutorConfig;
-using SensorTaskConfig = SensorExecutorConfig;
-
 struct TaskConfig {
+  /// Runtime projection used after DAG compilation.
+  struct Compiled {
+    int64_t task_rowid{0};
+    TaskId task_id;
+    ExecutorType executor{ExecutorType::Shell};
+    std::string command;
+    std::string working_dir;
+    std::chrono::seconds execution_timeout{task_defaults::kExecutionTimeout};
+    bool is_branch{false};
+    std::string branch_xcom_key{"branch"};
+    bool depends_on_past{false};
+    std::vector<XComPushConfig> xcom_push;
+    std::vector<XComPullConfig> xcom_pull;
+  };
+
   struct Builder;
   static auto builder() -> Builder;
 
@@ -108,6 +52,22 @@ struct TaskConfig {
 
   std::vector<XComPushConfig> xcom_push;
   std::vector<XComPullConfig> xcom_pull;
+
+  [[nodiscard]] auto compiled() const -> Compiled {
+    return Compiled{
+        .task_rowid = task_rowid,
+        .task_id = task_id,
+        .executor = executor,
+        .command = command,
+        .working_dir = working_dir,
+        .execution_timeout = execution_timeout,
+        .is_branch = is_branch,
+        .branch_xcom_key = branch_xcom_key,
+        .depends_on_past = depends_on_past,
+        .xcom_push = xcom_push,
+        .xcom_pull = xcom_pull,
+    };
+  }
 };
 
 struct TaskConfig::Builder {

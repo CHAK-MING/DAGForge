@@ -1,8 +1,11 @@
 #pragma once
 
+
+#include "dagforge/scheduler/execution_info.hpp"
 #include "dagforge/scheduler/task.hpp"
 
 #include <variant>
+
 
 namespace dagforge {
 

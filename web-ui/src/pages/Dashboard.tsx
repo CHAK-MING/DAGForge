@@ -6,7 +6,7 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
-import { RunSparkline } from "@/components/RunSparkline";
+import { DAGSummaryCard } from "@/components/DAGSummaryCard";
 import {
   GitBranch,
   Play,
@@ -23,6 +23,8 @@ import {
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { useI18n } from "@/contexts/I18nContext";
+import { matchesSearchQuery } from "@/lib/search";
+import { computeDagHistoryOverview } from "@/lib/dag-overview";
 import { useDAGsQuery, useTriggerDAGMutation } from "@/hooks/useDAGQueries";
 import { useSystemStatus, useSystemHealth, useGlobalHistory } from "@/hooks/useSystemData";
 import { useState, useMemo } from "react";
@@ -35,20 +37,7 @@ const computeDashboardStats = (globalHistory: RunRecord[]) => {
   const totalCompleted = failedCount + successCount;
   const successRate = totalCompleted > 0 ? Math.round((successCount / totalCompleted) * 100) : 100;
 
-  const dagRunsMap = new Map<string, RunRecord[]>();
-  globalHistory.forEach(run => {
-    const dagId = run.dag_id;
-    if (!dagRunsMap.has(dagId)) {
-      dagRunsMap.set(dagId, []);
-    }
-    dagRunsMap.get(dagId)!.push(run);
-  });
-
-  const dagHealthMap = new Map<string, "healthy" | "failed">();
-  dagRunsMap.forEach((runs, dagId) => {
-    const hasRecentFailure = runs.slice(0, 5).some(r => r.state === 'failed');
-    dagHealthMap.set(dagId, hasRecentFailure ? "failed" : "healthy");
-  });
+  const { dagRunsMap, dagHealthMap } = computeDagHistoryOverview(globalHistory);
 
   const queueBacklog = globalHistory.filter(r => r.state === 'running').length;
 
@@ -69,19 +58,19 @@ export default function Dashboard() {
   const [viewMode, setViewMode] = useState<"card" | "table">("card");
   const [showAdvancedMetrics, setShowAdvancedMetrics] = useState(false);
 
-  const refetchInterval = autoRefresh ? 5000 : false;
+  const refetchInterval: number | false = autoRefresh ? 5000 : false;
 
   // Use React Query with automatic refetching
-  const { data: dags = [], isLoading: dagsLoading } = useDAGsQuery(refetchInterval);
-  const { data: status } = useSystemStatus(refetchInterval);
-  const { data: health } = useSystemHealth(refetchInterval);
+  const { data: availableDAGs = [], isLoading: dagsLoading } = useDAGsQuery(autoRefresh ? 5000 : undefined);
+  const { data: systemStatus } = useSystemStatus(refetchInterval);
+  const { data: systemHealth } = useSystemHealth(refetchInterval);
 
-  const { data: stats } = useGlobalHistory(autoRefresh ? 10000 : false, {
+  const { data: dashboardStats } = useGlobalHistory(autoRefresh ? 10000 : false, {
     select: computeDashboardStats
   });
   const triggerDAGMutation = useTriggerDAGMutation();
 
-  const { metrics, dagRunsMap, dagHealthMap, queueBacklog } = stats || {
+  const { metrics, dagRunsMap, dagHealthMap, queueBacklog } = dashboardStats || {
     metrics: { failedCount: 0, successCount: 0, successRate: 100, totalCompleted: 0 },
     dagRunsMap: new Map(),
     dagHealthMap: new Map(),
@@ -90,11 +79,15 @@ export default function Dashboard() {
 
   // Filter and search DAGs
   const filteredDAGs = useMemo(() => {
-    return dags.filter(dag => {
+    return availableDAGs.filter(dag => {
       // Search filter
-      const matchesSearch = searchQuery === "" ||
-        dag.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        dag.description?.toLowerCase().includes(searchQuery.toLowerCase());
+      const matchesSearch = matchesSearchQuery(
+        searchQuery,
+        dag.dag_id,
+        dag.name,
+        dag.description,
+        dag.cron
+      );
 
       // Status filter
       const dagHealth = dagHealthMap.get(dag.dag_id) || "healthy";
@@ -104,19 +97,19 @@ export default function Dashboard() {
 
       return matchesSearch && matchesStatus;
     });
-  }, [dags, searchQuery, statusFilter, dagHealthMap]);
+  }, [availableDAGs, searchQuery, statusFilter, dagHealthMap]);
 
   const handleTriggerDAG = (dagId: string) => {
     triggerDAGMutation.mutate(dagId);
   };
 
-  const totalTasks = dags.reduce((sum, dag) => sum + (dag.tasks?.length || 0), 0);
-  const activeRuns = status?.active_runs
-    ? (typeof status.active_runs === 'boolean'
-      ? (status.active_runs ? 1 : 0)
-      : status.active_runs)
+  const totalTasks = availableDAGs.reduce((sum, dag) => sum + (dag.tasks?.length || 0), 0);
+  const activeRuns = systemStatus?.active_runs
+    ? (typeof systemStatus.active_runs === 'boolean'
+      ? (systemStatus.active_runs ? 1 : 0)
+      : systemStatus.active_runs)
     : 0;
-  const isHealthy = health?.status === 'healthy';
+  const isHealthy = systemHealth?.status === 'healthy';
 
   return (
     <AppLayout title={t.dashboard.title} subtitle={t.dashboard.subtitle}>
@@ -129,7 +122,7 @@ export default function Dashboard() {
             onCheckedChange={setAutoRefresh}
           />
           <Label htmlFor="auto-refresh" className="text-sm cursor-pointer">
-            {autoRefresh ? "自动刷新 (5s)" : "已暂停刷新"}
+            {autoRefresh ? t.dashboard.autoRefreshOn : t.dashboard.autoRefreshOff}
           </Label>
         </div>
       </div>
@@ -138,20 +131,20 @@ export default function Dashboard() {
       <div className="grid gap-5 md:grid-cols-3 mb-6">
         <StatCard
           title={t.dashboard.dagCount}
-          value={status?.dag_count ?? dags.length}
+          metricValue={systemStatus?.dag_count ?? availableDAGs.length}
           icon={GitBranch}
         />
         {/* O&M Failed Runs Alert */}
         <StatCard
           title={t.dashboard.failedTasks}
-          value={metrics.failedCount}
+          metricValue={metrics.failedCount}
           icon={AlertCircle}
           variant={metrics.failedCount > 0 ? "destructive" : "success"}
         />
         {/* O&M Success Rate Indicator */}
         <StatCard
           title={t.dashboard.successRate}
-          value={`${metrics.successRate}%`}
+          metricValue={`${metrics.successRate}%`}
           icon={TrendingUp}
           variant={metrics.successRate >= 90 ? "success" : metrics.successRate >= 70 ? "warning" : "destructive"}
         />
@@ -182,13 +175,13 @@ export default function Dashboard() {
         <div className="grid gap-4 md:grid-cols-2 mb-8">
           <StatCard
             title={t.dashboard.activeRuns}
-            value={activeRuns}
+            metricValue={activeRuns}
             icon={Play}
             variant="default"
           />
           <StatCard
             title={t.dashboard.totalTasks}
-            value={totalTasks}
+            metricValue={totalTasks}
             icon={Clock}
             variant="success"
           />
@@ -242,7 +235,7 @@ export default function Dashboard() {
               className="cursor-pointer"
               onClick={() => setStatusFilter("all")}
             >
-              {t.dashboard.allDags} ({dags.length})
+              {t.dashboard.allDags} ({availableDAGs.length})
             </Badge>
             <Badge
               variant={statusFilter === "healthy" ? "default" : "outline"}
@@ -269,61 +262,15 @@ export default function Dashboard() {
           {filteredDAGs.slice(0, 6).map((dag) => {
             const dagRuns = dagRunsMap.get(dag.dag_id) || [];
             const dagHealth = dagHealthMap.get(dag.dag_id) || "healthy";
-            const recentRun = dagRuns[0];
-
             return (
-              <Card
+              <DAGSummaryCard
                 key={dag.dag_id}
-                className="cursor-pointer bg-card/60 backdrop-blur supports-[backdrop-filter]:bg-background/60 hover:shadow-md hover:border-primary/40 transform hover:-translate-y-1 transition-all duration-300"
-                onClick={() => navigate(`/dags/${dag.dag_id}`)}
-              >
-                <CardHeader className="pb-2">
-                  <div className="flex items-start justify-between">
-                    <CardTitle className="text-base">{dag.name}</CardTitle>
-                    {dagHealth === "failed" && (
-                      <Badge variant="destructive" className="text-xs">
-                        异常
-                      </Badge>
-                    )}
-                  </div>
-                </CardHeader>
-                <CardContent>
-                  <p className="text-sm text-muted-foreground mb-3 line-clamp-2">
-                    {dag.description || t.dags.noDescription}
-                  </p>
-
-                  {/* Sparkline */}
-                  <div className="mb-3">
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="text-xs text-muted-foreground">{t.dashboard.runHistory}</span>
-                      <span className="text-xs text-muted-foreground">
-                        {dagRuns.length > 0 ? `${dagRuns.length} ${t.dashboard.runs}` : t.dashboard.noRecords}
-                      </span>
-                    </div>
-                    <RunSparkline runs={dagRuns} maxBars={10} />
-                  </div>
-
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-xs text-muted-foreground">
-                      {tf(t.dags.taskCount, { count: dag.tasks?.length || 0 })}
-                    </span>
-                    <div className="flex gap-1">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleTriggerDAG(dag.dag_id);
-                        }}
-                        className="h-7"
-                      >
-                        <Play className="h-3 w-3 mr-1" />
-                        {t.common.run}
-                      </Button>
-                    </div>
-                  </div>
-                </CardContent>
-              </Card>
+                dag={dag}
+                runs={dagRuns}
+                health={dagHealth}
+                onOpen={(dagId) => navigate(`/dags/${dagId}`)}
+                onTrigger={handleTriggerDAG}
+              />
             );
           })}
         </div>
@@ -334,19 +281,17 @@ export default function Dashboard() {
             <table className="w-full">
               <thead className="bg-muted/50">
                 <tr>
-                  <th className="text-left p-3 text-sm font-medium">名称</th>
-                  <th className="text-left p-3 text-sm font-medium">任务数</th>
-                  <th className="text-left p-3 text-sm font-medium">运行历史</th>
-                  <th className="text-left p-3 text-sm font-medium">状态</th>
-                  <th className="text-right p-3 text-sm font-medium">操作</th>
+                  <th className="text-left p-3 text-sm font-medium">{t.dashboard.tableName}</th>
+                  <th className="text-left p-3 text-sm font-medium">{t.dashboard.tableTasks}</th>
+                  <th className="text-left p-3 text-sm font-medium">{t.dashboard.tableHistory}</th>
+                  <th className="text-left p-3 text-sm font-medium">{t.dashboard.tableStatus}</th>
+                  <th className="text-right p-3 text-sm font-medium">{t.dashboard.tableActions}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-border">
                 {filteredDAGs.slice(0, 10).map((dag) => {
                   const dagRuns = dagRunsMap.get(dag.dag_id) || [];
                   const dagHealth = dagHealthMap.get(dag.dag_id) || "healthy";
-                  const recentRun = dagRuns[0];
-
                   return (
                     <tr
                       key={dag.dag_id}
@@ -382,7 +327,7 @@ export default function Dashboard() {
                             className="h-7"
                           >
                             <Play className="h-3 w-3 mr-1" />
-                            运行
+                            {t.common.run}
                           </Button>
                         </div>
                       </td>
@@ -417,7 +362,7 @@ export default function Dashboard() {
               },
               {
                 label: t.dashboard.dagCount,
-                status: tf(t.dags.totalCount, { count: status?.dag_count ?? dags.length }),
+                status: tf(t.dags.totalCount, { count: systemStatus?.dag_count ?? availableDAGs.length }),
                 healthy: true
               },
               {
@@ -454,7 +399,7 @@ export default function Dashboard() {
             <CardTitle className="text-base font-semibold">{t.dashboard.quickActions}</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
-            {dags.slice(0, 5).map((dag) => (
+            {availableDAGs.slice(0, 5).map((dag) => (
               <div
                 key={dag.dag_id}
                 className="flex items-center justify-between p-3 rounded-lg border border-border"
@@ -475,7 +420,7 @@ export default function Dashboard() {
                 </Button>
               </div>
             ))}
-            {dags.length === 0 && (
+            {availableDAGs.length === 0 && (
               <p className="text-muted-foreground text-sm text-center py-4">
                 {t.common.noData}
               </p>

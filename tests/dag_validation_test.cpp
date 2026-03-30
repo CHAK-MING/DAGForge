@@ -1,4 +1,4 @@
-#include "dagforge/config/dag_definition.hpp"
+#include "dagforge/config/dag_info_loader.hpp"
 #include "dagforge/config/dag_file_loader.hpp"
 #include "dagforge/executor/executor.hpp"
 #include "dagforge/util/id.hpp"
@@ -13,6 +13,13 @@
 
 namespace dagforge {
 namespace {
+
+template <typename T>
+concept HasSourceFileBuilderMethod = requires(T builder) {
+  std::move(builder).source_file("unused");
+};
+
+static_assert(!HasSourceFileBuilderMethod<DAGInfoBuilder>);
 
 class DAGValidationTest : public ::testing::Test {
 protected:
@@ -66,7 +73,7 @@ id = "task1"
 command = "echo hello"
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(valid_toml);
+  auto result = DAGInfoLoader::load_from_string(valid_toml);
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->name, "test_dag");
   EXPECT_EQ(result->description, "Test DAG");
@@ -85,7 +92,7 @@ id = "task1"
 command = "echo hello"
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(valid_toml);
+  auto result = DAGInfoLoader::load_from_string(valid_toml);
 
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->name, "test_dag_glaze");
@@ -102,7 +109,7 @@ id = "task1"
 command = "echo hello"
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(toml);
+  auto result = DAGInfoLoader::load_from_string(toml);
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->dag_id, DAGId("invalid_dag"));
   EXPECT_EQ(result->name, "invalid_dag");
@@ -120,7 +127,7 @@ id = "task1"
 command = "echo hello"
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(toml);
+  auto result = DAGInfoLoader::load_from_string(toml);
   ASSERT_TRUE(result.has_value());
   ASSERT_TRUE(result->start_date.has_value());
   ASSERT_TRUE(result->end_date.has_value());
@@ -134,7 +141,7 @@ name = "test_dag"
 tasks = []
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(invalid_toml);
+  auto result = DAGInfoLoader::load_from_string(invalid_toml);
   EXPECT_FALSE(result.has_value());
 }
 
@@ -151,7 +158,7 @@ id = "task1"
 command = "echo world"
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(invalid_toml);
+  auto result = DAGInfoLoader::load_from_string(invalid_toml);
   EXPECT_FALSE(result.has_value());
 }
 
@@ -164,7 +171,7 @@ id = "task1"
 command = ""
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(invalid_toml);
+  auto result = DAGInfoLoader::load_from_string(invalid_toml);
   EXPECT_FALSE(result.has_value());
 }
 
@@ -178,7 +185,7 @@ command = "echo hello"
 dependencies = ["task1"]
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(invalid_toml);
+  auto result = DAGInfoLoader::load_from_string(invalid_toml);
   EXPECT_FALSE(result.has_value());
 }
 
@@ -192,7 +199,7 @@ command = "echo hello"
 dependencies = ["nonexistent"]
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(invalid_toml);
+  auto result = DAGInfoLoader::load_from_string(invalid_toml);
   EXPECT_FALSE(result.has_value());
 }
 
@@ -210,7 +217,7 @@ command = "echo world"
 dependencies = ["task1"]
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(valid_toml);
+  auto result = DAGInfoLoader::load_from_string(valid_toml);
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->tasks.size(), 2);
   EXPECT_EQ(result->tasks[1].dependencies.size(), 1);
@@ -240,7 +247,7 @@ command = "echo 1"
 
   bool found_dag1 = false;
   for (const auto &dag_file : *result) {
-    if (dag_file.definition.name == "dag1") {
+    if (dag_file.info.name == "dag1") {
       found_dag1 = true;
     }
   }
@@ -277,7 +284,7 @@ command = "echo 2"
 
   bool found_dag2 = false;
   for (const auto &dag_file : *second) {
-    if (dag_file.definition.name == "dag2") {
+    if (dag_file.info.name == "dag2") {
       found_dag2 = true;
       break;
     }
@@ -301,7 +308,7 @@ command = "echo 1"
   DAGFileLoader loader(temp_dir.string());
   auto original = loader.load_file(file_path);
   ASSERT_TRUE(original.has_value());
-  EXPECT_EQ(original->definition.description, "original");
+  EXPECT_EQ(original->info.description, "original");
 
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -317,7 +324,7 @@ command = "echo 1"
 
   auto modified = loader.load_file(file_path);
   ASSERT_TRUE(modified.has_value());
-  EXPECT_EQ(modified->definition.description, "modified");
+  EXPECT_EQ(modified->info.description, "modified");
 }
 
 TEST_F(DAGFileLoaderTest, LoadAllReflectsRemovedFile) {
@@ -364,7 +371,49 @@ tasks = []
   auto loaded = loader.load_all();
   ASSERT_TRUE(loaded.has_value());
   EXPECT_EQ(loaded->size(), 1);
-  EXPECT_EQ((*loaded)[0].definition.name, "dag1");
+  EXPECT_EQ((*loaded)[0].info.name, "dag1");
+}
+
+TEST_F(DAGFileLoaderTest, LoadFileMissingPathReturnsFileNotFound) {
+  auto temp_dir = create_temp_dir();
+  DAGFileLoader loader(temp_dir.string());
+
+  auto loaded = loader.load_file(temp_dir / "missing.toml");
+  ASSERT_FALSE(loaded.has_value());
+  EXPECT_EQ(loaded.error(), make_error_code(Error::FileNotFound));
+}
+
+TEST_F(DAGFileLoaderTest, LoadAllMissingDirectoryReturnsEmptySet) {
+  auto temp_dir = create_temp_dir();
+  std::filesystem::remove_all(temp_dir);
+
+  DAGFileLoader loader(temp_dir.string());
+  auto loaded = loader.load_all();
+
+  ASSERT_TRUE(loaded.has_value());
+  EXPECT_TRUE(loaded->empty());
+}
+
+TEST_F(DAGFileLoaderTest, LoadAllSkipsSymlinkOutsideDirectory) {
+  auto temp_dir = create_temp_dir();
+  auto outside_dir = create_temp_dir();
+  auto outside_file = write_toml_file(outside_dir, "outside.toml", R"(
+id = "outside"
+name = "outside"
+[[tasks]]
+id = "task1"
+command = "echo 1"
+)");
+
+  std::filesystem::create_symlink(outside_file, temp_dir / "linked.toml");
+
+  DAGFileLoader loader(temp_dir.string());
+  auto loaded = loader.load_all();
+
+  ASSERT_TRUE(loaded.has_value());
+  EXPECT_TRUE(loaded->empty());
+
+  std::filesystem::remove_all(outside_dir);
 }
 
 class DefaultArgsTest : public ::testing::Test {};
@@ -381,7 +430,7 @@ id = "task1"
 command = "echo hello"
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(toml);
+  auto result = DAGInfoLoader::load_from_string(toml);
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->tasks[0].execution_timeout, std::chrono::seconds(60));
 }
@@ -399,7 +448,7 @@ command = "echo hello"
 timeout = 120
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(toml);
+  auto result = DAGInfoLoader::load_from_string(toml);
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->tasks[0].execution_timeout, std::chrono::seconds(120));
 }
@@ -416,7 +465,7 @@ id = "task1"
 command = "echo hello"
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(toml);
+  auto result = DAGInfoLoader::load_from_string(toml);
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->tasks[0].retry_interval, std::chrono::seconds(30));
 }
@@ -433,7 +482,7 @@ id = "task1"
 command = "echo hello"
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(toml);
+  auto result = DAGInfoLoader::load_from_string(toml);
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->tasks[0].max_retries, 5);
 }
@@ -451,7 +500,7 @@ id = "task1"
 command = "echo hello"
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(toml);
+  auto result = DAGInfoLoader::load_from_string(toml);
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->tasks[0].retry_interval, std::chrono::seconds(45));
   EXPECT_EQ(result->tasks[0].max_retries, 7);
@@ -469,7 +518,7 @@ id = "task1"
 command = "echo hello"
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(toml);
+  auto result = DAGInfoLoader::load_from_string(toml);
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->tasks[0].trigger_rule, TriggerRule::OneFailed);
 }
@@ -486,7 +535,7 @@ id = "task1"
 command = "echo hello"
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(toml);
+  auto result = DAGInfoLoader::load_from_string(toml);
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->tasks[0].trigger_rule, TriggerRule::AllDone);
 }
@@ -503,7 +552,7 @@ id = "task1"
 command = "echo hello"
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(toml);
+  auto result = DAGInfoLoader::load_from_string(toml);
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(result->tasks[0].depends_on_past);
 }
@@ -526,7 +575,7 @@ command = "echo world"
 timeout = 120
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(toml);
+  auto result = DAGInfoLoader::load_from_string(toml);
   ASSERT_TRUE(result.has_value());
   ASSERT_EQ(result->tasks.size(), 2);
   EXPECT_EQ(result->tasks[0].execution_timeout, std::chrono::seconds(60));
@@ -546,7 +595,7 @@ command = "pwd"
 working_directory = "/tmp"
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(toml);
+  auto result = DAGInfoLoader::load_from_string(toml);
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->tasks[0].working_dir, "/tmp");
 }
@@ -567,7 +616,7 @@ command = "echo world"
 dependencies = ["task1"]
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(toml);
+  auto result = DAGInfoLoader::load_from_string(toml);
   ASSERT_TRUE(result.has_value());
   ASSERT_EQ(result->tasks[1].dependencies.size(), 1);
   EXPECT_EQ(result->tasks[1].dependencies[0].task_id, TaskId("task1"));
@@ -591,7 +640,7 @@ task = "task1"
 label = "success_branch"
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(toml);
+  auto result = DAGInfoLoader::load_from_string(toml);
   EXPECT_FALSE(result.has_value());
 }
 
@@ -609,7 +658,7 @@ TEST_F(DAGValidationTest, ToStringRoundTripsTaskMetadata) {
   TaskConfig task;
   task.task_id = TaskId{"task1"};
   task.name = "task1";
-  task.command = "curl http://example.com";
+  task.command.clear();
   task.executor = ExecutorType::Sensor;
   task.execution_timeout = std::chrono::seconds(90);
   task.retry_interval = std::chrono::seconds(15);
@@ -633,13 +682,13 @@ TEST_F(DAGValidationTest, ToStringRoundTripsTaskMetadata) {
       .ref = XComRef{.task_id = TaskId{"upstream_a"}, .key = "payload"},
       .env_var = "PAYLOAD",
       .required = true,
-      .default_value = std::nullopt,
+      .default_value_json = "",
+      .has_default_value = false,
   });
   task.executor_config = SensorExecutorConfig{
       .type = SensorType::Http,
       .target = "http://example.com/health",
       .poke_interval = std::chrono::seconds(45),
-      .execution_timeout = std::chrono::seconds(90),
       .soft_fail = true,
       .expected_status = 204,
       .http_method = "HEAD",
@@ -661,8 +710,8 @@ TEST_F(DAGValidationTest, ToStringRoundTripsTaskMetadata) {
   dag.tasks.push_back(task);
   dag.rebuild_task_index();
 
-  auto serialized = DAGDefinitionLoader::to_string(dag);
-  auto reparsed = DAGDefinitionLoader::load_from_string(serialized);
+  auto serialized = DAGInfoLoader::to_string(dag);
+  auto reparsed = DAGInfoLoader::load_from_string(serialized);
 
   ASSERT_TRUE(reparsed.has_value());
   ASSERT_EQ(reparsed->tasks.size(), 3);
@@ -684,6 +733,37 @@ TEST_F(DAGValidationTest, ToStringRoundTripsTaskMetadata) {
   EXPECT_EQ(sensor->target, "http://example.com/health");
   EXPECT_EQ(sensor->http_method, "HEAD");
   EXPECT_EQ(sensor->expected_status, 204);
+}
+
+TEST_F(DAGValidationTest, LoadFromStringPrecomputesRenderedXComPullDefault) {
+  std::string toml = R"(
+id = "xcom_default_dag"
+name = "xcom_default_dag"
+
+[[tasks]]
+id = "producer"
+command = "echo producer"
+
+[[tasks]]
+id = "consumer"
+command = "echo consumer"
+
+[[tasks.xcom_pull]]
+from = "producer"
+key = "payload"
+env = "PAYLOAD"
+required = false
+default_value = "fallback"
+)";
+
+  auto result = DAGInfoLoader::load_from_string(toml);
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  ASSERT_EQ(result->tasks.size(), 2U);
+
+  const auto &pull = result->tasks[1].xcom_pull.front();
+  EXPECT_TRUE(pull.has_default_value);
+  EXPECT_EQ(pull.default_value_json, R"("fallback")");
+  EXPECT_EQ(pull.default_value_rendered, "fallback");
 }
 
 TEST_F(DependencyLabelTest, LoadFromString_MixedFormsParse) {
@@ -711,7 +791,7 @@ task = "task2"
 label = "branch_a"
 )";
 
-  auto result = DAGDefinitionLoader::load_from_string(toml);
+  auto result = DAGInfoLoader::load_from_string(toml);
   EXPECT_FALSE(result.has_value());
 }
 

@@ -8,7 +8,7 @@
 
 #include "bench_utils.hpp"
 
-#include <benchmark/benchmark.h>
+#include "benchmark_compat.hpp"
 #include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
 
@@ -309,16 +309,16 @@ auto create_bench_dag_run(std::shared_ptr<HandoffBenchState> shared,
   run->set_execution_date(now);
 
   std::vector<ExecutorConfig> executor_configs;
-  executor_configs.emplace_back(ShellExecutorConfig{.command = ":"});
+  executor_configs.emplace_back(ShellExecutorConfig{});
 
-  std::vector<TaskConfig> task_configs;
-  task_configs.emplace_back(make_single_task_config());
+  std::vector<TaskConfig::Compiled> task_configs;
+  task_configs.emplace_back(make_single_task_config().compiled());
 
   return ok(ExecutionService::RunContext{
       .run = std::move(run),
       .executor_configs = std::make_shared<const std::vector<ExecutorConfig>>(
           std::move(executor_configs)),
-      .task_configs = std::make_shared<const std::vector<TaskConfig>>(
+      .task_configs = std::make_shared<const std::vector<TaskConfig::Compiled>>(
           std::move(task_configs)),
       .dag_id = dag_id.clone()});
 }
@@ -348,24 +348,24 @@ auto create_bench_dag_run(std::shared_ptr<HandoffBenchState> shared,
   run->set_execution_date(now);
 
   std::vector<ExecutorConfig> executor_configs;
-  executor_configs.emplace_back(ShellExecutorConfig{.command = ":"});
-  executor_configs.emplace_back(ShellExecutorConfig{.command = ":"});
+  executor_configs.emplace_back(ShellExecutorConfig{});
+  executor_configs.emplace_back(ShellExecutorConfig{});
 
-  std::vector<TaskConfig> task_configs;
+  std::vector<TaskConfig::Compiled> task_configs;
   for (const auto &task_name : {"t0", "t1"}) {
     TaskConfig cfg;
     cfg.task_id = TaskId{task_name};
     cfg.name = task_name;
     cfg.executor = ExecutorType::Shell;
     cfg.command = ":";
-    task_configs.emplace_back(std::move(cfg));
+    task_configs.emplace_back(cfg.compiled());
   }
 
   return ok(ExecutionService::RunContext{
       .run = std::move(run),
       .executor_configs = std::make_shared<const std::vector<ExecutorConfig>>(
           std::move(executor_configs)),
-      .task_configs = std::make_shared<const std::vector<TaskConfig>>(
+      .task_configs = std::make_shared<const std::vector<TaskConfig::Compiled>>(
           std::move(task_configs)),
       .dag_id = dag_id.clone()});
 }

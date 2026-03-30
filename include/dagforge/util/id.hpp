@@ -1,14 +1,21 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <compare>
 #include <concepts>
+#include <cstddef>
 #include <format>
 #include <functional>
 #include <optional>
 #include <ostream>
+#include <random>
 #include <string>
 #include <string_view>
+#include <utility>
+#endif
 
 namespace dagforge {
 
@@ -23,15 +30,12 @@ namespace dagforge {
   return !value.empty() && !has_control_chars(value);
 }
 
-// Phantom type tags for type-safe ID disambiguation
 struct DAGTag {};
 struct TaskTag {};
 struct DAGTaskTag {};
 struct DAGRunTag {};
 struct InstanceTag {};
 
-// Type-safe ID wrapper using phantom type pattern
-// Prevents accidental mixing of different ID types at compile time
 template <typename Tag> class TypedId {
 public:
   explicit TypedId(std::string value) : value_(std::move(value)) {}
@@ -50,8 +54,6 @@ public:
     return value_.c_str();
   }
 
-  // Explicit conversion to avoid unintended implicit string coercions
-  // (e.g., pass-by-value to functions expecting std::string).
   [[nodiscard]] explicit operator const std::string &() const noexcept {
     return value_;
   }
@@ -81,8 +83,8 @@ public:
                                       const TypedId &rhs) noexcept -> bool {
     return lhs < std::string_view{rhs.value_};
   }
-  [[nodiscard]] auto clone() const -> TypedId { return TypedId{value_}; }
 
+  [[nodiscard]] auto clone() const -> TypedId { return TypedId{value_}; }
   [[nodiscard]] auto empty() const noexcept -> bool { return value_.empty(); }
   [[nodiscard]] auto size() const noexcept -> std::size_t {
     return value_.size();
@@ -112,19 +114,15 @@ inline auto operator<<(std::ostream &os, const TypedId<Tag> &id)
 
 } // namespace dagforge
 
-// --- std::hash specialization ---
-// `is_avalanching` tells ankerl::unordered_dense::hash to delegate to
-// std::hash<TypedId<T>> instead of falling back to wyhash-over-raw-bytes
-// (which would hash the std::string internal pointers — UB / corruption).
 template <typename Tag> struct std::hash<dagforge::TypedId<Tag>> {
   using is_avalanching = void;
+
   auto operator()(const dagforge::TypedId<Tag> &id) const noexcept
       -> std::size_t {
     return std::hash<std::string_view>{}(id.value());
   }
 };
 
-// --- std::formatter specialization (before any std::format usage) ---
 template <typename Tag>
 struct std::formatter<dagforge::TypedId<Tag>>
     : std::formatter<std::string_view> {
@@ -133,12 +131,26 @@ struct std::formatter<dagforge::TypedId<Tag>>
   }
 };
 
-// Reopen namespace for functions that use std::format with TypedId
 namespace dagforge {
 
 namespace detail {
-[[nodiscard]] auto generate_short_uuid() -> std::string;
-[[nodiscard]] auto generate_uuid_v7_like() -> std::string;
+[[nodiscard]] inline auto generate_short_uuid() -> std::string {
+  thread_local std::mt19937_64 gen(std::random_device{}());
+  thread_local std::uniform_int_distribution<std::uint32_t> dis;
+  return std::format("{:08x}", dis(gen));
+}
+
+[[nodiscard]] inline auto generate_uuid_v7_like() -> std::string {
+  thread_local std::mt19937_64 gen(std::random_device{}());
+  thread_local std::uniform_int_distribution<std::uint64_t> dis;
+  const auto now_ms = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  const auto rnd = dis(gen);
+  return std::format("{:012x}{:016x}", now_ms, rnd);
+}
+
 inline constexpr std::string_view kDagRunSeparator = "__";
 } // namespace detail
 

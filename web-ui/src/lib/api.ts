@@ -5,6 +5,17 @@ export interface TaskConfig {
     task_id: string;
     name: string;
     command: string;
+    executor: 'shell' | 'docker' | 'sensor' | 'noop';
+    sensor_type: '' | 'file' | 'http' | 'command';
+    sensor_target: string;
+    execution_timeout_sec: number;
+    retry_interval_sec: number;
+    max_retries: number;
+    trigger_rule: string;
+    is_branch: boolean;
+    depends_on_past: boolean;
+    xcom_push_count: number;
+    xcom_pull_count: number;
     dependencies: TaskDependency[];
 }
 
@@ -137,11 +148,12 @@ export interface RunRecord {
 
 export interface TaskRunRecord {
     task_id: string;
-    state: 'pending' | 'running' | 'success' | 'failed' | 'upstream_failed' | 'retrying' | 'skipped';
+    state: 'pending' | 'ready' | 'running' | 'success' | 'failed' | 'upstream_failed' | 'retrying' | 'skipped';
     attempt: number;
     started_at: string;
     finished_at: string;
     exit_code: number;
+    duration_ms: number;
     error: string;
 }
 
@@ -180,6 +192,19 @@ export interface RunTasksResponse {
     tasks: TaskRunRecord[];
 }
 
+export interface TaskLogEntry {
+    task_id: string;
+    attempt: number;
+    stream: string;
+    logged_at: string;
+    content: string;
+}
+
+export interface RunLogsResponse {
+    dag_run_id: string;
+    logs: TaskLogEntry[];
+}
+
 export async function getTaskXCom(runId: string, taskId: string): Promise<TaskXComResponse> {
     const response = await fetch(`${API_BASE}/runs/${runId}/tasks/${taskId}/xcom`);
     return handleResponse<TaskXComResponse>(response);
@@ -194,4 +219,11 @@ export async function getRunTasks(runId: string): Promise<TaskRunRecord[]> {
     const response = await fetch(`${API_BASE}/runs/${runId}/tasks`);
     const data = await handleResponse<RunTasksResponse>(response);
     return data.tasks;
+}
+
+export async function getRunLogs(runId: string, limit: number = 10000): Promise<TaskLogEntry[]> {
+    const suffix = limit === 10000 ? '' : `?limit=${limit}`;
+    const response = await fetch(`${API_BASE}/runs/${runId}/logs${suffix}`);
+    const data = await handleResponse<RunLogsResponse>(response);
+    return data.logs;
 }

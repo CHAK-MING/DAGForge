@@ -1,11 +1,11 @@
 // bench_config_parse.cpp
 //
 // Keep benchmark payload generation outside the hot loop and only measure
-// TOML parse + hydration through DAGDefinitionLoader.
+// TOML parse + hydration through DAGInfoLoader.
 
-#include "dagforge/config/dag_definition.hpp"
+#include "dagforge/config/dag_info_loader.hpp"
 
-#include <benchmark/benchmark.h>
+#include "benchmark_compat.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -42,7 +42,7 @@ void BM_ConfigParseDagToml(benchmark::State &state) {
   const auto toml = make_dag_toml(task_count);
 
   for (auto _ : state) {
-    auto parsed = DAGDefinitionLoader::load_from_string(toml);
+    auto parsed = DAGInfoLoader::load_from_string(toml);
     if (!parsed) {
       state.SkipWithError(parsed.error().message().c_str());
       return;

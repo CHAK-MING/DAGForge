@@ -1,14 +1,17 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/core/error.hpp"
+#endif
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include <charconv>
 #include <concepts>
 #include <string_view>
+#endif
 
 namespace dagforge::util {
 
-// Safe parse integer from string_view (wrapper for from_chars)
 template <std::integral T>
 [[nodiscard]] inline auto parse_int(std::string_view s, int base = 10)
     -> Result<T> {

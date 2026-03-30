@@ -1,6 +1,6 @@
 #include "dagforge/app/application.hpp"
 #include "dagforge/cli/commands.hpp"
-#include "dagforge/config/config.hpp"
+#include "dagforge/cli/context.hpp"
 #include "dagforge/util/daemon.hpp"
 #include "dagforge/util/json.hpp"
 #include "dagforge/util/log.hpp"
@@ -12,34 +12,8 @@
 #include <print>
 #include <string>
 
+
 namespace dagforge::cli {
-namespace {
-
-auto resolve_pid_file(const Config &config,
-                      const std::optional<std::string> &override_pid_file)
-    -> std::string {
-  if (override_pid_file.has_value() && !override_pid_file->empty()) {
-    return *override_pid_file;
-  }
-  if (!config.scheduler.pid_file.empty()) {
-    return config.scheduler.pid_file;
-  }
-  if (const char *env = std::getenv("DAGFORGE_PID_FILE"); env && *env) {
-    return env;
-  }
-  return "/tmp/dagforge.pid";
-}
-
-auto load_config_or_print(std::string_view path) -> Result<Config> {
-  return ConfigLoader::load_from_file(path).or_else(
-      [&](std::error_code ec) -> Result<Config> {
-        std::println(stderr, "Error: {}", ec.message());
-        return fail(ec);
-      });
-}
-
-} // namespace
-
 auto cmd_serve_start(const ServeStartOptions &opts) -> int {
   auto config_res = load_config_or_print(opts.config_file);
   if (!config_res) {

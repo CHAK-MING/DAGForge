@@ -1,9 +1,10 @@
 #include "dagforge/app/application.hpp"
 #include "dagforge/cli/commands.hpp"
+#include "dagforge/cli/context.hpp"
 #include "dagforge/cli/formatting.hpp"
 #include "dagforge/cli/management_client.hpp"
 #include "dagforge/client/http/http_client.hpp"
-#include "dagforge/config/config.hpp"
+#include "dagforge/config/system_config_loader.hpp"
 #include "dagforge/util/json.hpp"
 #include "dagforge/util/log.hpp"
 #include "dagforge/util/url.hpp"
@@ -16,14 +17,15 @@
 #include <sstream>
 #include <thread>
 
+
 namespace dagforge::cli {
 
 namespace {
 
 template <typename T>
-auto run_async(boost::asio::io_context &io, task<T> op) -> T {
+auto run_async(io::IoContext &io, task<T> op) -> T {
   auto fut = boost::asio::co_spawn(io, std::move(op), boost::asio::use_future);
-  io.run();
+  (void)io.run();
   io.restart();
   return fut.get();
 }
@@ -84,14 +86,14 @@ auto is_terminal(DAGRunState state) -> bool {
          state == DAGRunState::Skipped || state == DAGRunState::Cancelled;
 }
 
-auto trigger_via_running_service(const Config &config,
+auto trigger_via_running_service(const SystemConfig &config,
                                  const TriggerOptions &opts)
     -> std::optional<int> {
   if (!config.api.enabled || opts.no_api) {
     return std::nullopt;
   }
 
-  boost::asio::io_context io;
+  io::IoContext io;
   auto client_res = run_async(
       io, http::HttpClient::connect_tcp(io, config.api.host, config.api.port));
   if (!client_res) {
@@ -186,11 +188,7 @@ auto trigger_via_running_service(const Config &config,
 auto cmd_trigger(const TriggerOptions &opts) -> int {
   log::set_output_stderr();
 
-  auto config_res = ConfigLoader::load_from_file(opts.config_file)
-                        .or_else([&](std::error_code ec) -> Result<Config> {
-                          std::println(stderr, "Error: {}", ec.message());
-                          return fail(ec);
-                        });
+  auto config_res = load_config_or_print(opts.config_file);
   if (!config_res) {
     log::stop();
     return 1;

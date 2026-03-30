@@ -1,151 +1,30 @@
 #pragma once
 
-#include "dagforge/core/memory.hpp"
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/core/error.hpp"
 #include "dagforge/core/runtime.hpp"
-#include "dagforge/util/enum.hpp"
+#include "dagforge/executor/executor_types.hpp"
 #include "dagforge/util/id.hpp"
+#endif
 #include "dagforge/util/log.hpp"
+
 #include <atomic>
 #include <chrono>
-#include <cstdint>
-#include <flat_map>
 #include <functional>
 #include <memory>
 #include <optional>
-#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
 #include <boost/asio/async_result.hpp>
-#include <boost/describe/enum.hpp>
 
 namespace dagforge {
 
 struct TaskConfig;
 
-enum class ExecutorType : std::uint8_t {
-  Shell,
-  Docker,
-  Sensor,
-  Noop,
-};
-BOOST_DESCRIBE_ENUM(ExecutorType, Shell, Docker, Sensor, Noop)
-
-enum class ImagePullPolicy : std::uint8_t {
-  Never,
-  IfNotPresent,
-  Always,
-};
-BOOST_DESCRIBE_ENUM(ImagePullPolicy, Never, IfNotPresent, Always)
-DAGFORGE_DEFINE_ENUM_SERDE(ExecutorType, ExecutorType::Shell)
-DAGFORGE_DEFINE_ENUM_SERDE(ImagePullPolicy, ImagePullPolicy::Never)
-
-struct ShellExecutorConfig {
-  std::string command;
-  std::string working_dir;
-  std::chrono::seconds execution_timeout{std::chrono::seconds(3600)};
-  std::flat_map<std::string, std::string> env;
-};
-
-struct DockerExecutorConfig {
-  std::string image;
-  std::string command;
-  std::string working_dir;
-  std::chrono::seconds execution_timeout{std::chrono::seconds(3600)};
-  std::flat_map<std::string, std::string> env;
-  std::string docker_socket{"/var/run/docker.sock"};
-  ImagePullPolicy pull_policy{ImagePullPolicy::Never};
-};
-
-enum class SensorType : std::uint8_t {
-  File,
-  Http,
-  Command,
-};
-BOOST_DESCRIBE_ENUM(SensorType, File, Http, Command)
-DAGFORGE_DEFINE_ENUM_SERDE(SensorType, SensorType::File)
-
-struct SensorExecutorConfig {
-  SensorType type{SensorType::File};
-  std::string target;
-  std::chrono::seconds poke_interval{std::chrono::seconds(30)};
-  std::chrono::seconds execution_timeout{std::chrono::seconds(3600)};
-  bool soft_fail{false};
-  int expected_status{200};
-  std::string http_method{"GET"};
-};
-
-struct NoopExecutorConfig {
-  int exit_code{0};
-};
-
-template <typename T> struct ExecutorConfigTraits;
-
-template <> struct ExecutorConfigTraits<ShellExecutorConfig> {
-  static constexpr ExecutorType type = ExecutorType::Shell;
-};
-
-template <> struct ExecutorConfigTraits<DockerExecutorConfig> {
-  static constexpr ExecutorType type = ExecutorType::Docker;
-};
-
-template <> struct ExecutorConfigTraits<SensorExecutorConfig> {
-  static constexpr ExecutorType type = ExecutorType::Sensor;
-};
-
-template <> struct ExecutorConfigTraits<NoopExecutorConfig> {
-  static constexpr ExecutorType type = ExecutorType::Noop;
-};
-
-class ExecutorConfig {
-public:
-  ExecutorConfig() : ExecutorConfig(ShellExecutorConfig{}) {}
-
-  template <typename T>
-  ExecutorConfig(T value)
-      : payload_(std::make_shared<Model<T>>(std::move(value))) {}
-
-  template <typename T> auto operator=(T value) -> ExecutorConfig & {
-    payload_ = std::make_shared<Model<T>>(std::move(value));
-    return *this;
-  }
-
-  [[nodiscard]] auto type() const noexcept -> ExecutorType {
-    return payload_ != nullptr ? payload_->type() : ExecutorType::Shell;
-  }
-
-  template <typename T> [[nodiscard]] auto as() noexcept -> T * {
-    auto *model = dynamic_cast<Model<T> *>(payload_.get());
-    return model != nullptr ? &model->value : nullptr;
-  }
-
-  template <typename T> [[nodiscard]] auto as() const noexcept -> const T * {
-    auto *model = dynamic_cast<const Model<T> *>(payload_.get());
-    return model != nullptr ? &model->value : nullptr;
-  }
-
-private:
-  struct Concept {
-    virtual ~Concept() = default;
-    [[nodiscard]] virtual auto type() const noexcept -> ExecutorType = 0;
-  };
-
-  template <typename T> struct Model final : Concept {
-    explicit Model(T value_) : value(std::move(value_)) {}
-    [[nodiscard]] auto type() const noexcept -> ExecutorType override {
-      return ExecutorConfigTraits<T>::type;
-    }
-    T value;
-  };
-
-  std::shared_ptr<Concept> payload_;
-};
-
-inline constexpr int kExitCodeTimeout = 124;
-inline constexpr int kExitCodeSkip = 100;
-inline constexpr int kExitCodeImmediateFail = 101;
+using ExecutorHeartbeatCallback =
+    std::move_only_function<void(const InstanceId &instance_id)>;
 
 struct ExecutorResult {
   int exit_code{0};
@@ -169,6 +48,9 @@ struct ExecutorResult {
 
 struct ExecutorRequest {
   InstanceId instance_id;
+  std::string command;
+  std::string working_dir;
+  std::chrono::seconds execution_timeout{std::chrono::seconds(3600)};
   ExecutorConfig config;
   std::shared_ptr<pmr::memory_resource> memory_resource;
 
@@ -179,6 +61,7 @@ struct ExecutorRequest {
 };
 
 struct ExecutionSink {
+  ExecutorHeartbeatCallback on_heartbeat;
   std::move_only_function<void(const InstanceId &instance_id,
                                std::string_view message)>
       on_state;
@@ -279,61 +162,87 @@ auto log_result_error(const Result<T> &result,
 }
 
 inline auto execute_async(Runtime & /*runtime*/, IExecutor &executor,
+                          ExecutorRequest req,
+                          std::shared_ptr<pmr::memory_resource>
+                              memory_resource = {},
+                          std::move_only_function<void(std::string_view)>
+                              on_stdout = {},
+                          std::move_only_function<void(std::string_view)>
+                              on_stderr = {},
+                          ExecutorHeartbeatCallback on_heartbeat = {})
+    -> task<ExecutorResult> {
+  req.memory_resource = std::move(memory_resource);
+
+  return boost::asio::async_initiate<const boost::asio::use_awaitable_t<>,
+                                     void(ExecutorResult)>(
+      [&executor, req = std::move(req), on_stdout = std::move(on_stdout),
+       on_stderr = std::move(on_stderr),
+       on_heartbeat = std::move(on_heartbeat)](auto handler) mutable {
+        ExecutionSink sink;
+        // Capture handler by shared_ptr so we can call it on start failure too.
+        auto shared_h = std::make_shared<decltype(handler)>(std::move(handler));
+        auto *resource = req.resource();
+        if (on_stdout) {
+          sink.on_stdout =
+              [cb = std::move(on_stdout)](const InstanceId &,
+                                          std::string_view data) mutable {
+                cb(data);
+              };
+        }
+        if (on_stderr) {
+          sink.on_stderr =
+              [cb = std::move(on_stderr)](const InstanceId &,
+                                          std::string_view data) mutable {
+                cb(data);
+              };
+        }
+        if (on_heartbeat) {
+          sink.on_heartbeat =
+              [cb = std::move(on_heartbeat)](const InstanceId &id) mutable {
+                cb(id);
+              };
+        }
+        sink.on_complete = [shared_h](const InstanceId &,
+                                      ExecutorResult res) mutable {
+          std::move(*shared_h)(std::move(res));
+        };
+
+        auto start_res = executor.start(std::move(req), std::move(sink));
+        if (!start_res) {
+          // start() failed before scheduling; on_complete will never fire.
+          ExecutorResult err_result = make_executor_result(resource);
+          err_result.exit_code = 1;
+          err_result.error =
+              pmr::string(start_res.error().message(), resource);
+          std::move(*shared_h)(std::move(err_result));
+        }
+      },
+      boost::asio::use_awaitable);
+}
+
+inline auto execute_async(Runtime &runtime, IExecutor &executor,
                           InstanceId instance_id, ExecutorConfig config,
                           std::shared_ptr<pmr::memory_resource>
                               memory_resource = {},
                           std::move_only_function<void(std::string_view)>
                               on_stdout = {},
                           std::move_only_function<void(std::string_view)>
-                              on_stderr = {})
+                              on_stderr = {},
+                          ExecutorHeartbeatCallback on_heartbeat = {},
+                          std::string command = {},
+                          std::string working_dir = {},
+                          std::chrono::seconds execution_timeout =
+                              std::chrono::seconds(3600))
     -> task<ExecutorResult> {
-  ExecutorRequest req{.instance_id = std::move(instance_id),
-                      .config = std::move(config),
-                      .memory_resource = std::move(memory_resource)};
-
-  auto result =
-      co_await boost::asio::async_initiate<const boost::asio::use_awaitable_t<>,
-                                           void(ExecutorResult)>(
-          [&executor, req = std::move(req), on_stdout = std::move(on_stdout),
-           on_stderr = std::move(on_stderr)](auto handler) mutable {
-            ExecutionSink sink;
-            // Capture handler by shared_ptr so we can call it on start failure
-            // too.
-            auto shared_h =
-                std::make_shared<decltype(handler)>(std::move(handler));
-            auto *resource = req.resource();
-            if (on_stdout) {
-              sink.on_stdout =
-                  [cb = std::move(on_stdout)](const InstanceId &,
-                                              std::string_view data) mutable {
-                    cb(data);
-                  };
-            }
-            if (on_stderr) {
-              sink.on_stderr =
-                  [cb = std::move(on_stderr)](const InstanceId &,
-                                              std::string_view data) mutable {
-                    cb(data);
-                  };
-            }
-            sink.on_complete = [shared_h](const InstanceId &,
-                                          ExecutorResult res) mutable {
-              std::move (*shared_h)(std::move(res));
-            };
-
-            auto start_res = executor.start(std::move(req), std::move(sink));
-            if (!start_res) {
-              // start() failed before scheduling; on_complete will never fire.
-              ExecutorResult err_result = make_executor_result(resource);
-              err_result.exit_code = 1;
-              err_result.error =
-                  pmr::string(start_res.error().message(), resource);
-              std::move (*shared_h)(std::move(err_result));
-            }
-          },
-          boost::asio::use_awaitable);
-
-  co_return result;
+  return execute_async(runtime, executor,
+                       ExecutorRequest{.instance_id = std::move(instance_id),
+                                       .command = std::move(command),
+                                       .working_dir = std::move(working_dir),
+                                       .execution_timeout = execution_timeout,
+                                       .config = std::move(config),
+                                       .memory_resource = {}},
+                       std::move(memory_resource), std::move(on_stdout),
+                       std::move(on_stderr), std::move(on_heartbeat));
 }
 
 } // namespace dagforge

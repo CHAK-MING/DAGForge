@@ -1,55 +1,17 @@
 #include "dagforge/executor/executor.hpp"
-
+#include "dagforge/executor/executor_dto.hpp"
 #include "dagforge/config/task_config.hpp"
 #include "dagforge/util/log.hpp"
 
+
 #include <glaze/json.hpp>
 
-namespace dagforge::executor_dto {
-
-struct SensorExecutorConfigJson {
-  std::string type;
-  std::string target;
-  std::int64_t poke_interval{30};
-  bool soft_fail{false};
-  std::int64_t expected_status{200};
-  std::string http_method{"GET"};
-};
-
-struct DockerExecutorConfigJson {
-  std::string image;
-  std::string socket{"/var/run/docker.sock"};
-  std::string pull_policy;
-};
-
-} // namespace dagforge::executor_dto
-
-namespace glz {
-
-template <> struct meta<dagforge::executor_dto::SensorExecutorConfigJson> {
-  using T = dagforge::executor_dto::SensorExecutorConfigJson;
-  static constexpr auto value =
-      object("type", &T::type, "target", &T::target, "poke_interval",
-             &T::poke_interval, "soft_fail", &T::soft_fail, "expected_status",
-             &T::expected_status, "http_method", &T::http_method);
-};
-
-template <> struct meta<dagforge::executor_dto::DockerExecutorConfigJson> {
-  using T = dagforge::executor_dto::DockerExecutorConfigJson;
-  static constexpr auto value = object("image", &T::image, "socket", &T::socket,
-                                       "pull_policy", &T::pull_policy);
-};
-
-} // namespace glz
 
 namespace dagforge {
 namespace {
 
 auto build_shell_config(const TaskConfig &task) -> Result<ExecutorConfig> {
   ShellExecutorConfig exec;
-  exec.command = task.command;
-  exec.working_dir = task.working_dir;
-  exec.execution_timeout = task.execution_timeout;
   return ok(ExecutorConfig{std::move(exec)});
 }
 
@@ -59,16 +21,13 @@ auto build_docker_config(const TaskConfig &task) -> Result<ExecutorConfig> {
     exec.image = docker_cfg->image;
     exec.docker_socket = docker_cfg->docker_socket;
     exec.pull_policy = docker_cfg->pull_policy;
+    exec.env = docker_cfg->env;
   }
-  exec.command = task.command;
-  exec.working_dir = task.working_dir;
-  exec.execution_timeout = task.execution_timeout;
   return ok(ExecutorConfig{std::move(exec)});
 }
 
 auto build_sensor_config(const TaskConfig &task) -> Result<ExecutorConfig> {
   SensorExecutorConfig exec;
-  exec.execution_timeout = task.execution_timeout;
   if (const auto *sensor_cfg = task.executor_config.as<SensorExecutorConfig>()) {
     exec.type = sensor_cfg->type;
     exec.target = sensor_cfg->target;
@@ -203,7 +162,15 @@ auto parse_sensor_config(std::string_view input) -> Result<ExecutorConfig> {
 auto validate_sensor_task(const TaskConfig &task, std::vector<std::string> &errors)
     -> void {
   const auto *sensor = task.executor_config.as<SensorExecutorConfig>();
-  if (sensor != nullptr && sensor->target.empty()) {
+  if (sensor == nullptr) {
+    return;
+  }
+  if (!task.command.empty()) {
+    errors.emplace_back(std::format(
+        "Task '{}': command is not allowed for sensor tasks; use target",
+        task.task_id));
+  }
+  if (sensor->target.empty()) {
     errors.emplace_back(
         std::format("Task '{}': sensor target cannot be empty", task.task_id));
   }

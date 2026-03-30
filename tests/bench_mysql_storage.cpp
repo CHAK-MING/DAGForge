@@ -17,8 +17,9 @@
 #include "dagforge/scheduler/task.hpp"
 #include "dagforge/storage/mysql_schema.hpp"
 #include "dagforge/util/enum.hpp"
+#include "dagforge/util/enum_mysql_formatter.hpp"
 
-#include <benchmark/benchmark.h>
+#include "benchmark_compat.hpp"
 
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/io_context.hpp>
@@ -85,7 +86,7 @@ using boost::asio::use_awaitable;
 /// Per-benchmark connection context.  Each benchmark function creates its own
 /// instance so there is no sharing across google-benchmark threads.
 struct ConnContext {
-  boost::asio::io_context io;
+  io::IoContext io;
   std::optional<boost::mysql::any_connection> conn;
   DatabaseConfig cfg{load_db_config()};
 

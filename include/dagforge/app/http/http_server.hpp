@@ -1,15 +1,20 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/app/http/websocket.hpp"
 #include "dagforge/client/http/http_types.hpp"
-#include "dagforge/core/coroutine.hpp"
 #include "dagforge/core/error.hpp"
+#endif
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
+#include "dagforge/core/coroutine.hpp"
+#endif
 
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
+
 
 namespace dagforge {
 class Runtime;

@@ -139,7 +139,7 @@ mkdir -p "$DAG_DIR" "$OUT_DIR"
 cleanup() {
   set +e
   if [[ -f "$RUN_DIR/config.toml" ]]; then
-    "$ROOT_DIR/build/bin/dagforge" serve stop -c "$RUN_DIR/config.toml" >/dev/null 2>&1 || true
+    "$ROOT_DIR/bin/dagforge" serve stop -c "$RUN_DIR/config.toml" >/dev/null 2>&1 || true
   fi
   if [[ "$KEEP_WORK_DIR" -eq 0 ]]; then
     rm -rf "$WORK_ROOT"
@@ -211,7 +211,7 @@ cfg_path.write_text(text)
 PY
 
 SERVER_LOG="$RUN_DIR/server.log"
-"$ROOT_DIR/build/bin/dagforge" serve start -c "$RUN_DIR/config.toml" --log-level "$LOG_LEVEL" >"$SERVER_LOG" 2>&1 &
+"$ROOT_DIR/bin/dagforge" serve start -c "$RUN_DIR/config.toml" --log-level "$LOG_LEVEL" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
 for _ in $(seq 1 100); do

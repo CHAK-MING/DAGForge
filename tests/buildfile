@@ -1,0 +1,12 @@
+./: ../bin/exe{modules-foundation-smoke} \
+    ../bin/exe{core-unit-tests}          \
+    ../bin/exe{unit-domain-tests}        \
+    ../bin/exe{unit-runtime-tests}       \
+    ../bin/exe{unit-storage-tests}       \
+    ../bin/exe{unit-api-tests}           \
+    ../bin/exe{unit-e2e-tests}           \
+    ../bin/exe{all-unit-tests}           \
+    ../bin/exe{bench-core}               \
+    ../bin/exe{bench-storage}            \
+    ../bin/exe{bench-app}                \
+    ../bin/exe{all-benchmarks}

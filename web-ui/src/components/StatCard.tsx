@@ -1,13 +1,14 @@
 import { LucideIcon } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
+import { useI18n } from "@/contexts/I18nContext";
 
 interface StatCardProps {
     title: string;
-    value: string | number;
+    metricValue: string | number;
     icon: LucideIcon;
     trend?: {
-        value: number;
+        trendValue: number;
         isPositive: boolean;
     };
     variant?: "default" | "success" | "warning" | "destructive";
@@ -20,7 +21,8 @@ const variantStyles = {
     destructive: "bg-destructive/10 text-destructive",
 };
 
-export function StatCard({ title, value, icon: Icon, trend, variant = "default" }: StatCardProps) {
+export function StatCard({ title, metricValue: value, icon: Icon, trend, variant = "default" }: StatCardProps) {
+    const { t } = useI18n();
     return (
         <Card className="overflow-hidden bg-card/50 backdrop-blur supports-[backdrop-filter]:bg-background/50 transition-all duration-300 hover:shadow-lg hover:border-primary/30 transform hover:-translate-y-1">
             <CardContent className="p-6">
@@ -36,9 +38,9 @@ export function StatCard({ title, value, icon: Icon, trend, variant = "default" 
                                         trend.isPositive ? "text-success" : "text-destructive"
                                     )}
                                 >
-                                    {trend.isPositive ? "↑" : "↓"} {Math.abs(trend.value)}%
+                                    {trend.isPositive ? "↑" : "↓"} {Math.abs(trend.trendValue)}%
                                 </span>
-                                <span className="text-xs text-muted-foreground">vs 昨日</span>
+                                <span className="text-xs text-muted-foreground">{t.dashboard.vsYesterday}</span>
                             </div>
                         )}
                     </div>

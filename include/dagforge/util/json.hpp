@@ -1,11 +1,18 @@
 #pragma once
 
+#if !defined(DAGFORGE_BUILDING_MODULE_INTERFACE) &&                              \
+    (!defined(DAGFORGE_CONSUME_NAMED_MODULES) ||                                \
+     !DAGFORGE_CONSUME_NAMED_MODULES)
 #include "dagforge/core/error.hpp"
+#endif
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include <glaze/json.hpp>
 
 #include <string>
 #include <string_view>
+#endif
+
 
 namespace dagforge {
 

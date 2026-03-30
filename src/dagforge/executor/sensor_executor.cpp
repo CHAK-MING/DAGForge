@@ -1,9 +1,4 @@
 #include "dagforge/client/http/http_client.hpp"
-#include "dagforge/client/http/http_types.hpp"
-#include "dagforge/core/asio_awaitable.hpp"
-#include "dagforge/core/coroutine.hpp"
-#include "dagforge/core/error.hpp"
-#include "dagforge/core/runtime.hpp"
 #include "dagforge/executor/executor.hpp"
 #include "dagforge/executor/executor_state.hpp"
 #include "dagforge/executor/process_launch.hpp"
@@ -14,8 +9,10 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/asio/cancel_after.hpp>
 #include <boost/process/v2/process.hpp>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <experimental/scope>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -29,6 +26,7 @@ namespace dagforge {
 namespace {
 
 namespace bp = boost::process::v2;
+inline constexpr auto kHeartbeatInterval = std::chrono::seconds(1);
 
 using SensorShardState = ExecutorShardState<ActiveProcess>;
 
@@ -84,6 +82,35 @@ auto make_result(pmr::memory_resource *resource) -> ExecutorResult {
   return make_executor_result(resource);
 }
 
+auto emit_heartbeat(
+    const std::shared_ptr<ExecutorHeartbeatCallback> &heartbeat_callback,
+    const InstanceId &instance_id) -> void {
+  if (heartbeat_callback && *heartbeat_callback) {
+    (*heartbeat_callback)(instance_id);
+  }
+}
+
+auto run_executor_heartbeat(
+    std::shared_ptr<ExecutorHeartbeatCallback> heartbeat_callback,
+    std::shared_ptr<std::atomic_bool> stop, InstanceId instance_id)
+    -> spawn_task {
+  if (!heartbeat_callback || !*heartbeat_callback) {
+    co_return;
+  }
+
+  while (!stop->load(std::memory_order_acquire)) {
+    try {
+      co_await async_sleep_on_timing_wheel(kHeartbeatInterval);
+    } catch (const std::exception &) {
+      co_return;
+    }
+    if (stop->load(std::memory_order_acquire)) {
+      co_return;
+    }
+    (*heartbeat_callback)(instance_id);
+  }
+}
+
 auto wait_for_command_exit(bp::process &proc,
                            std::chrono::steady_clock::duration timeout)
     -> task<ProcessWaitResult> {
@@ -98,11 +125,26 @@ auto wait_for_command_exit(bp::process &proc,
   co_return ProcessWaitResult{.error = ec};
 }
 
-auto run_file_sensor(SensorExecutorConfig config, InstanceId instance_id,
-                     ExecutionSink sink, SensorContext ctx,
-                     pmr::memory_resource *resource) -> spawn_task {
+auto run_file_sensor(Runtime &runtime, SensorExecutorConfig config,
+                     std::chrono::seconds execution_timeout,
+                     InstanceId instance_id, ExecutionSink sink,
+                     std::shared_ptr<ExecutorHeartbeatCallback>
+                         heartbeat_callback,
+                     SensorContext ctx,
+                     std::shared_ptr<pmr::memory_resource> resource_owner)
+    -> spawn_task {
+  auto *resource = resource_owner != nullptr ? resource_owner.get()
+                                             : current_memory_resource_or_default();
+  auto heartbeat_stop = std::make_shared<std::atomic_bool>(false);
+  std::experimental::scope_exit stop_heartbeat{
+      [heartbeat_stop] { heartbeat_stop->store(true, std::memory_order_release); }};
+  emit_heartbeat(heartbeat_callback, instance_id);
+  if (heartbeat_callback && *heartbeat_callback) {
+    runtime.spawn(run_executor_heartbeat(heartbeat_callback, heartbeat_stop,
+                                         instance_id.clone()));
+  }
   auto start_time = std::chrono::steady_clock::now();
-  auto deadline = start_time + config.execution_timeout;
+  auto deadline = start_time + execution_timeout;
 
   while (std::chrono::steady_clock::now() < deadline) {
     if (is_cancelled(instance_id, ctx)) {
@@ -129,7 +171,7 @@ auto run_file_sensor(SensorExecutorConfig config, InstanceId instance_id,
                 exists_res.error().message());
     }
 
-    co_await async_sleep(config.poke_interval);
+    co_await async_sleep_on_timing_wheel(config.poke_interval);
   }
 
   if (sink.on_complete) {
@@ -141,11 +183,26 @@ auto run_file_sensor(SensorExecutorConfig config, InstanceId instance_id,
   }
 }
 
-auto run_command_sensor(SensorExecutorConfig config, InstanceId instance_id,
-                        ExecutionSink sink, SensorContext ctx,
-                        pmr::memory_resource *resource) -> spawn_task {
+auto run_command_sensor(Runtime &runtime, SensorExecutorConfig config,
+                        std::chrono::seconds execution_timeout,
+                        InstanceId instance_id, ExecutionSink sink,
+                        std::shared_ptr<ExecutorHeartbeatCallback>
+                            heartbeat_callback,
+                        SensorContext ctx,
+                        std::shared_ptr<pmr::memory_resource> resource_owner)
+    -> spawn_task {
+  auto *resource = resource_owner != nullptr ? resource_owner.get()
+                                             : current_memory_resource_or_default();
+  auto heartbeat_stop = std::make_shared<std::atomic_bool>(false);
+  std::experimental::scope_exit stop_heartbeat{
+      [heartbeat_stop] { heartbeat_stop->store(true, std::memory_order_release); }};
+  emit_heartbeat(heartbeat_callback, instance_id);
+  if (heartbeat_callback && *heartbeat_callback) {
+    runtime.spawn(run_executor_heartbeat(heartbeat_callback, heartbeat_stop,
+                                         instance_id.clone()));
+  }
   auto start_time = std::chrono::steady_clock::now();
-  auto deadline = start_time + config.execution_timeout;
+  auto deadline = start_time + execution_timeout;
 
   while (std::chrono::steady_clock::now() < deadline) {
     if (is_cancelled(instance_id, ctx)) {
@@ -219,7 +276,7 @@ auto run_command_sensor(SensorExecutorConfig config, InstanceId instance_id,
       co_return;
     }
 
-    co_await async_sleep(config.poke_interval);
+    co_await async_sleep_on_timing_wheel(config.poke_interval);
   }
 
   if (sink.on_complete) {
@@ -232,11 +289,26 @@ auto run_command_sensor(SensorExecutorConfig config, InstanceId instance_id,
   }
 }
 
-auto run_http_sensor(SensorExecutorConfig config, InstanceId instance_id,
-                     ExecutionSink sink, SensorContext ctx,
-                     pmr::memory_resource *resource) -> spawn_task {
+auto run_http_sensor(Runtime &runtime, SensorExecutorConfig config,
+                     std::chrono::seconds execution_timeout,
+                     InstanceId instance_id, ExecutionSink sink,
+                     std::shared_ptr<ExecutorHeartbeatCallback>
+                         heartbeat_callback,
+                     SensorContext ctx,
+                     std::shared_ptr<pmr::memory_resource> resource_owner)
+    -> spawn_task {
+  auto *resource = resource_owner != nullptr ? resource_owner.get()
+                                             : current_memory_resource_or_default();
+  auto heartbeat_stop = std::make_shared<std::atomic_bool>(false);
+  std::experimental::scope_exit stop_heartbeat{
+      [heartbeat_stop] { heartbeat_stop->store(true, std::memory_order_release); }};
+  emit_heartbeat(heartbeat_callback, instance_id);
+  if (heartbeat_callback && *heartbeat_callback) {
+    runtime.spawn(run_executor_heartbeat(heartbeat_callback, heartbeat_stop,
+                                         instance_id.clone()));
+  }
   auto start_time = std::chrono::steady_clock::now();
-  auto deadline = start_time + config.execution_timeout;
+  auto deadline = start_time + execution_timeout;
 
   auto parsed_res = util::parse_http_url(config.target);
   if (!parsed_res) {
@@ -278,7 +350,7 @@ auto run_http_sensor(SensorExecutorConfig config, InstanceId instance_id,
       if (!client_res) {
         log::debug("HTTP sensor connection failed for {}: {}, retrying...",
                    config.target, client_res.error().message());
-        co_await async_sleep(std::chrono::milliseconds(100));
+        co_await async_sleep_on_timing_wheel(std::chrono::milliseconds(100));
         continue;
       }
       client = std::move(*client_res);
@@ -314,7 +386,7 @@ auto run_http_sensor(SensorExecutorConfig config, InstanceId instance_id,
       co_return;
     }
 
-    co_await async_sleep(config.poke_interval);
+    co_await async_sleep_on_timing_wheel(config.poke_interval);
   }
 
   if (sink.on_complete) {
@@ -338,30 +410,43 @@ public:
     if (!config) {
       return fail(Error::InvalidArgument);
     }
+    auto resource_owner = req.memory_resource;
 
-    log::info("SensorExecutor start: instance_id={} type={} target={}",
-              req.instance_id,
-              config->type == SensorType::File   ? "file"
-              : config->type == SensorType::Http ? "http"
-                                                 : "command",
-              config->target);
+    log::debug("SensorExecutor start: instance_id={} type={} target={}",
+               req.instance_id,
+               config->type == SensorType::File   ? "file"
+               : config->type == SensorType::Http ? "http"
+                                                  : "command",
+               config->target);
 
     auto sid = runtime_->is_current_shard() ? runtime_->current_shard() : 0;
+    std::shared_ptr<ExecutorHeartbeatCallback> heartbeat_callback;
+    if (sink.on_heartbeat) {
+      heartbeat_callback = std::make_shared<ExecutorHeartbeatCallback>(
+          std::move(sink.on_heartbeat));
+    }
     SensorContext ctx{.state = &shard_states_[sid]};
     switch (config->type) {
     case SensorType::File: {
-      runtime_->spawn(run_file_sensor(*config, req.instance_id, std::move(sink),
-                                      ctx, req.resource()));
+      runtime_->spawn(run_file_sensor(*runtime_, *config, req.execution_timeout,
+                                      req.instance_id,
+                                      std::move(sink), heartbeat_callback, ctx,
+                                      resource_owner));
       break;
     }
     case SensorType::Http: {
-      runtime_->spawn(run_http_sensor(*config, req.instance_id, std::move(sink),
-                                      ctx, req.resource()));
+      runtime_->spawn(run_http_sensor(*runtime_, *config,
+                                      req.execution_timeout, req.instance_id,
+                                      std::move(sink), heartbeat_callback, ctx,
+                                      resource_owner));
       break;
     }
     case SensorType::Command: {
-      runtime_->spawn(run_command_sensor(*config, req.instance_id,
-                                         std::move(sink), ctx, req.resource()));
+      runtime_->spawn(run_command_sensor(*runtime_, *config,
+                                         req.execution_timeout,
+                                         req.instance_id,
+                                         std::move(sink), heartbeat_callback,
+                                         ctx, resource_owner));
       break;
     }
     }
@@ -376,7 +461,8 @@ public:
                            if (it != state.active_end() && it->second.pid > 0) {
                              kill_process_group_or_process(it->second.pid);
                            }
-                           log::info("SensorExecutor cancel: instance_id={}", id);
+                           log::debug("SensorExecutor cancel: instance_id={}",
+                                      id);
                          });
   }
 

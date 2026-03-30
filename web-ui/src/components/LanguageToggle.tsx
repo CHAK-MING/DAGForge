@@ -9,22 +9,22 @@ import { Languages } from "lucide-react";
 import { useI18n } from "@/contexts/I18nContext";
 
 export function LanguageToggle() {
-  const { locale, setLocale } = useI18n();
+  const { locale, setLocale, t } = useI18n();
 
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <Button variant="outline" size="icon">
           <Languages className="h-[1.2rem] w-[1.2rem]" />
-          <span className="sr-only">Toggle language</span>
+          <span className="sr-only">{t.settings.language}</span>
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end">
         <DropdownMenuItem onClick={() => setLocale("zh")}>
-          <span className={locale === "zh" ? "font-bold" : ""}>中文</span>
+          <span className={locale === "zh" ? "font-bold" : ""}>{t.settings.zh}</span>
         </DropdownMenuItem>
         <DropdownMenuItem onClick={() => setLocale("en")}>
-          <span className={locale === "en" ? "font-bold" : ""}>English</span>
+          <span className={locale === "en" ? "font-bold" : ""}>{t.settings.en}</span>
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

@@ -1,13 +1,12 @@
 #include "dagforge/app/services/persistence_service.hpp"
+#include "dagforge/cli/management_client.hpp"
 #include "dagforge/config/task_config.hpp"
 #include "dagforge/core/runtime.hpp"
+#include "fixtures/test_fixture.hpp"
 #include "test_utils.hpp"
 
 #include <gtest/gtest.h>
 
-#include <atomic>
-#include <cstdlib>
-#include <format>
 #include <memory>
 #include <string>
 #include <thread>
@@ -15,97 +14,8 @@
 using namespace dagforge;
 using namespace dagforge::test;
 
-namespace {
-
-auto env_or_default(const char *key, std::string fallback) -> std::string {
-  if (const char *v = std::getenv(key); v && *v != '\0') {
-    return v;
-  }
-  return fallback;
-}
-
-auto load_test_db_config() -> DatabaseConfig {
-  DatabaseConfig cfg;
-  cfg.host = env_or_default("DAGFORGE_TEST_MYSQL_HOST", cfg.host);
-  cfg.username = env_or_default("DAGFORGE_TEST_MYSQL_USER", cfg.username);
-  cfg.password = env_or_default("DAGFORGE_TEST_MYSQL_PASSWORD", cfg.password);
-  cfg.database = env_or_default("DAGFORGE_TEST_MYSQL_DB", cfg.database);
-  cfg.connect_timeout = 2;
-  return cfg;
-}
-
-} // namespace
-
-class PersistenceTest : public ::testing::Test {
+class PersistenceTest : public dagforge::test::DatabaseTest {
 protected:
-  struct PersistedDag {
-    DAGId dag_id;
-    TaskId task_id;
-    int64_t dag_rowid{0};
-    int64_t task_rowid{0};
-  };
-
-  void SetUp() override {
-    ASSERT_TRUE(runtime_.start().has_value());
-    service_ =
-        std::make_unique<PersistenceService>(runtime_, load_test_db_config());
-    auto open_res = run_coro(service_->open());
-    if (!open_res) {
-      GTEST_SKIP() << "MySQL unavailable for persistence tests: "
-                   << open_res.error().message();
-    }
-    db_ready_ = true;
-    auto clear_res = run_coro(service_->clear_all_dag_data());
-    ASSERT_TRUE(clear_res.has_value()) << clear_res.error().message();
-  }
-
-  void TearDown() override {
-    if (service_ && db_ready_) {
-      auto clear_res = run_coro(service_->clear_all_dag_data());
-      EXPECT_TRUE(clear_res.has_value());
-      run_coro(service_->close());
-    }
-    service_.reset();
-    runtime_.stop();
-  }
-
-  auto unique_token(std::string_view base) const -> std::string {
-    static std::atomic<std::uint64_t> seq{0};
-    const auto n = seq.fetch_add(1, std::memory_order_relaxed);
-    const auto *info = ::testing::UnitTest::GetInstance()->current_test_info();
-    const auto test_name = info ? info->name() : "test";
-    return std::format("{}_{}_{}", base, test_name, n);
-  }
-
-  auto create_persisted_dag(const char *dag_name, const char *task_name)
-      -> PersistedDag {
-    PersistedDag out;
-    out.dag_id = DAGId(unique_token(dag_name));
-    out.task_id = TaskId(unique_token(task_name));
-
-    DAGInfo dag{};
-    dag.dag_id = out.dag_id;
-    dag.name = out.dag_id.str();
-    dag.created_at = std::chrono::system_clock::now();
-    dag.updated_at = dag.created_at;
-
-    auto dag_rowid = run_coro(service_->save_dag(dag));
-    EXPECT_TRUE(dag_rowid.has_value());
-    out.dag_rowid = dag_rowid.value_or(0);
-
-    auto task = TaskConfig::builder()
-                    .id(out.task_id.str())
-                    .name(out.task_id.str())
-                    .command("echo ok")
-                    .build();
-    EXPECT_TRUE(task.has_value());
-
-    auto task_rowid = run_coro(service_->save_task(out.dag_id, *task));
-    EXPECT_TRUE(task_rowid.has_value());
-    out.task_rowid = task_rowid.value_or(0);
-    return out;
-  }
-
   auto create_run(const DAGRunId &run_id, int64_t dag_rowid) -> Result<DAGRun> {
     auto graph = std::make_shared<DAG>();
     if (auto add = graph->add_node(TaskId{"task_1"}); !add) {
@@ -126,10 +36,76 @@ protected:
     return run;
   }
 
-  Runtime runtime_{1};
-  std::unique_ptr<PersistenceService> service_;
-  bool db_ready_{false};
 };
+
+class PersistenceSmallTaskUpdateQueueTest : public PersistenceTest {
+protected:
+  void SetUp() override {
+    ASSERT_TRUE(runtime_.start().has_value());
+    service_ = std::make_unique<PersistenceService>(
+        runtime_, load_test_db_config(), 4096, 1);
+    auto open_res = run_coro(service_->open());
+    if (!open_res) {
+      GTEST_SKIP() << "MySQL unavailable for persistence queue tests: "
+                   << open_res.error().message();
+    }
+    db_ready_ = true;
+    auto clear_res = run_coro(service_->clear_all_dag_data());
+    ASSERT_TRUE(clear_res.has_value()) << clear_res.error().message();
+  }
+};
+
+TEST(PersistenceServiceLifecycleTest,
+     ResetMysqlTestDatabaseDoesNotAbortOnOpenFailure) {
+  EXPECT_EXIT(
+      {
+        auto bad_cfg = load_test_db_config();
+        bad_cfg.username = "__dagforge_invalid_user__";
+        bad_cfg.password = "__dagforge_invalid_password__";
+        bad_cfg.database = unique_token("dagforge_invalid_db");
+        reset_mysql_test_database(bad_cfg);
+        std::_Exit(0);
+      },
+      ::testing::ExitedWithCode(0), "");
+}
+
+TEST(PersistenceServiceLifecycleTest,
+     FailedOpenDoesNotPoisonSubsequentFreshServiceOpen) {
+  auto bad_cfg = load_test_db_config();
+  bad_cfg.host = "127.0.0.1";
+  bad_cfg.port = pick_unused_tcp_port_or_zero();
+  ASSERT_NE(bad_cfg.port, 0);
+  bad_cfg.connect_timeout = 1;
+
+  Runtime bad_runtime(1);
+  ASSERT_TRUE(bad_runtime.start().has_value());
+  PersistenceService bad_service(bad_runtime, bad_cfg);
+
+  auto bad_open = run_coro(bad_service.open(), std::chrono::seconds(5));
+  ASSERT_FALSE(bad_open.has_value());
+  EXPECT_FALSE(bad_service.is_open());
+
+  bad_runtime.stop();
+
+  auto good_cfg = load_test_db_config();
+  Runtime good_runtime(1);
+  ASSERT_TRUE(good_runtime.start().has_value());
+  PersistenceService good_service(good_runtime, good_cfg);
+
+  auto good_open = run_coro(good_service.open(), std::chrono::seconds(10));
+  if (!good_open) {
+    GTEST_SKIP() << "MySQL unavailable for recovery lifecycle test: "
+                 << good_open.error().message();
+  }
+
+  EXPECT_TRUE(good_service.is_open());
+
+  auto dags = run_coro(good_service.list_dags());
+  EXPECT_TRUE(dags.has_value()) << dags.error().message();
+
+  run_coro(good_service.close());
+  good_runtime.stop();
+}
 
 TEST_F(PersistenceTest, SaveDagAndListDags_RealServicePath) {
   auto persisted = create_persisted_dag("persist_dag", "persist_task");
@@ -141,6 +117,24 @@ TEST_F(PersistenceTest, SaveDagAndListDags_RealServicePath) {
   ASSERT_FALSE(dags->empty());
   const auto it = std::ranges::find_if(
       *dags, [&](const DAGInfo &d) { return d.dag_id == persisted.dag_id; });
+  EXPECT_NE(it, dags->end());
+}
+
+TEST_F(PersistenceTest, CloseAndReopenRestoresDatabaseOperations) {
+  auto initial = create_persisted_dag("reopen_dag", "reopen_task");
+  ASSERT_GT(initial.dag_rowid, 0);
+
+  run_coro(service_->close());
+  EXPECT_FALSE(service_->is_open());
+
+  auto reopen = run_coro(service_->open(), std::chrono::seconds(10));
+  ASSERT_TRUE(reopen.has_value()) << reopen.error().message();
+  EXPECT_TRUE(service_->is_open());
+
+  auto dags = run_coro(service_->list_dags());
+  ASSERT_TRUE(dags.has_value()) << dags.error().message();
+  const auto it = std::ranges::find_if(
+      *dags, [&](const DAGInfo &d) { return d.dag_id == initial.dag_id; });
   EXPECT_NE(it, dags->end());
 }
 
@@ -161,6 +155,99 @@ TEST_F(PersistenceTest, SaveTaskInstance_NonexistentRun_ReturnsNotFound) {
       run_coro(service_->update_task_instance(DAGRunId("missing_run"), info));
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error(), Error::NotFound);
+}
+
+TEST_F(PersistenceTest,
+       SubmitTaskInstanceUpdate_EventuallyPersistsWithoutAwaitingReply) {
+  auto persisted =
+      create_persisted_dag("submit_update_dag", "submit_update_task");
+  ASSERT_GT(persisted.dag_rowid, 0);
+  ASSERT_GT(persisted.task_rowid, 0);
+
+  const DAGRunId run_id{unique_token("submit_update_run")};
+  auto run = create_run(run_id, persisted.dag_rowid);
+  ASSERT_TRUE(run.has_value());
+
+  TaskInstanceInfo initial{};
+  initial.task_rowid = persisted.task_rowid;
+  initial.attempt = 1;
+  initial.state = TaskState::Ready;
+
+  auto create_res = run_coro(service_->create_run_with_task_instances(
+      std::move(*run), std::vector<TaskInstanceInfo>{initial}));
+  ASSERT_TRUE(create_res.has_value());
+
+  auto tasks = run_coro(service_->get_task_instances(run_id));
+  ASSERT_TRUE(tasks.has_value());
+  ASSERT_EQ(tasks->size(), 1U);
+
+  auto updated = tasks->front();
+  updated.state = TaskState::Success;
+  updated.finished_at = std::chrono::system_clock::now();
+  updated.exit_code = 0;
+
+  service_->submit_task_instance_update(run_id, updated);
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  bool persisted_success = false;
+  while (std::chrono::steady_clock::now() < deadline) {
+    auto current = run_coro(service_->get_task_instances(run_id));
+    ASSERT_TRUE(current.has_value());
+    ASSERT_EQ(current->size(), 1U);
+    if (current->front().state == TaskState::Success) {
+      persisted_success = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  ASSERT_TRUE(persisted_success);
+}
+
+TEST_F(PersistenceSmallTaskUpdateQueueTest,
+       SubmitTaskInstanceUpdateBackpressureStaysOnBatchQueue) {
+  auto persisted =
+      create_persisted_dag("queued_update_dag", "queued_update_task");
+  ASSERT_GT(persisted.dag_rowid, 0);
+  ASSERT_GT(persisted.task_rowid, 0);
+
+  const DAGRunId run_id{unique_token("queued_update_run")};
+  auto run = create_run(run_id, persisted.dag_rowid);
+  ASSERT_TRUE(run.has_value());
+
+  TaskInstanceInfo initial{};
+  initial.task_rowid = persisted.task_rowid;
+  initial.attempt = 1;
+  initial.state = TaskState::Ready;
+
+  auto create_res = run_coro(service_->create_run_with_task_instances(
+      std::move(*run), std::vector<TaskInstanceInfo>{initial}));
+  ASSERT_TRUE(create_res.has_value());
+
+  auto tasks = run_coro(service_->get_task_instances(run_id));
+  ASSERT_TRUE(tasks.has_value());
+  ASSERT_EQ(tasks->size(), 1U);
+
+  auto updated = tasks->front();
+  updated.state = TaskState::Success;
+  updated.finished_at = std::chrono::system_clock::now();
+  updated.exit_code = 0;
+
+  for (int i = 0; i < 512; ++i) {
+    service_->submit_task_instance_update(run_id, updated);
+  }
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while ((service_->task_update_batch_requests_total() +
+          service_->task_update_batch_fallback_total()) < 512 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  EXPECT_GT(service_->task_update_batch_rejected_total(), 0U);
+  EXPECT_EQ(service_->task_update_batch_fallback_total(), 0U);
 }
 
 TEST_F(PersistenceTest, MarkIncompleteRunsFailed_RealServicePath) {
@@ -192,7 +279,7 @@ TEST_F(PersistenceTest, MarkIncompleteRunsFailed_RealServicePath) {
   EXPECT_EQ(state.value(), DAGRunState::Failed);
 }
 
-TEST_F(PersistenceTest, ClaimTaskInstances_ClaimsPendingRowsAsRunning) {
+TEST_F(PersistenceTest, ClaimTaskInstances_ClaimsReadyRowsAsRunning) {
   auto persisted = create_persisted_dag("claim_dag", "claim_task");
   ASSERT_GT(persisted.dag_rowid, 0);
   ASSERT_GT(persisted.task_rowid, 0);
@@ -204,7 +291,7 @@ TEST_F(PersistenceTest, ClaimTaskInstances_ClaimsPendingRowsAsRunning) {
   TaskInstanceInfo ti{};
   ti.task_rowid = persisted.task_rowid;
   ti.attempt = 1;
-  ti.state = TaskState::Pending;
+  ti.state = TaskState::Ready;
 
   auto create_res = run_coro(service_->create_run_with_task_instances(
       std::move(*run), std::vector<TaskInstanceInfo>{ti}));
@@ -226,13 +313,25 @@ TEST_F(PersistenceTest, ClaimTaskInstances_ClaimsPendingRowsAsRunning) {
   ASSERT_FALSE(tasks->empty());
   EXPECT_EQ(tasks->front().state, TaskState::Running);
 
-  auto hb =
-      run_coro(service_->touch_task_heartbeat(run_id, persisted.task_rowid, 1));
+  auto hb = run_coro(service_->touch_task_heartbeat(TaskInstanceKey{
+      .run_rowid = it->run_rowid,
+      .task_rowid = persisted.task_rowid,
+      .attempt = 1,
+  }));
   EXPECT_TRUE(hb.has_value());
+
+  auto hb_again = run_coro(service_->touch_task_heartbeat(TaskInstanceKey{
+      .run_rowid = it->run_rowid,
+      .task_rowid = persisted.task_rowid,
+      .attempt = 1,
+  }));
+  EXPECT_TRUE(hb_again.has_value());
 }
 
-TEST_F(PersistenceTest, CreateRunWithTaskInstances_NormalizesInitialAttemptToOne) {
-  auto persisted = create_persisted_dag("attempt_norm_dag", "attempt_norm_task");
+TEST_F(PersistenceTest,
+       CreateRunWithTaskInstances_NormalizesInitialAttemptToOne) {
+  auto persisted =
+      create_persisted_dag("attempt_norm_dag", "attempt_norm_task");
   ASSERT_GT(persisted.dag_rowid, 0);
   ASSERT_GT(persisted.task_rowid, 0);
 
@@ -243,7 +342,7 @@ TEST_F(PersistenceTest, CreateRunWithTaskInstances_NormalizesInitialAttemptToOne
   TaskInstanceInfo ti{};
   ti.task_rowid = persisted.task_rowid;
   ti.attempt = 0;
-  ti.state = TaskState::Pending;
+  ti.state = TaskState::Ready;
 
   auto create_res = run_coro(service_->create_run_with_task_instances(
       std::move(*run), std::vector<TaskInstanceInfo>{ti}));
@@ -253,6 +352,59 @@ TEST_F(PersistenceTest, CreateRunWithTaskInstances_NormalizesInitialAttemptToOne
   ASSERT_TRUE(tasks.has_value());
   ASSERT_EQ(tasks->size(), 1U);
   EXPECT_EQ(tasks->front().attempt, 1);
+}
+
+TEST_F(PersistenceTest, ClearFailedTasksRebuildsReadyStateAndRunState) {
+  auto persisted = create_persisted_dag("clear_dag", "clear_task");
+  ASSERT_GT(persisted.dag_rowid, 0);
+  ASSERT_GT(persisted.task_rowid, 0);
+
+  const DAGRunId run_id{unique_token("clear_run")};
+  auto run = create_run(run_id, persisted.dag_rowid);
+  ASSERT_TRUE(run.has_value());
+
+  TaskInstanceInfo ti{};
+  ti.task_rowid = persisted.task_rowid;
+  ti.attempt = 1;
+  ti.state = TaskState::Failed;
+  ti.finished_at = std::chrono::system_clock::now();
+  ti.exit_code = 1;
+  ti.error_message = "boom";
+  ti.error_type = "executor_error";
+
+  auto create_res = run_coro(service_->create_run_with_task_instances(
+      std::move(*run), std::vector<TaskInstanceInfo>{ti}));
+  ASSERT_TRUE(create_res.has_value());
+
+  auto mark_failed = run_coro(service_->mark_incomplete_runs_failed());
+  ASSERT_TRUE(mark_failed.has_value());
+  EXPECT_GE(mark_failed.value(), 1U);
+
+  auto failed_state = run_coro(service_->get_dag_run_state(run_id));
+  ASSERT_TRUE(failed_state.has_value());
+  EXPECT_EQ(failed_state.value(), DAGRunState::Failed);
+
+  cli::ManagementClient client(load_test_db_config());
+  auto client_open = client.open();
+  ASSERT_TRUE(client_open.has_value());
+
+  auto clear_res = client.clear_failed_tasks(run_id);
+  ASSERT_TRUE(clear_res.has_value()) << clear_res.error().message();
+
+  auto run_state = run_coro(service_->get_dag_run_state(run_id));
+  ASSERT_TRUE(run_state.has_value());
+  EXPECT_EQ(run_state.value(), DAGRunState::Running);
+
+  auto tasks = run_coro(service_->get_task_instances(run_id));
+  ASSERT_TRUE(tasks.has_value());
+  ASSERT_EQ(tasks->size(), 1U);
+  EXPECT_EQ(tasks->front().state, TaskState::Ready);
+  EXPECT_EQ(tasks->front().exit_code, 0);
+  EXPECT_TRUE(tasks->front().error_message.empty());
+  EXPECT_TRUE(tasks->front().error_type.empty());
+  EXPECT_EQ(tasks->front().started_at, std::chrono::system_clock::time_point{});
+  EXPECT_EQ(tasks->front().finished_at,
+            std::chrono::system_clock::time_point{});
 }
 
 TEST_F(PersistenceTest,
@@ -384,17 +536,83 @@ TEST_F(PersistenceTest, MarkIncompleteRunsFailed_DoesNotFailPendingTasks) {
   EXPECT_EQ(pending_it->state, TaskState::Pending);
 }
 
-TEST(PersistenceOpenTest, OpenWithInvalidHostFailsGracefully) {
+TEST_F(PersistenceTest,
+       UpsertDagInfoPersistsMultipleTasksAndRebuildsDependencies) {
+  DAGInfo dag{};
+  dag.dag_id = DAGId{unique_token("bulk_upsert_dag")};
+  dag.name = dag.dag_id.str();
+  dag.created_at = std::chrono::system_clock::now();
+  dag.updated_at = dag.created_at;
+
+  auto producer = TaskConfig::builder()
+                      .id("producer")
+                      .name("producer")
+                      .command("echo producer")
+                      .build();
+  ASSERT_TRUE(producer.has_value());
+
+  auto consumer = TaskConfig::builder()
+                      .id("consumer")
+                      .name("consumer")
+                      .command("echo consumer")
+                      .depends_on("producer")
+                      .build();
+  ASSERT_TRUE(consumer.has_value());
+
+  dag.tasks = {std::move(*producer), std::move(*consumer)};
+  dag.rebuild_task_index();
+  const auto dag_id = dag.dag_id.clone();
+
+  auto upserted =
+      run_coro(service_->upsert_dag_info(dag_id, std::move(dag), false));
+  ASSERT_TRUE(upserted.has_value()) << upserted.error().message();
+  ASSERT_EQ(upserted->tasks.size(), 2U);
+  EXPECT_GT(upserted->dag_rowid, 0);
+  EXPECT_GT(upserted->tasks[0].task_rowid, 0);
+  EXPECT_GT(upserted->tasks[1].task_rowid, 0);
+
+  auto loaded = run_coro(service_->get_dag(upserted->dag_id));
+  ASSERT_TRUE(loaded.has_value()) << loaded.error().message();
+  ASSERT_EQ(loaded->tasks.size(), 2U);
+  const auto *loaded_producer = loaded->find_task(TaskId{"producer"});
+  const auto *loaded_consumer = loaded->find_task(TaskId{"consumer"});
+  ASSERT_NE(loaded_producer, nullptr);
+  ASSERT_NE(loaded_consumer, nullptr);
+  EXPECT_GT(loaded_producer->task_rowid, 0);
+  EXPECT_GT(loaded_consumer->task_rowid, 0);
+  ASSERT_EQ(loaded_consumer->dependencies.size(), 1U);
+  EXPECT_EQ(loaded_consumer->dependencies.front().task_id, TaskId{"producer"});
+}
+
+TEST(PersistenceOpenTest, OpenWithInvalidEndpointFailsGracefully) {
   Runtime runtime(1);
   ASSERT_TRUE(runtime.start().has_value());
 
   DatabaseConfig cfg = load_test_db_config();
-  cfg.host = "invalid-host-for-dagforge-tests";
+  cfg.host = "127.0.0.1";
+  cfg.port = 1;
   cfg.connect_timeout = 1;
 
   PersistenceService service(runtime, cfg);
   auto open_res = run_coro(service.open());
   EXPECT_FALSE(open_res.has_value());
+
+  runtime.stop();
+}
+
+TEST(PersistenceOpenTest, OpenFailureIncrementsDbErrorsTotal) {
+  Runtime runtime(1);
+  ASSERT_TRUE(runtime.start().has_value());
+
+  DatabaseConfig cfg = load_test_db_config();
+  cfg.host = "127.0.0.1";
+  cfg.port = 1;
+  cfg.connect_timeout = 1;
+
+  PersistenceService service(runtime, cfg);
+  auto open_res = run_coro(service.open());
+  EXPECT_FALSE(open_res.has_value());
+  EXPECT_GT(service.db_errors_total(), 0U);
 
   runtime.stop();
 }
@@ -413,6 +631,23 @@ TEST(PersistenceOpenTest, SyncWaitOpenSucceedsWhenDatabaseIsReachable) {
 
   EXPECT_TRUE(open_res.has_value());
   service.sync_wait(service.close());
+  runtime.stop();
+}
+
+TEST(PersistenceOpenTest, SuccessfulOpenAndCloseIncrementTransactionsTotal) {
+  Runtime runtime(1);
+  ASSERT_TRUE(runtime.start().has_value());
+
+  PersistenceService service(runtime, load_test_db_config());
+  auto open_res = service.sync_wait(service.open());
+  if (!open_res) {
+    runtime.stop();
+    GTEST_SKIP() << "MySQL unavailable for transaction metric test: "
+                 << open_res.error().message();
+  }
+
+  service.sync_wait(service.close());
+  EXPECT_GE(service.db_transactions_total(), 2U);
   runtime.stop();
 }
 

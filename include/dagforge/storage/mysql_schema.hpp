@@ -1,6 +1,8 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include <string_view>
+#endif
 
 namespace dagforge::schema {
 
@@ -50,6 +52,11 @@ CREATE TABLE IF NOT EXISTS dag_tasks (
     retry_interval INT NOT NULL DEFAULT 60,
     max_retries INT NOT NULL DEFAULT 3,
     trigger_rule VARCHAR(64) NOT NULL DEFAULT 'all_success',
+    is_branch TINYINT NOT NULL DEFAULT 0,
+    branch_xcom_key VARCHAR(255) NOT NULL DEFAULT 'branch',
+    depends_on_past TINYINT NOT NULL DEFAULT 0,
+    xcom_push JSON NOT NULL DEFAULT ('[]'),
+    xcom_pull JSON NOT NULL DEFAULT ('[]'),
     UNIQUE KEY uq_dag_task (dag_rowid, task_id),
     CONSTRAINT fk_task_dag FOREIGN KEY (dag_rowid) REFERENCES dags(dag_rowid) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
@@ -146,6 +153,6 @@ CREATE TABLE IF NOT EXISTS task_logs (
 
 )SQL";
 
-inline constexpr int CURRENT_SCHEMA_VERSION = 1;
+inline constexpr int CURRENT_SCHEMA_VERSION = 3;
 
 } // namespace dagforge::schema

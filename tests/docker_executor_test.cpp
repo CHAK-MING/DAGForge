@@ -32,9 +32,6 @@ TEST_F(DockerExecutorTest, DockerExecutorConfigDefaults) {
   DockerExecutorConfig config;
 
   EXPECT_TRUE(config.image.empty());
-  EXPECT_TRUE(config.command.empty());
-  EXPECT_TRUE(config.working_dir.empty());
-  EXPECT_EQ(config.execution_timeout, std::chrono::seconds(3600));
   EXPECT_TRUE(config.env.empty());
   EXPECT_EQ(config.docker_socket, "/var/run/docker.sock");
 }
@@ -42,17 +39,11 @@ TEST_F(DockerExecutorTest, DockerExecutorConfigDefaults) {
 TEST_F(DockerExecutorTest, DockerExecutorConfigCustomValues) {
   DockerExecutorConfig config{
       .image = "alpine:latest",
-      .command = "echo hello",
-      .working_dir = "/app",
-      .execution_timeout = std::chrono::seconds(60),
       .env = {{"KEY", "value"}},
       .docker_socket = "/custom/docker.sock",
   };
 
   EXPECT_EQ(config.image, "alpine:latest");
-  EXPECT_EQ(config.command, "echo hello");
-  EXPECT_EQ(config.working_dir, "/app");
-  EXPECT_EQ(config.execution_timeout, std::chrono::seconds(60));
   EXPECT_EQ(config.env.size(), 1U);
   EXPECT_EQ(config.env["KEY"], "value");
   EXPECT_EQ(config.docker_socket, "/custom/docker.sock");
@@ -63,15 +54,16 @@ TEST_F(DockerExecutorTest, ExecutorHandlesInvalidConfig) {
   ExecutorResult final_result;
 
   ShellExecutorConfig wrong_config;
-  wrong_config.command = "echo test";
 
   ExecutorRequest req{
       .instance_id = InstanceId{"test-instance-1"},
+      .command = "echo test",
       .config = wrong_config,
       .memory_resource = {},
   };
 
   ExecutionSink sink{
+      .on_heartbeat = nullptr,
       .on_state = nullptr,
       .on_stdout = nullptr,
       .on_stderr = nullptr,
@@ -100,20 +92,20 @@ TEST_F(DockerExecutorTest, ExecutorFailsWithNonExistentSocket) {
 
   DockerExecutorConfig config{
       .image = "alpine:latest",
-      .command = "echo hello",
-      .working_dir = "",
-      .execution_timeout = std::chrono::seconds(300),
       .env = {},
       .docker_socket = "/tmp/nonexistent_docker_socket_test.sock",
   };
 
   ExecutorRequest req{
       .instance_id = InstanceId{"test-instance-2"},
+      .command = "echo hello",
+      .execution_timeout = std::chrono::seconds(300),
       .config = config,
       .memory_resource = {},
   };
 
   ExecutionSink sink{
+      .on_heartbeat = nullptr,
       .on_state = nullptr,
       .on_stdout = nullptr,
       .on_stderr = nullptr,

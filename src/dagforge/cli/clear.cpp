@@ -1,7 +1,6 @@
 #include "dagforge/cli/commands.hpp"
+#include "dagforge/cli/context.hpp"
 #include "dagforge/cli/formatting.hpp"
-#include "dagforge/cli/management_client.hpp"
-#include "dagforge/config/config.hpp"
 #include "dagforge/util/json.hpp"
 #include "dagforge/util/log.hpp"
 
@@ -9,6 +8,7 @@
 #include <print>
 #include <ranges>
 #include <unordered_set>
+
 
 namespace dagforge::cli {
 
@@ -19,21 +19,11 @@ auto cmd_clear(const ClearOptions &opts) -> int {
     return 1;
   }
 
-  auto config_res = ConfigLoader::load_from_file(opts.config_file)
-                        .or_else([&](std::error_code ec) -> Result<Config> {
-                          std::println(stderr, "Error: {}", ec.message());
-                          return fail(ec);
-                        });
-  if (!config_res) {
+  auto ctx = load_context_or_print(opts.config_file);
+  if (!ctx) {
     return 1;
   }
-
-  ManagementClient client(config_res->database);
-
-  if (auto r = client.open(); !r) {
-    std::println(stderr, "Error: {}", r.error().message());
-    return 1;
-  }
+  auto &client = ctx->db();
 
   auto run_result =
       client.get_run(DAGRunId{opts.run_id})
@@ -120,14 +110,14 @@ auto cmd_clear(const ClearOptions &opts) -> int {
     } else {
       if (opts.downstream) {
         std::println("{} Task '{}' and {} downstream task(s) in run '{}' "
-                     "{} to pending",
+                     "{} for rescheduling",
                      opts.dry_run ? fmt::ansi::yellow("Dry-run:")
                                   : fmt::ansi::green("\u2713"),
                      *opts.task, to_clear.size() > 0 ? to_clear.size() - 1 : 0,
                      opts.run_id,
                      opts.dry_run ? "would be cleared" : "cleared");
       } else {
-        std::println("{} Task '{}' in run '{}' {} to pending",
+        std::println("{} Task '{}' in run '{}' {} for rescheduling",
                      opts.dry_run ? fmt::ansi::yellow("Dry-run:")
                                   : fmt::ansi::green("\u2713"),
                      *opts.task, opts.run_id,
@@ -151,7 +141,7 @@ auto cmd_clear(const ClearOptions &opts) -> int {
                              {"action", "cleared_failed"},
                          }));
     } else {
-      std::println("{} Failed tasks in run '{}' {} to pending",
+      std::println("{} Failed tasks in run '{}' {} for rescheduling",
                    opts.dry_run ? fmt::ansi::yellow("Dry-run:")
                                 : fmt::ansi::green("\u2713"),
                    opts.run_id, opts.dry_run ? "would be cleared" : "cleared");
@@ -173,7 +163,7 @@ auto cmd_clear(const ClearOptions &opts) -> int {
                              {"action", "cleared_all"},
                          }));
     } else {
-      std::println("{} All tasks in run '{}' {} to pending",
+      std::println("{} All tasks in run '{}' {} for rescheduling",
                    opts.dry_run ? fmt::ansi::yellow("Dry-run:")
                                 : fmt::ansi::green("\u2713"),
                    opts.run_id, opts.dry_run ? "would be cleared" : "cleared");

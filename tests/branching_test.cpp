@@ -15,7 +15,7 @@ protected:
   auto is_ready(DAGRun &run, NodeIndex idx) -> bool {
     auto info = run.get_task_info(idx);
     auto ready = run.get_ready_tasks();
-    return info && info->state == TaskState::Pending &&
+    return info && info->state == TaskState::Ready &&
            std::find(ready.begin(), ready.end(), idx) != ready.end();
   }
 

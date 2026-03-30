@@ -1,14 +1,16 @@
 #pragma once
 
-#include "dagforge/core/error.hpp"
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/util/id.hpp"
 #include "dagforge/xcom/xcom_types.hpp"
+#endif
 
 #include <ankerl/unordered_dense.h>
 #include <chrono>
 #include <functional>
 #include <string>
 #include <vector>
+
 
 namespace dagforge {
 
@@ -33,11 +35,10 @@ public:
   // Pre-populate the XCom cache before executing a task. This allows the
   // resolver to work synchronously during template expansion without needing
   // a blocking DB call — the caller pre-fetches via co_await and seeds the
-  // cache here before handing off to the synchronous visitor.
+  // cache with rendered values here before handing off to the synchronous
+  // visitor.
   auto prefetch_xcom(const DAGRunId &run_id, const TaskId &task_id,
-                     const std::string &key, const JsonValue &value) -> void {
-    xcom_cache_.set(run_id, task_id, key, value);
-  }
+                     std::string_view key, std::string_view value_json) -> void;
 
   [[nodiscard]] auto resolve_env_vars(const TemplateContext &ctx,
                                       const std::vector<XComPullConfig> &pulls)

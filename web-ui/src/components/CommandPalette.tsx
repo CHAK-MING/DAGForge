@@ -21,10 +21,10 @@ interface CommandPaletteProps {
 
 export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
   const navigate = useNavigate();
-  const { t } = useI18n();
+  const { t, tf } = useI18n();
   const [search, setSearch] = useState("");
 
-  const { data: dags = [] } = useDAGsQuery();
+  const { data: availableDAGs = [] } = useDAGsQuery();
   const { data: recentRuns = [] } = useRunsQuery(undefined, 0);
 
   const handleSelect = useCallback((callback: () => void) => {
@@ -46,7 +46,7 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
           <div className="flex items-center border-b px-3">
             <Search className="mr-2 h-4 w-4 shrink-0 opacity-50" />
             <Command.Input
-              placeholder={t.commandPalette?.placeholder || "搜索 DAG、任务、历史记录..."}
+              placeholder={t.commandPalette.placeholder}
               className="flex h-11 w-full rounded-md bg-transparent py-3 text-sm outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-50"
               value={search}
               onValueChange={setSearch}
@@ -55,45 +55,45 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
 
           <Command.List className="max-h-[400px] overflow-y-auto p-2">
             <Command.Empty className="py-6 text-center text-sm text-muted-foreground">
-              {t.commandPalette?.noResults || "未找到结果"}
+              {t.commandPalette.noResults}
             </Command.Empty>
 
             {/* Navigation Commands */}
-            <Command.Group heading={t.commandPalette?.navigation || "导航"}>
+            <Command.Group heading={t.commandPalette.navigation}>
               <Command.Item
                 onSelect={() => handleSelect(() => navigate("/"))}
                 className="flex items-center gap-3 px-3 py-2 rounded-md cursor-pointer hover:bg-accent data-[selected=true]:bg-accent"
               >
                 <GitBranch className="h-4 w-4" />
-                <span>{t.dashboard?.title || "仪表板"}</span>
+                <span>{t.dashboard.title}</span>
               </Command.Item>
               <Command.Item
                 onSelect={() => handleSelect(() => navigate("/dags"))}
                 className="flex items-center gap-3 px-3 py-2 rounded-md cursor-pointer hover:bg-accent data-[selected=true]:bg-accent"
               >
                 <FileText className="h-4 w-4" />
-                <span>{t.dags?.title || "DAG 列表"}</span>
+                <span>{t.dags.title}</span>
               </Command.Item>
               <Command.Item
                 onSelect={() => handleSelect(() => navigate("/history"))}
                 className="flex items-center gap-3 px-3 py-2 rounded-md cursor-pointer hover:bg-accent data-[selected=true]:bg-accent"
               >
                 <History className="h-4 w-4" />
-                <span>{t.history?.title || "运行历史"}</span>
+                <span>{t.history.title}</span>
               </Command.Item>
               <Command.Item
                 onSelect={() => handleSelect(() => navigate("/settings"))}
                 className="flex items-center gap-3 px-3 py-2 rounded-md cursor-pointer hover:bg-accent data-[selected=true]:bg-accent"
               >
                 <Settings className="h-4 w-4" />
-                <span>{t.settings?.title || "设置"}</span>
+                <span>{t.settings.title}</span>
               </Command.Item>
             </Command.Group>
 
             {/* DAG Commands */}
-            {dags.length > 0 && (
+            {availableDAGs.length > 0 && (
               <Command.Group heading="DAGs">
-                {dags.slice(0, 10).map((dag) => (
+                {availableDAGs.slice(0, 10).map((dag) => (
                   <Command.Item
                     key={dag.dag_id}
                     value={`dag-${dag.dag_id}-${dag.name}`}
@@ -105,12 +105,12 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
                       <div>
                         <div className="font-medium">{dag.name}</div>
                         <div className="text-xs text-muted-foreground line-clamp-1">
-                          {dag.description || "无描述"}
+                          {dag.description || t.dags.noDescription}
                         </div>
                       </div>
                     </div>
                     <Badge variant="secondary" className="text-xs">
-                      {dag.tasks?.length || 0} 任务
+                      {tf(t.dags.taskCount, { count: dag.tasks?.length || 0 })}
                     </Badge>
                   </Command.Item>
                 ))}
@@ -119,7 +119,7 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
 
             {/* Recent Runs */}
             {recentRuns.length > 0 && (
-              <Command.Group heading={t.commandPalette?.recentRuns || "最近运行"}>
+              <Command.Group heading={t.commandPalette.recentRuns}>
                 {recentRuns.slice(0, 5).map((run) => (
                   <Command.Item
                     key={run.dag_run_id}
@@ -141,8 +141,8 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
                         run.state === "success"
                           ? "default"
                           : run.state === "failed"
-                          ? "destructive"
-                          : "secondary"
+                            ? "destructive"
+                            : "secondary"
                       }
                       className="text-xs"
                     >
@@ -156,14 +156,14 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
 
           <div className="border-t px-3 py-2 text-xs text-muted-foreground">
             <div className="flex items-center justify-between">
-              <span>快捷键提示</span>
+              <span>{t.commandPalette.shortcuts}</span>
               <div className="flex items-center gap-2">
                 <kbd className="px-2 py-1 bg-muted rounded text-xs">↑↓</kbd>
-                <span>导航</span>
+                <span>{t.commandPalette.navigateHint}</span>
                 <kbd className="px-2 py-1 bg-muted rounded text-xs ml-2">Enter</kbd>
-                <span>选择</span>
+                <span>{t.commandPalette.selectHint}</span>
                 <kbd className="px-2 py-1 bg-muted rounded text-xs ml-2">Esc</kbd>
-                <span>关闭</span>
+                <span>{t.commandPalette.closeHint}</span>
               </div>
             </div>
           </div>

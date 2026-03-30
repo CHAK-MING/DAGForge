@@ -106,6 +106,21 @@ protected:
   std::unique_ptr<TemplateResolver> resolver_;
 };
 
+class XComTemplateResolverTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    resolver_ = std::make_unique<TemplateResolver>(
+        [](const DAGRunId &, const TaskId &,
+           std::string_view) -> Result<XComEntry> {
+          return fail(Error::NotFound);
+        });
+    ctx_ = make_template_context();
+  }
+
+  std::unique_ptr<TemplateResolver> resolver_;
+  TemplateContext ctx_;
+};
+
 TEST_F(DateTemplateEdgeCaseTest, EmptyExecutionDate_NoReplacement) {
   auto ctx = make_template_context();
 
@@ -389,4 +404,36 @@ TEST_F(DateTemplateEdgeCaseTest, DataIntervalStart_WhitespaceTrimmed) {
       resolver_->resolve_template("{{  data_interval_start  }}", ctx, {});
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(*result, "2026-01-15T00:00:00Z");
+}
+
+TEST_F(XComTemplateResolverTest, ResolveXComPullUsesPreRenderedDefaultValue) {
+  XComPullConfig pull{
+      .ref = XComRef{.task_id = TaskId{"producer"}, .key = "payload"},
+      .env_var = "PAYLOAD",
+      .required = false,
+      .default_value_json = R"("fallback")",
+      .default_value_rendered = "fallback",
+      .has_default_value = true,
+  };
+
+  auto result = resolver_->resolve_xcom_pull(ctx_, pull);
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  ASSERT_TRUE(result->has_value());
+  EXPECT_EQ(**result, "fallback");
+}
+
+TEST_F(XComTemplateResolverTest, PrefetchedSerializedXComResolvesFromCache) {
+  resolver_->prefetch_xcom(ctx_.dag_run_id, TaskId{"producer"}, "payload",
+                           R"("hello")");
+
+  XComPullConfig pull{
+      .ref = XComRef{.task_id = TaskId{"producer"}, .key = "payload"},
+      .env_var = "PAYLOAD",
+      .required = true,
+  };
+
+  auto result = resolver_->resolve_xcom_pull(ctx_, pull);
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  ASSERT_TRUE(result->has_value());
+  EXPECT_EQ(**result, "hello");
 }

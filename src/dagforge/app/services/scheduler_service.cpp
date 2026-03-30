@@ -1,14 +1,13 @@
 #include "dagforge/app/services/scheduler_service.hpp"
-
-#include "dagforge/dag/dag_manager.hpp"
-#include "dagforge/scheduler/cron.hpp"
 #include "dagforge/util/hash.hpp"
 #include "dagforge/util/log.hpp"
+
 
 #include <algorithm>
 #include <chrono>
 #include <optional>
 #include <thread>
+
 
 namespace dagforge {
 
@@ -106,6 +105,7 @@ auto SchedulerService::register_dag(DAGId dag_id, const DAGInfo &dag_info)
 
   auto cron_expr_result = CronExpr::parse(dag_info.cron);
   if (!cron_expr_result) {
+    cron_parse_errors_total_.fetch_add(1, std::memory_order_relaxed);
     log::warn("Invalid cron expression for DAG {}: {}", dag_id, dag_info.cron);
     return;
   }
@@ -124,8 +124,8 @@ auto SchedulerService::register_dag(DAGId dag_id, const DAGInfo &dag_info)
   owner_engine(dag_id)
       .add_task(std::move(info))
       .and_then([&]() -> Result<void> {
-        log::info("Registered DAG schedule: {} with cron: {}", dag_id,
-                  dag_info.cron);
+        log::debug("Registered DAG schedule: {} with cron: {}", dag_id,
+                   dag_info.cron);
         registered_root_tasks_[dag_id] = schedule_task_id;
         return ok();
       })
@@ -145,7 +145,7 @@ auto SchedulerService::unregister_dag(const DAGId &dag_id) -> void {
   owner_engine(dag_id)
       .remove_task(dag_id, it->second)
       .and_then([&]() -> Result<void> {
-        log::info("Unregistered DAG schedule: {}", dag_id);
+        log::debug("Unregistered DAG schedule: {}", dag_id);
         return ok();
       })
       .or_else([&](std::error_code ec) -> Result<void> {
@@ -234,6 +234,26 @@ auto SchedulerService::is_running() const -> bool {
       engines_, [](const std::unique_ptr<Engine> &engine) {
         return engine->is_running();
       });
+}
+
+auto SchedulerService::queue_depth() const -> std::size_t {
+  std::size_t total = 0;
+  for (const auto &engine : engines_) {
+    total += engine->scheduled_task_count();
+  }
+  return total;
+}
+
+auto SchedulerService::missed_schedules_total() const -> std::uint64_t {
+  std::uint64_t total = 0;
+  for (const auto &engine : engines_) {
+    total += engine->missed_schedules_total();
+  }
+  return total;
+}
+
+auto SchedulerService::cron_parse_errors_total() const -> std::uint64_t {
+  return cron_parse_errors_total_.load(std::memory_order_relaxed);
 }
 
 auto SchedulerService::engine() -> Engine & { return *engines_.front(); }

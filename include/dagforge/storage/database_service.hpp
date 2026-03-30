@@ -1,13 +1,14 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/core/coroutine.hpp"
 #include "dagforge/core/error.hpp"
 #include "dagforge/dag/dag_manager.hpp"
 #include "dagforge/dag/dag_run.hpp"
 #include "dagforge/storage/orm_models.hpp"
 #include "dagforge/util/id.hpp"
-#include "dagforge/util/json.hpp"
 #include "dagforge/xcom/xcom_types.hpp"
+#endif
 
 #include <chrono>
 #include <cstdint>
@@ -20,10 +21,18 @@ namespace dagforge {
 struct TaskConfig;
 
 struct ClaimedTaskInstance {
-  DAGRunId dag_run_id;
+  DAGRunId dag_run_id{};
   int64_t run_rowid{0};
   int64_t task_rowid{0};
   int attempt{0};
+
+  [[nodiscard]] auto task_instance_key() const noexcept -> TaskInstanceKey {
+    return TaskInstanceKey{
+        .run_rowid = run_rowid,
+        .task_rowid = task_rowid,
+        .attempt = attempt,
+    };
+  }
 };
 
 struct RunInsertBundle {
@@ -58,6 +67,8 @@ public:
   virtual auto get_dag(const DAGId &dag_id) -> task<Result<DAGInfo>> = 0;
   virtual auto get_dag_by_rowid(int64_t dag_rowid) -> task<Result<DAGInfo>> = 0;
   virtual auto list_dags() -> task<Result<std::vector<DAGInfo>>> = 0;
+  virtual auto list_dag_states()
+      -> task<Result<std::vector<DagStateRecord>>> = 0;
 
   // === Task CRUD ===
   virtual auto save_task(const DAGId &dag_id, const TaskConfig &t)
@@ -103,8 +114,8 @@ public:
   virtual auto claim_task_instances(std::size_t limit,
                                     std::string_view worker_id)
       -> task<Result<std::vector<ClaimedTaskInstance>>> = 0;
-  virtual auto touch_task_heartbeat(const DAGRunId &run_id, int64_t task_rowid,
-                                    int attempt) -> task<Result<void>> = 0;
+  virtual auto touch_task_heartbeat(const TaskInstanceKey &key)
+      -> task<Result<void>> = 0;
   virtual auto reap_zombie_task_instances(std::int64_t heartbeat_timeout_ms)
       -> task<Result<std::size_t>> = 0;
 
@@ -118,7 +129,7 @@ public:
 
   // === XCom ===
   virtual auto save_xcom(const DAGRunId &run_id, const TaskId &task_id,
-                         std::string key, const JsonValue &value)
+                         std::string key, std::string value_json)
       -> task<Result<void>> = 0;
   virtual auto get_xcom(const DAGRunId &run_id, const TaskId &task_id,
                         std::string_view key) -> task<Result<XComEntry>> = 0;
@@ -156,8 +167,7 @@ public:
   // === Task Logs ===
   virtual auto append_task_log(const DAGRunId &run_id, const TaskId &task_id,
                                int attempt, std::string stream,
-                               std::string content)
-      -> task<Result<void>> = 0;
+                               std::string content) -> task<Result<void>> = 0;
   virtual auto get_task_logs(const DAGRunId &run_id, const TaskId &task_id,
                              int attempt, std::size_t limit = 5000)
       -> task<Result<std::vector<orm::TaskLogEntry>>> = 0;

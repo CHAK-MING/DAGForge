@@ -49,7 +49,7 @@ TEST(ProcessManagementTest, WaitResultDefaultsToNoError) {
 }
 
 TEST(ProcessManagementTest, TerminateAndReapProcessMarksTimeout) {
-  boost::asio::io_context io;
+  io::IoContext io;
   boost::process::v2::process proc(io, "/bin/sh", {"-c", "sleep 30"});
 
   std::optional<ProcessWaitResult> result;
@@ -61,7 +61,7 @@ TEST(ProcessManagementTest, TerminateAndReapProcessMarksTimeout) {
         co_return;
       },
       [&](std::exception_ptr e) { eptr = e; });
-  io.run_for(std::chrono::seconds(5));
+  (void)io.run_for(std::chrono::seconds(5));
 
   ASSERT_FALSE(eptr);
   ASSERT_TRUE(result.has_value());

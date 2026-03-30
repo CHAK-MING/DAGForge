@@ -1,7 +1,6 @@
 #include "dagforge/cli/commands.hpp"
+#include "dagforge/cli/context.hpp"
 #include "dagforge/cli/formatting.hpp"
-#include "dagforge/cli/management_client.hpp"
-#include "dagforge/config/config.hpp"
 #include "dagforge/util/json.hpp"
 #include "dagforge/util/log.hpp"
 
@@ -11,6 +10,7 @@
 #include <print>
 #include <unordered_map>
 #include <vector>
+
 
 namespace dagforge::cli {
 namespace {
@@ -24,13 +24,11 @@ auto resolve_run_id_prefix(ManagementClient &client, const DAGId &dag_id,
   if (!runs) {
     return fail(runs.error());
   }
-  std::vector<DAGRunId> matches;
-  for (const auto &r : *runs) {
-    const auto id = r.dag_run_id.str();
-    if (id.starts_with(input)) {
-      matches.push_back(r.dag_run_id.clone());
-    }
-  }
+  auto matches = *runs | std::views::filter([&](const auto &r) {
+    return r.dag_run_id.str().starts_with(input);
+  }) | std::views::transform([](const auto &r) {
+    return r.dag_run_id.clone();
+  }) | std::ranges::to<std::vector>();
   if (matches.empty()) {
     return fail(Error::NotFound);
   }
@@ -46,18 +44,11 @@ auto resolve_run_id_prefix(ManagementClient &client, const DAGId &dag_id,
 
 auto cmd_inspect(const InspectOptions &opts) -> int {
   log::set_output_stderr();
-  auto config_res = ConfigLoader::load_from_file(opts.config_file);
-  if (!config_res) {
-    std::println(stderr, "Error: {}", config_res.error().message());
+  auto ctx = load_context_or_print(opts.config_file);
+  if (!ctx) {
     return 1;
   }
-
-  ManagementClient client(config_res->database);
-
-  if (auto r = client.open(); !r) {
-    std::println(stderr, "Error: {}", r.error().message());
-    return 1;
-  }
+  auto &client = ctx->db();
 
   // Resolve --latest to the most recent run_id
   std::string resolved_run_id = opts.run_id;

@@ -2,38 +2,133 @@
 
 #include "dagforge/config/task_config.hpp"
 #include "dagforge/executor/executor.hpp"
+#include "dagforge/util/json.hpp"
+#include "dagforge/xcom/xcom_codec.hpp"
 #include "dagforge/xcom/xcom_extractor.hpp"
 #include "dagforge/xcom/xcom_types.hpp"
+#include "dagforge/xcom/xcom_util.hpp"
 
 namespace dagforge {
 namespace {
 
-auto expect_json_string(const JsonValue &value, std::string_view expected)
+auto expect_json_string(std::string_view json_text, std::string_view expected)
     -> void {
+  auto parsed = parse_json(json_text);
+  ASSERT_TRUE(parsed);
+  const auto &value = *parsed;
   ASSERT_TRUE(value.is_string());
   EXPECT_EQ(value.as<std::string>(), expected);
 }
 
-auto expect_json_int(const JsonValue &value, int64_t expected) -> void {
+auto expect_json_int(std::string_view json_text, int64_t expected) -> void {
+  auto parsed = parse_json(json_text);
+  ASSERT_TRUE(parsed);
+  const auto &value = *parsed;
   ASSERT_TRUE(value.is_number());
   EXPECT_EQ(value.as<int64_t>(), expected);
 }
 
-auto expect_json_bool(const JsonValue &value, bool expected) -> void {
+auto expect_json_bool(std::string_view json_text, bool expected) -> void {
+  auto parsed = parse_json(json_text);
+  ASSERT_TRUE(parsed);
+  const auto &value = *parsed;
   ASSERT_TRUE(value.is_boolean());
   EXPECT_EQ(value.get<bool>(), expected);
 }
 
 class XComExtractorTest : public ::testing::Test {};
 
+TEST(XComCodecTest, PushConfigRoundTripPreservesFields) {
+  XComPushConfig push;
+  push.key = "result";
+  push.source = XComSource::Json;
+  push.json_path = "items[1]";
+  push.regex_pattern = R"((\d+))";
+  push.regex_group = 1;
+  ASSERT_TRUE(push.compile_regex().has_value());
+
+  const auto encoded = xcom::serialize_push_configs({push});
+  auto decoded = xcom::parse_push_configs(encoded);
+  ASSERT_TRUE(decoded.has_value()) << decoded.error().message();
+  ASSERT_EQ(decoded->size(), 1U);
+  EXPECT_EQ((*decoded)[0].key, "result");
+  EXPECT_EQ((*decoded)[0].source, XComSource::Json);
+  EXPECT_EQ((*decoded)[0].json_path, "items[1]");
+  EXPECT_EQ((*decoded)[0].regex_pattern, R"((\d+))");
+  EXPECT_EQ((*decoded)[0].regex_group, 1);
+  ASSERT_TRUE((*decoded)[0].compiled_regex);
+}
+
+TEST(XComCodecTest, ParsePushConfigsRejectsMalformedJson) {
+  auto decoded = xcom::parse_push_configs("{not-json");
+  ASSERT_FALSE(decoded.has_value());
+  EXPECT_EQ(decoded.error(), make_error_code(Error::ParseError));
+}
+
+TEST(XComCodecTest, ParsePushConfigsRejectsInvalidRegex) {
+  auto decoded = xcom::parse_push_configs(
+      R"([{"key":"result","source":"stdout","json_path":"","regex":"(","regex_group":0}])");
+  ASSERT_FALSE(decoded.has_value());
+  EXPECT_EQ(decoded.error(), make_error_code(Error::InvalidArgument));
+}
+
+TEST(XComCodecTest, PullConfigRoundTripPreservesDefaultValue) {
+  XComPullConfig pull;
+  pull.ref.task_id = TaskId{"producer"};
+  pull.ref.key = "payload";
+  pull.env_var = "PAYLOAD";
+  pull.required = true;
+  pull.default_value_json = R"("fallback")";
+  pull.default_value_rendered = "fallback";
+  pull.has_default_value = true;
+
+  const auto encoded = xcom::serialize_pull_configs({pull});
+  auto decoded = xcom::parse_pull_configs(encoded);
+  ASSERT_TRUE(decoded.has_value()) << decoded.error().message();
+  ASSERT_EQ(decoded->size(), 1U);
+  EXPECT_EQ((*decoded)[0].ref.task_id, TaskId{"producer"});
+  EXPECT_EQ((*decoded)[0].ref.key, "payload");
+  EXPECT_EQ((*decoded)[0].env_var, "PAYLOAD");
+  EXPECT_TRUE((*decoded)[0].required);
+  EXPECT_TRUE((*decoded)[0].has_default_value);
+  EXPECT_EQ((*decoded)[0].default_value_json, R"("fallback")");
+  EXPECT_EQ((*decoded)[0].default_value_rendered, "fallback");
+}
+
+TEST(XComCodecTest, ParsePullConfigsRejectsMalformedJson) {
+  auto decoded = xcom::parse_pull_configs("[");
+  ASSERT_FALSE(decoded.has_value());
+  EXPECT_EQ(decoded.error(), make_error_code(Error::ParseError));
+}
+
+TEST(XComUtilTest, RenderSerializedJsonUnwrapsStringValues) {
+  auto rendered = xcom::render_serialized_json(R"("hello")");
+  ASSERT_TRUE(rendered.has_value()) << rendered.error().message();
+  EXPECT_EQ(*rendered, "hello");
+}
+
+TEST(XComUtilTest, RenderSerializedJsonPreservesStructuredJson) {
+  auto rendered = xcom::render_serialized_json(R"({"ok":true})");
+  ASSERT_TRUE(rendered.has_value()) << rendered.error().message();
+  EXPECT_EQ(*rendered, R"({"ok":true})");
+}
+
+TEST(XComUtilTest, RenderSerializedJsonRejectsInvalidJson) {
+  auto rendered = xcom::render_serialized_json("not-json");
+  ASSERT_FALSE(rendered.has_value());
+  EXPECT_EQ(rendered.error(), make_error_code(Error::ParseError));
+}
+
 TEST(XComCacheTest, SetAndGetByCompositeKey) {
   XComCache cache;
   cache.set(DAGRunId("run_1"), TaskId("task_a"), "result",
-            JsonValue{{"ok", true}});
+            R"({"ok":true})");
 
   auto got = cache.get(DAGRunId("run_1"), TaskId("task_a"), "result");
   ASSERT_TRUE(got);
-  expect_json_bool(got->get()["ok"], true);
+  auto parsed = parse_json(got->get());
+  ASSERT_TRUE(parsed);
+  expect_json_bool(dump_json((*parsed)["ok"]), true);
 }
 
 TEST(XComCacheTest, ClearRunRemovesOnlyTargetRunEntries) {
@@ -49,7 +144,7 @@ TEST(XComCacheTest, ClearRunRemovesOnlyTargetRunEntries) {
 
   auto retained = cache.get(DAGRunId("run_2"), TaskId("task_a"), "k1");
   ASSERT_TRUE(retained);
-  expect_json_string(*retained, "v3");
+  EXPECT_EQ(retained->get(), "v3");
 }
 
 TEST_F(XComExtractorTest, ExtractStdoutAsString) {
@@ -116,8 +211,10 @@ TEST_F(XComExtractorTest, ExtractJsonFromStdout) {
 
   auto extracted = xcom::extract(result, configs);
   ASSERT_TRUE(extracted);
-  expect_json_string((*extracted)[0].value["name"], "test");
-  expect_json_int((*extracted)[0].value["value"], 123);
+  auto parsed = parse_json((*extracted)[0].value);
+  ASSERT_TRUE(parsed);
+  expect_json_string(dump_json((*parsed)["name"]), "test");
+  expect_json_int(dump_json((*parsed)["value"]), 123);
 }
 
 TEST_F(XComExtractorTest, ExtractWithJsonPath) {
@@ -241,6 +338,73 @@ TEST_F(XComExtractorTest, JsonPathWithArrayIndex) {
   expect_json_int((*extracted)[0].value, 2);
 }
 
+TEST_F(XComExtractorTest, JsonPathArrayIndexOutOfBoundsReturnsError) {
+  ExecutorResult result{.exit_code = 0,
+                        .stdout_output = R"({"items": [1, 2, 3]})",
+                        .stderr_output = "",
+                        .error = "",
+                        .timed_out = false};
+  std::vector<XComPushConfig> configs{{.key = "missing",
+                                       .source = XComSource::Json,
+                                       .json_path = "items[999]",
+                                       .regex_pattern = ""}};
+
+  auto extracted = xcom::extract(result, configs);
+  ASSERT_FALSE(extracted);
+  EXPECT_EQ(extracted.error(), make_error_code(Error::NotFound));
+}
+
+TEST_F(XComExtractorTest, RegexGroupOutOfRangeReturnsError) {
+  ExecutorResult result{.exit_code = 0,
+                        .stdout_output = "Result: 42 items processed",
+                        .stderr_output = "",
+                        .error = "",
+                        .timed_out = false};
+  std::vector<XComPushConfig> configs{{.key = "count",
+                                       .source = XComSource::Stdout,
+                                       .json_path = "",
+                                       .regex_pattern = R"(Result: (\d+))",
+                                       .regex_group = 2}};
+
+  auto extracted = xcom::extract(result, configs);
+  ASSERT_FALSE(extracted);
+  EXPECT_EQ(extracted.error(), make_error_code(Error::InvalidArgument));
+}
+
+TEST_F(XComExtractorTest, UncompiledInvalidRegexReturnsError) {
+  ExecutorResult result{.exit_code = 0,
+                        .stdout_output = "Result: 42 items processed",
+                        .stderr_output = "",
+                        .error = "",
+                        .timed_out = false};
+  std::vector<XComPushConfig> configs{{.key = "count",
+                                       .source = XComSource::Stdout,
+                                       .json_path = "",
+                                       .regex_pattern = "(",
+                                       .regex_group = 0}};
+
+  auto extracted = xcom::extract(result, configs);
+  ASSERT_FALSE(extracted);
+  EXPECT_EQ(extracted.error(), make_error_code(Error::InvalidArgument));
+}
+
+TEST_F(XComExtractorTest, EmptyStdoutWithoutRegexProducesEmptyString) {
+  ExecutorResult result{.exit_code = 0,
+                        .stdout_output = "\n\n",
+                        .stderr_output = "",
+                        .error = "",
+                        .timed_out = false};
+  std::vector<XComPushConfig> configs{{.key = "output",
+                                       .source = XComSource::Stdout,
+                                       .json_path = "",
+                                       .regex_pattern = ""}};
+
+  auto extracted = xcom::extract(result, configs);
+  ASSERT_TRUE(extracted);
+  ASSERT_EQ(extracted->size(), 1U);
+  expect_json_string((*extracted)[0].value, "");
+}
+
 TEST_F(XComExtractorTest, ExtractJsonFromMixedOutput_LastLine) {
   ExecutorResult result{.exit_code = 0,
                         .stdout_output = "Data size: 42\n[\"large_path\"]",
@@ -254,8 +418,10 @@ TEST_F(XComExtractorTest, ExtractJsonFromMixedOutput_LastLine) {
 
   auto extracted = xcom::extract(result, configs);
   ASSERT_TRUE(extracted);
-  EXPECT_EQ((*extracted)[0].value.size(), 1);
-  expect_json_string((*extracted)[0].value[0], "large_path");
+  auto parsed = parse_json((*extracted)[0].value);
+  ASSERT_TRUE(parsed);
+  EXPECT_EQ(parsed->size(), 1);
+  expect_json_string(dump_json((*parsed)[0]), "large_path");
 }
 
 TEST_F(XComExtractorTest, ExtractJsonFromMixedOutput_PrecedingLogs) {
@@ -273,7 +439,9 @@ TEST_F(XComExtractorTest, ExtractJsonFromMixedOutput_PrecedingLogs) {
 
   auto extracted = xcom::extract(result, configs);
   ASSERT_TRUE(extracted);
-  expect_json_string((*extracted)[0].value[0], "small_path");
+  auto parsed = parse_json((*extracted)[0].value);
+  ASSERT_TRUE(parsed);
+  expect_json_string(dump_json((*parsed)[0]), "small_path");
 }
 
 TEST_F(XComExtractorTest, ExtractJsonFromMixedOutput_MultipleLogLines) {
@@ -291,7 +459,41 @@ TEST_F(XComExtractorTest, ExtractJsonFromMixedOutput_MultipleLogLines) {
 
   auto extracted = xcom::extract(result, configs);
   ASSERT_TRUE(extracted);
-  expect_json_string((*extracted)[0].value["result"], "success");
+  auto parsed = parse_json((*extracted)[0].value);
+  ASSERT_TRUE(parsed);
+  expect_json_string(dump_json((*parsed)["result"]), "success");
+}
+
+TEST_F(XComExtractorTest, InvalidJsonPathSyntaxReturnsError) {
+  ExecutorResult result{.exit_code = 0,
+                        .stdout_output = R"({"items": [1, 2, 3]})",
+                        .stderr_output = "",
+                        .error = "",
+                        .timed_out = false};
+  std::vector<XComPushConfig> configs{{.key = "broken",
+                                       .source = XComSource::Json,
+                                       .json_path = "items[1",
+                                       .regex_pattern = ""}};
+
+  auto extracted = xcom::extract(result, configs);
+  ASSERT_FALSE(extracted);
+  EXPECT_EQ(extracted.error(), make_error_code(Error::InvalidArgument));
+}
+
+TEST_F(XComExtractorTest, JsonPathOnInvalidJsonTextReturnsError) {
+  ExecutorResult result{.exit_code = 0,
+                        .stdout_output = "plain text",
+                        .stderr_output = "",
+                        .error = "",
+                        .timed_out = false};
+  std::vector<XComPushConfig> configs{{.key = "broken",
+                                       .source = XComSource::Stdout,
+                                       .json_path = "items[0]",
+                                       .regex_pattern = ""}};
+
+  auto extracted = xcom::extract(result, configs);
+  ASSERT_FALSE(extracted);
+  EXPECT_EQ(extracted.error(), make_error_code(Error::InvalidArgument));
 }
 
 } // namespace

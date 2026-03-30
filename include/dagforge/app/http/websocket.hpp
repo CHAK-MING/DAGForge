@@ -1,7 +1,12 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/client/http/http_types.hpp"
+#include "dagforge/core/metrics.hpp"
+#endif
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/core/coroutine.hpp"
+#endif
 
 #include <boost/asio/generic/stream_protocol.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -14,6 +19,7 @@
 #include <span>
 #include <string>
 #include <vector>
+
 
 namespace dagforge {
 class Runtime;
@@ -140,6 +146,10 @@ public:
   auto broadcast_event(const EventMessage &event) -> void;
 
   [[nodiscard]] auto connection_count() const -> size_t;
+  [[nodiscard]] auto messages_sent_total() const -> std::uint64_t;
+  [[nodiscard]] auto messages_received_total() const -> std::uint64_t;
+  [[nodiscard]] auto message_size_snapshots() const
+      -> std::vector<std::pair<std::string, metrics::Histogram::Snapshot>>;
   auto close_all() -> void;
 
 private:

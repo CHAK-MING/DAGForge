@@ -1,5 +1,6 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include <array>
 #include <cerrno>
 #include <concepts>
@@ -10,6 +11,7 @@
 #include <system_error>
 #include <type_traits>
 #include <utility>
+#endif
 
 namespace dagforge {
 
@@ -73,6 +75,8 @@ class ErrorCategory : public std::error_category {
   };
 
 public:
+  ~ErrorCategory() override = default;
+
   [[nodiscard]] auto name() const noexcept -> const char * override {
     return "dagforge";
   }
@@ -95,7 +99,6 @@ inline auto make_error_code(Error e) -> std::error_code {
   return {std::to_underlying(e), error_category()};
 }
 
-// Concept for types that can be used with Result<T>
 template <typename T>
 concept ResultValue = std::destructible<T> || std::is_void_v<T>;
 
@@ -119,8 +122,9 @@ template <typename T>
 }
 
 template <typename T> [[nodiscard]] auto sys_check(T val) -> Result<T> {
-  if (val < 0)
+  if (val < 0) {
     return fail(std::error_code(errno, std::system_category()));
+  }
   return ok(val);
 }
 

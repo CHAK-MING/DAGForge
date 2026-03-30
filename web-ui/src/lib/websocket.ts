@@ -1,15 +1,15 @@
 import { WS_URL } from './config';
 
-export type WebSocketEventType = 'task_status_changed' | 'dag_run_completed';
+export type WebSocketEventType = 'task_status_changed' | 'dag_run_completed' | 'log';
 
-interface WebSocketMessage {
+interface WebSocketEventEnvelope {
   type: 'event' | 'connected';
-  event?: WebSocketEventType;
-  data?: string;
+  event?: Exclude<WebSocketEventType, 'log'>;
+  data?: string | Record<string, unknown>;
   timestamp?: string;
 }
 
-interface TaskStatusChangedData {
+export interface TaskStatusChangedData {
   type: 'task_status_changed';
   dag_id: string;
   run_id: string;
@@ -18,7 +18,7 @@ interface TaskStatusChangedData {
   timestamp: number;
 }
 
-interface DAGRunCompletedData {
+export interface DAGRunCompletedData {
   type: 'dag_run_completed';
   dag_id: string;
   run_id: string;
@@ -26,7 +26,18 @@ interface DAGRunCompletedData {
   timestamp: number;
 }
 
-export type WebSocketEventData = TaskStatusChangedData | DAGRunCompletedData;
+export interface TaskLogMessageData {
+  type: 'log';
+  timestamp: string;
+  dag_run_id: string;
+  task_id: string;
+  stream: string;
+  content: string;
+}
+
+type WebSocketMessage = WebSocketEventEnvelope | TaskLogMessageData;
+
+export type WebSocketEventData = TaskStatusChangedData | DAGRunCompletedData | TaskLogMessageData;
 type EventHandler = (data: WebSocketEventData) => void;
 
 export class WebSocketManager {
@@ -41,6 +52,14 @@ export class WebSocketManager {
 
   constructor() {
     this.url = WS_URL;
+  }
+
+  private emit(eventType: WebSocketEventType, data: WebSocketEventData): void {
+    const handlers = this.handlers.get(eventType);
+    if (!handlers) {
+      return;
+    }
+    handlers.forEach((handler) => handler(data));
   }
 
   connect(): void {
@@ -61,12 +80,16 @@ export class WebSocketManager {
       try {
         const message: WebSocketMessage = JSON.parse(event.data);
 
+        if (message.type === 'log') {
+          this.emit('log', message);
+          return;
+        }
+
         if (message.type === 'event' && message.event && message.data) {
-          const data = JSON.parse(message.data);
-          const handlers = this.handlers.get(message.event);
-          if (handlers) {
-            handlers.forEach(handler => handler(data));
-          }
+          const data = typeof message.data === 'string'
+            ? JSON.parse(message.data)
+            : message.data;
+          this.emit(message.event, data as WebSocketEventData);
         }
       } catch {
         // Ignore parse errors

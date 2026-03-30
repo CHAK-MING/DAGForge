@@ -1,8 +1,7 @@
 #include "dagforge/cli/commands.hpp"
+#include "dagforge/cli/context.hpp"
 #include "dagforge/cli/formatting.hpp"
-#include "dagforge/cli/management_client.hpp"
-#include "dagforge/config/config.hpp"
-#include "dagforge/config/dag_definition.hpp"
+#include "dagforge/config/dag_info_loader.hpp"
 #include "dagforge/util/json.hpp"
 #include "dagforge/util/log.hpp"
 
@@ -10,11 +9,12 @@
 #include <optional>
 #include <print>
 
+
 namespace dagforge::cli {
 
 namespace {
 
-auto dag_exists_in_source(const Config &config, std::string_view dag_id)
+auto dag_exists_in_source(const SystemConfig &config, std::string_view dag_id)
     -> std::optional<bool> {
   const auto &dir = config.dag_source.directory;
   if (dir.empty() || !std::filesystem::exists(dir) ||
@@ -27,7 +27,7 @@ auto dag_exists_in_source(const Config &config, std::string_view dag_id)
       continue;
     }
 
-    auto dag = DAGDefinitionLoader::load_from_file(entry.path().string());
+    auto dag = DAGInfoLoader::load_from_file(entry.path().string());
     if (!dag) {
       continue;
     }
@@ -42,21 +42,16 @@ auto dag_exists_in_source(const Config &config, std::string_view dag_id)
 auto set_dag_paused(const std::string &config_file, const std::string &dag_id,
                     bool paused) -> int {
   log::set_output_stderr();
-  auto config_res = ConfigLoader::load_from_file(config_file);
-  if (!config_res) {
-    std::println(stderr, "Error: {}", config_res.error().message());
+  auto ctx = load_context_or_print(config_file);
+  if (!ctx) {
     return 1;
   }
-
-  ManagementClient client(config_res->database);
-  if (auto r = client.open(); !r) {
-    std::println(stderr, "Error: {}", r.error().message());
-    return 1;
-  }
+  auto &config = ctx->config;
+  auto &client = ctx->db();
 
   if (auto r = client.set_dag_paused(DAGId{dag_id}, paused); !r) {
     if (r.error() == Error::NotFound) {
-      auto in_source = dag_exists_in_source(*config_res, dag_id);
+      auto in_source = dag_exists_in_source(config, dag_id);
       if (in_source.has_value() && *in_source) {
         std::println(stderr,
                      "Error: DAG '{}' exists in DAG files but is not "

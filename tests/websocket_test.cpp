@@ -285,6 +285,30 @@ TEST_F(WebSocketTest, RemoveNonExistentConnection) {
   EXPECT_EQ(hub_->connection_count(), 0);
 }
 
+TEST_F(WebSocketTest, BroadcastWithoutConnectionsIsNoOp) {
+  EXPECT_EQ(hub_->connection_count(), 0U);
+  EXPECT_EQ(hub_->messages_sent_total(), 0U);
+
+  hub_->broadcast_log(WebSocketHub::LogMessage{
+      .timestamp = "1",
+      .dag_run_id = "run1",
+      .task_id = "task1",
+      .stream = "stdout",
+      .content = "hello",
+  });
+  hub_->broadcast_event(WebSocketHub::EventMessage{
+      .timestamp = "2",
+      .event = "task_status_changed",
+      .dag_run_id = "run1",
+      .task_id = "task1",
+      .data = R"({"status":"running"})",
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_EQ(hub_->connection_count(), 0U);
+  EXPECT_EQ(hub_->messages_sent_total(), 0U);
+}
+
 TEST_F(WebSocketTest, HandleFrames_PingRespondsWithPong) {
   auto pair = make_connection_pair();
   ASSERT_GE(pair.client_fd, 0);

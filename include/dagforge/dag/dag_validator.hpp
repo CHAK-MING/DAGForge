@@ -1,11 +1,14 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/core/error.hpp"
 #include "dagforge/dag/dag.hpp"
 #include "dagforge/dag/dag_manager.hpp"
+#endif
 
 #include <format>
 #include <string>
+
 
 namespace dagforge {
 

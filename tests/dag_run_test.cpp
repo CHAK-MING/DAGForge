@@ -5,6 +5,8 @@
 
 #include "gtest/gtest.h"
 
+#include <memory_resource>
+
 using namespace dagforge;
 
 class DAGRunTest : public ::testing::Test {
@@ -77,7 +79,8 @@ TEST_F(DAGRunTest, SetFinishedAt) {
 
 TEST(DAGRunRowidTest, SetRunRowidPropagatesToTaskInfos) {
   DAG dag;
-  ASSERT_TRUE(dag.add_node(TaskId{"task1"}, TriggerRule::AllSuccess).has_value());
+  ASSERT_TRUE(
+      dag.add_node(TaskId{"task1"}, TriggerRule::AllSuccess).has_value());
   auto run_result =
       DAGRun::create(DAGRunId("rowid_run"), std::make_shared<DAG>(dag));
   ASSERT_TRUE(run_result.has_value());
@@ -158,6 +161,9 @@ TEST_F(DAGRunTest, WithTasks) {
 
   auto ready = run.get_ready_tasks();
   EXPECT_EQ(ready.size(), 1);
+  auto first_info = run.get_task_info(ready[0]);
+  ASSERT_TRUE(first_info.has_value());
+  EXPECT_EQ(first_info->state, TaskState::Ready);
 }
 
 TEST_F(DAGRunTest, TaskLifecycleStartToComplete) {
@@ -191,6 +197,27 @@ TEST_F(DAGRunTest, TaskLifecycleStartToComplete) {
   EXPECT_EQ(run.state(), DAGRunState::Success);
 }
 
+TEST_F(DAGRunTest, TaskStartUsesProvidedTimestamp) {
+  DAG dag;
+  auto idx_result = dag.add_node(TaskId("task1"));
+  ASSERT_TRUE(idx_result.has_value());
+  auto idx = *idx_result;
+
+  auto run_result = DAGRun::create(DAGRunId("lifecycle_timestamp_test"),
+                                   std::make_shared<DAG>(dag));
+  ASSERT_TRUE(run_result.has_value());
+  auto &run = *run_result;
+
+  const auto started_at =
+      std::chrono::system_clock::time_point{std::chrono::milliseconds{1234}};
+  ASSERT_TRUE(run.mark_task_started(idx, InstanceId("inst1"), started_at));
+
+  auto info = run.get_task_info(idx);
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->state, TaskState::Running);
+  EXPECT_EQ(info->started_at, started_at);
+}
+
 TEST_F(DAGRunTest, TaskFailureWithRetry) {
   DAG dag;
   auto idx_result = dag.add_node(TaskId("task1"));
@@ -217,9 +244,31 @@ TEST_F(DAGRunTest, TaskFailureWithRetry) {
   ASSERT_TRUE(run.mark_task_retry_ready(idx));
   info = run.get_task_info(idx);
   ASSERT_TRUE(info.has_value());
-  EXPECT_EQ(info->state, TaskState::Pending);
+  EXPECT_EQ(info->state, TaskState::Ready);
   EXPECT_EQ(run.ready_count(), 1);
   EXPECT_FALSE(run.is_complete());
+}
+
+TEST_F(DAGRunTest, SeparatesPendingFromReadyStates) {
+  DAG dag;
+  auto root = dag.add_node(TaskId("root"));
+  auto leaf = dag.add_node(TaskId("leaf"));
+  ASSERT_TRUE(root.has_value());
+  ASSERT_TRUE(leaf.has_value());
+  ASSERT_TRUE(dag.add_edge(*root, *leaf).has_value());
+
+  auto run_result =
+      DAGRun::create(DAGRunId("pending_vs_ready"), std::make_shared<DAG>(dag));
+  ASSERT_TRUE(run_result.has_value());
+  auto &run = *run_result;
+
+  auto root_info = run.get_task_info(*root);
+  auto leaf_info = run.get_task_info(*leaf);
+  ASSERT_TRUE(root_info.has_value());
+  ASSERT_TRUE(leaf_info.has_value());
+
+  EXPECT_EQ(root_info->state, TaskState::Ready);
+  EXPECT_EQ(leaf_info->state, TaskState::Pending);
 }
 
 TEST_F(DAGRunTest, TaskFailureExhaustedRetries) {
@@ -233,12 +282,13 @@ TEST_F(DAGRunTest, TaskFailureExhaustedRetries) {
   ASSERT_TRUE(run_result.has_value());
   auto &run = *run_result;
 
-  // Exhaust all retries
-  for (int i = 0; i < 3; ++i) {
+  // Exhaust all retries: with max_retries=3, the 4th failed attempt is
+  // terminal.
+  for (int i = 0; i < 4; ++i) {
     ASSERT_TRUE(
         run.mark_task_started(idx, InstanceId("inst" + std::to_string(i))));
     ASSERT_TRUE(run.mark_task_failed(idx, "error", 3));
-    if (i < 2) {
+    if (i < 3) {
       ASSERT_TRUE(run.mark_task_retry_ready(idx));
     }
   }
@@ -380,4 +430,107 @@ TEST_F(DAGRunTest, ReadyTasksPreserveActivationOrder) {
   ASSERT_EQ(ready.size(), 2);
   EXPECT_EQ(ready[0], *second);
   EXPECT_EQ(ready[1], *first);
+}
+
+TEST_F(DAGRunTest, ReadyTaskStreamMatchesReadyOrder) {
+  DAG dag;
+  auto first = dag.add_node(TaskId("first"));
+  auto second = dag.add_node(TaskId("second"));
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(second.has_value());
+
+  auto run_result = DAGRun::create(DAGRunId("ready_stream_order"),
+                                   std::make_shared<DAG>(dag));
+  ASSERT_TRUE(run_result.has_value());
+  auto &run = *run_result;
+
+  ASSERT_TRUE(run.mark_task_started(*first, InstanceId("inst-first")));
+  ASSERT_TRUE(run.mark_task_failed(*first, "error", 1));
+  ASSERT_TRUE(run.mark_task_started(*second, InstanceId("inst-second")));
+  ASSERT_TRUE(run.mark_task_failed(*second, "error", 1));
+  ASSERT_TRUE(run.mark_task_retry_ready(*second));
+  ASSERT_TRUE(run.mark_task_retry_ready(*first));
+
+  pmr::monotonic_buffer_resource resource;
+  pmr::vector<NodeIndex> from_copy{&resource};
+  run.copy_ready_tasks(from_copy);
+  auto ready = run.get_ready_tasks();
+  ASSERT_EQ(from_copy.size(), ready.size());
+  EXPECT_EQ(from_copy[0], ready[0]);
+  EXPECT_EQ(from_copy[1], ready[1]);
+}
+
+TEST_F(DAGRunTest, CompletionDeltaCapturesNewlyReadyDownstreamTasks) {
+  DAG dag;
+  auto root = dag.add_node(TaskId("root"));
+  auto leaf = dag.add_node(TaskId("leaf"));
+  ASSERT_TRUE(root.has_value());
+  ASSERT_TRUE(leaf.has_value());
+  ASSERT_TRUE(dag.add_edge(*root, *leaf).has_value());
+
+  auto run_result =
+      DAGRun::create(DAGRunId("completion_delta"), std::make_shared<DAG>(dag));
+  ASSERT_TRUE(run_result.has_value());
+  auto &run = *run_result;
+
+  ASSERT_TRUE(run.mark_task_started(*root, InstanceId("inst-root")));
+  auto delta = run.mark_task_completed(*root, 0);
+  ASSERT_TRUE(delta.has_value());
+
+  ASSERT_EQ(delta->ready_tasks.size(), 1U);
+  EXPECT_EQ(delta->ready_tasks.front(), *leaf);
+  EXPECT_TRUE(delta->terminal_tasks.empty());
+}
+
+TEST_F(DAGRunTest, FailureDeltaCapturesPropagatedTerminalTasks) {
+  DAG dag;
+  auto root = dag.add_node(TaskId("root"));
+  auto mid = dag.add_node(TaskId("mid"));
+  auto leaf = dag.add_node(TaskId("leaf"));
+  ASSERT_TRUE(root.has_value());
+  ASSERT_TRUE(mid.has_value());
+  ASSERT_TRUE(leaf.has_value());
+  ASSERT_TRUE(dag.add_edge(*root, *mid).has_value());
+  ASSERT_TRUE(dag.add_edge(*mid, *leaf).has_value());
+
+  auto run_result =
+      DAGRun::create(DAGRunId("failure_delta"), std::make_shared<DAG>(dag));
+  ASSERT_TRUE(run_result.has_value());
+  auto &run = *run_result;
+
+  ASSERT_TRUE(run.mark_task_started(*root, InstanceId("inst-root")));
+  auto delta = run.mark_task_failed(*root, "boom", 0);
+  ASSERT_TRUE(delta.has_value());
+
+  ASSERT_EQ(delta->terminal_tasks.size(), 2U);
+  EXPECT_EQ(delta->terminal_tasks[0], *mid);
+  EXPECT_EQ(delta->terminal_tasks[1], *leaf);
+  EXPECT_TRUE(delta->ready_tasks.empty());
+
+  auto mid_info = run.get_task_info(*mid);
+  auto leaf_info = run.get_task_info(*leaf);
+  ASSERT_TRUE(mid_info.has_value());
+  ASSERT_TRUE(leaf_info.has_value());
+  EXPECT_EQ(mid_info->state, TaskState::UpstreamFailed);
+  EXPECT_EQ(leaf_info->state, TaskState::UpstreamFailed);
+}
+
+TEST_F(DAGRunTest, RetryReadyDeltaCapturesReactivatedTask) {
+  DAG dag;
+  auto idx = dag.add_node(TaskId("retryable"));
+  ASSERT_TRUE(idx.has_value());
+
+  auto run_result =
+      DAGRun::create(DAGRunId("retry_ready_delta"), std::make_shared<DAG>(dag));
+  ASSERT_TRUE(run_result.has_value());
+  auto &run = *run_result;
+
+  ASSERT_TRUE(run.mark_task_started(*idx, InstanceId("inst-retry")));
+  ASSERT_TRUE(run.mark_task_failed(*idx, "retry", 1));
+
+  auto delta = run.mark_task_retry_ready(*idx);
+  ASSERT_TRUE(delta.has_value());
+  ASSERT_EQ(delta->ready_tasks.size(), 1U);
+  EXPECT_EQ(delta->ready_tasks.front(), *idx);
+  EXPECT_TRUE(delta->terminal_tasks.empty());
 }

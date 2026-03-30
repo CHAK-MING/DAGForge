@@ -8,11 +8,13 @@ import {
   listHistory,
   getRunDetail,
   getRunTasks,
+  getRunLogs,
   getRunXCom,
   DAGInfo,
   RunRecord,
   RunDetail,
   TaskRunRecord,
+  TaskLogEntry,
   RunXComResponse,
 } from "@/lib/api";
 import { toast } from "sonner";
@@ -104,6 +106,16 @@ export function useRunTasksQuery(runId: string | undefined, refetchInterval?: nu
   return useQuery<TaskRunRecord[]>({
     queryKey: ['run-tasks', runId],
     queryFn: () => getRunTasks(runId!),
+    enabled: !!runId,
+    staleTime: 2000,
+    refetchInterval,
+  });
+}
+
+export function useRunLogsQuery(runId: string | undefined, limit: number = 10000, refetchInterval?: number) {
+  return useQuery<TaskLogEntry[]>({
+    queryKey: ['run-logs', runId, limit],
+    queryFn: () => getRunLogs(runId!, limit),
     enabled: !!runId,
     staleTime: 2000,
     refetchInterval,

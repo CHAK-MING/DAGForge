@@ -1,7 +1,12 @@
 #pragma once
 
+#if !defined(DAGFORGE_BUILDING_MODULE_INTERFACE) &&                              \
+    (!defined(DAGFORGE_CONSUME_NAMED_MODULES) ||                                \
+     !DAGFORGE_CONSUME_NAMED_MODULES)
 #include "dagforge/core/error.hpp"
+#endif
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include <boost/url/encode.hpp>
 #include <boost/url/rfc/unreserved_chars.hpp>
 #include <boost/url/url_view.hpp>
@@ -9,6 +14,8 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#endif
+
 
 namespace dagforge::util {
 

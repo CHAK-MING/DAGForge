@@ -5,6 +5,8 @@
 #include <array>
 #include <optional>
 #include <ranges>
+
+
 namespace dagforge::http {
 
 using dagforge::StringEqual;
@@ -114,6 +116,35 @@ struct Router::Impl {
 
     return true;
   }
+
+  auto route_exists_for_other_method(std::string_view route_path,
+                                     HttpMethod current_method) const -> bool {
+    const auto path_segments = split_path_views(route_path);
+    for (std::size_t index = 0; index < methods.size(); ++index) {
+      if (index == method_index(current_method)) {
+        continue;
+      }
+
+      const auto &method_routes = methods[index];
+      if (method_routes.static_lookup.contains(std::string(route_path))) {
+        return true;
+      }
+
+      auto dyn_it = method_routes.dynamic_by_segments.find(path_segments.size());
+      if (dyn_it == method_routes.dynamic_by_segments.end()) {
+        continue;
+      }
+
+      HttpRequest probe;
+      for (const auto &route : dyn_it->second) {
+        if (match_route(route.parsed, path_segments, probe)) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
 };
 
 Router::Router() : impl_(std::make_unique<Impl>()) {}
@@ -161,25 +192,32 @@ auto Router::del(std::string path, RouteHandler handler) -> void {
 }
 
 auto Router::route(HttpRequest req) -> dagforge::task<HttpResponse> {
-  auto path_segments = Impl::split_path_views(req.path);
+  const auto query_pos = req.path.find('?');
+  const std::string_view route_path =
+      query_pos == std::string::npos
+          ? std::string_view(req.path)
+          : std::string_view(req.path).substr(0, query_pos);
+  auto path_segments = Impl::split_path_views(route_path);
 
   auto &method_routes = impl_->methods[Impl::method_index(req.method)];
 
-  if (auto it = method_routes.static_lookup.find(req.path);
+  if (auto it = method_routes.static_lookup.find(std::string(route_path));
       it != method_routes.static_lookup.end()) {
     co_return co_await method_routes.static_routes[it->second].handler(
         std::move(req));
   }
 
   auto dyn_it = method_routes.dynamic_by_segments.find(path_segments.size());
-  if (dyn_it == method_routes.dynamic_by_segments.end()) {
-    co_return HttpResponse::not_found();
+  if (dyn_it != method_routes.dynamic_by_segments.end()) {
+    for (auto &route : dyn_it->second) {
+      if (Impl::match_route(route.parsed, path_segments, req)) {
+        co_return co_await route.handler(std::move(req));
+      }
+    }
   }
 
-  for (auto &route : dyn_it->second) {
-    if (Impl::match_route(route.parsed, path_segments, req)) {
-      co_return co_await route.handler(std::move(req));
-    }
+  if (impl_->route_exists_for_other_method(route_path, req.method)) {
+    co_return HttpResponse{.status = HttpStatus::MethodNotAllowed};
   }
 
   co_return HttpResponse::not_found();

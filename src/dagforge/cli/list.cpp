@@ -1,10 +1,8 @@
 #include "dagforge/cli/commands.hpp"
+#include "dagforge/cli/context.hpp"
 #include "dagforge/cli/formatting.hpp"
-#include "dagforge/cli/management_client.hpp"
-#include "dagforge/config/config.hpp"
-#include "dagforge/config/dag_definition.hpp"
+#include "dagforge/config/dag_info_loader.hpp"
 #include "dagforge/config/dag_file_loader.hpp"
-#include "dagforge/dag/dag_domain.hpp"
 #include "dagforge/util/json.hpp"
 #include "dagforge/util/log.hpp"
 
@@ -16,30 +14,25 @@
 #include <unordered_map>
 #include <unordered_set>
 
+
 namespace dagforge::cli {
 
 auto cmd_list_dags(const ListDagsOptions &opts) -> int {
   log::set_output_stderr();
-  auto config_res = ConfigLoader::load_from_file(opts.config_file);
-  if (!config_res) {
-    std::println(stderr, "Error: {}", config_res.error().message());
+  auto ctx = load_context_or_print(opts.config_file);
+  if (!ctx) {
     return 1;
   }
+  auto &config = ctx->config;
+  auto &client = ctx->db();
 
-  ManagementClient client(config_res->database);
-
-  if (auto r = client.open(); !r) {
-    std::println(stderr, "Error: {}", r.error().message());
-    return 1;
-  }
-
-  const bool has_file_source = !config_res->dag_source.directory.empty();
+  const bool has_file_source = !config.dag_source.directory.empty();
   std::vector<DAGInfo> dags;
   std::unordered_set<std::string> dag_ids;
   std::unordered_map<std::string, std::string> dag_sources;
 
-  if (!config_res->dag_source.directory.empty()) {
-    DAGFileLoader loader(config_res->dag_source.directory);
+  if (!config.dag_source.directory.empty()) {
+    DAGFileLoader loader(config.dag_source.directory);
     auto file_dags = loader.load_all();
     if (!file_dags) {
       std::println(stderr, "Error: {}", file_dags.error().message());
@@ -47,7 +40,7 @@ auto cmd_list_dags(const ListDagsOptions &opts) -> int {
     }
     dags.reserve(file_dags->size());
     for (auto &dag_file : *file_dags) {
-      DAGInfo dag = std::move(dag_file.definition);
+      DAGInfo dag = std::move(dag_file.info);
       dag.dag_id = dag_file.dag_id;
       dag.rebuild_task_index();
       dag_ids.insert(dag.dag_id.str());
@@ -85,11 +78,11 @@ auto cmd_list_dags(const ListDagsOptions &opts) -> int {
       continue;
     }
     const auto dag_file =
-        std::filesystem::path(config_res->dag_source.directory) /
+        std::filesystem::path(config.dag_source.directory) /
         std::format("{}.toml", id.str());
     if (std::filesystem::exists(dag_file)) {
       if (auto dag_from_file =
-              DAGDefinitionLoader::load_from_file(dag_file.string());
+              DAGInfoLoader::load_from_file(dag_file.string());
           dag_from_file) {
         merge_db_state_into_dag_info(*dag_from_file, db_dag);
         dag_ids.insert(dag_from_file->dag_id.str());
@@ -167,18 +160,11 @@ auto cmd_list_dags(const ListDagsOptions &opts) -> int {
 
 auto cmd_list_runs(const ListRunsOptions &opts) -> int {
   log::set_output_stderr();
-  auto config_res = ConfigLoader::load_from_file(opts.config_file);
-  if (!config_res) {
-    std::println(stderr, "Error: {}", config_res.error().message());
+  auto ctx = load_context_or_print(opts.config_file);
+  if (!ctx) {
     return 1;
   }
-
-  ManagementClient client(config_res->database);
-
-  if (auto r = client.open(); !r) {
-    std::println(stderr, "Error: {}", r.error().message());
-    return 1;
-  }
+  auto &client = ctx->db();
 
   auto result = opts.dag_id.empty()
                     ? client.list_runs(opts.limit)
@@ -303,27 +289,22 @@ auto dag_to_json(const DAGInfo &dag, bool include_dag_id) -> JsonValue {
 
 auto cmd_list_tasks(const ListTasksOptions &opts) -> int {
   log::set_output_stderr();
-  auto config_res = ConfigLoader::load_from_file(opts.config_file);
-  if (!config_res) {
-    std::println(stderr, "Error: {}", config_res.error().message());
+  auto ctx = load_context_or_print(opts.config_file);
+  if (!ctx) {
     return 1;
   }
-
-  ManagementClient client(config_res->database);
-  if (auto r = client.open(); !r) {
-    std::println(stderr, "Error: {}", r.error().message());
-    return 1;
-  }
+  auto &config = ctx->config;
+  auto &client = ctx->db();
 
   const bool json_mode = opts.json || opts.output == "json";
   // Single DAG mode
   if (!opts.dag_id.empty()) {
     const auto dag_file =
-        std::filesystem::path(config_res->dag_source.directory) /
+        std::filesystem::path(config.dag_source.directory) /
         std::format("{}.toml", opts.dag_id);
     std::optional<DAGInfo> dag;
     if (std::filesystem::exists(dag_file)) {
-      if (auto r = DAGDefinitionLoader::load_from_file(dag_file.string()); r) {
+      if (auto r = DAGInfoLoader::load_from_file(dag_file.string()); r) {
         dag = std::move(*r);
       }
     }

@@ -5,6 +5,8 @@ export interface Translations {
     loading: string;
     error: string;
     success: string;
+    copy: string;
+    manualOnly: string;
     warning: string;
     confirm: string;
     cancel: string;
@@ -57,16 +59,27 @@ export interface Translations {
     runningInstances: string;
     recentSuccessRate: string;
     noMatchingDags: string;
+    autoRefreshOn: string;
+    autoRefreshOff: string;
+    tableName: string;
+    tableTasks: string;
+    tableHistory: string;
+    tableStatus: string;
+    tableActions: string;
+    vsYesterday: string;
   };
   dags: {
     title: string;
     subtitle: string;
     searchPlaceholder: string;
     totalCount: string;
+    pageInfo: string;
     noDescription: string;
     taskCount: string;
     trigger: string;
     triggering: string;
+    prevPage: string;
+    nextPage: string;
     notFound: string;
     adjustSearch: string;
   };
@@ -76,18 +89,41 @@ export interface Translations {
     taskDefinitions: string;
     flowGraph: string;
     runInstances: string;
+    logs: string;
+    logsDescription: string;
     xcomData: string;
     xcomDescription: string;
     selectRun: string;
+    selectTask: string;
+    task: string;
+    time: string;
     noRuns: string;
     clickTrigger: string;
     noXcom: string;
+    noLogs: string;
+    waitingLogs: string;
     showingRunStatus: string;
     selectRunToView: string;
     started: string;
     finished: string;
     dependsOn: string;
+    dependenciesShort: string;
+    branch: string;
     executor: string;
+    sensorType: string;
+    sensorTarget: string;
+    stream: string;
+    stdout: string;
+    stderr: string;
+    live: string;
+    disconnected: string;
+    autoScroll: string;
+    allTasks: string;
+    allStreams: string;
+    jumpToLatest: string;
+    taskSearchPlaceholder: string;
+    firstAttempt: string;
+    retriedTimes: string;
     executionTime: string;
     variables: string;
   };
@@ -96,6 +132,7 @@ export interface Translations {
     success: string;
     failed: string;
     pending: string;
+    ready: string;
     upstreamFailed: string;
     retrying: string;
     skipped: string;
@@ -188,11 +225,17 @@ export interface Translations {
     noResults: string;
     navigation: string;
     recentRuns: string;
+    shortcuts: string;
+    navigateHint: string;
+    selectHint: string;
+    closeHint: string;
   };
   toast: {
     dagTriggered: string;
     dagTriggerFailed: string;
     newRunCreated: string;
+    commandCopied: string;
+    commandCopyFailed: string;
     fetchDagsFailed: string;
     fetchDagDetailFailed: string;
     fetchHistoryFailed: string;
@@ -207,6 +250,8 @@ const zhTranslations: Translations = {
     loading: '加载中…',
     error: '错误',
     success: '成功',
+    copy: '复制',
+    manualOnly: '仅手动',
     warning: '警告',
     confirm: '确认',
     cancel: '取消',
@@ -248,7 +293,7 @@ const zhTranslations: Translations = {
     successRate: '成功率',
     moreMetrics: '更多指标',
     hideMetrics: '收起详细指标',
-    searchPlaceholder: '搜索 DAG 名称或描述...',
+    searchPlaceholder: '搜索 DAG 名称、ID 或描述...',
     allDags: '全部',
     healthy: '健康',
     abnormal: '异常',
@@ -259,16 +304,27 @@ const zhTranslations: Translations = {
     runningInstances: '个运行中',
     recentSuccessRate: '近期成功率',
     noMatchingDags: '未找到匹配的 DAG',
+    autoRefreshOn: '自动刷新 (5s)',
+    autoRefreshOff: '已暂停刷新',
+    tableName: '名称',
+    tableTasks: '任务数',
+    tableHistory: '运行历史',
+    tableStatus: '状态',
+    tableActions: '操作',
+    vsYesterday: '较昨日',
   },
   dags: {
     title: 'DAGs',
     subtitle: '查看所有工作流',
-    searchPlaceholder: '搜索 DAG…',
+    searchPlaceholder: '搜索 DAG 名称或 ID…',
     totalCount: '共 {count} 个 DAG',
+    pageInfo: '第 {page} / {total} 页',
     noDescription: '暂无描述',
     taskCount: '{count} 个任务',
     trigger: '运行',
     triggering: '触发中…',
+    prevPage: '上一页',
+    nextPage: '下一页',
     notFound: '未找到匹配的 DAG',
     adjustSearch: '尝试调整搜索条件',
   },
@@ -278,18 +334,47 @@ const zhTranslations: Translations = {
     taskDefinitions: '任务定义',
     flowGraph: '流程图',
     runInstances: '运行实例',
+    logs: '日志',
+    logsDescription: '查看任务输出与实时日志流',
     xcomData: 'XCom 数据',
     xcomDescription: '任务间传递的数据',
     selectRun: '选择运行实例',
+    selectTask: '选择任务',
+    task: '任务',
+    time: '时间',
     noRuns: '暂无运行实例',
     clickTrigger: '点击“触发运行”开始执行',
     noXcom: '该实例没有 XCom 数据',
+    noLogs: '该运行实例暂无日志',
+    waitingLogs: '等待日志输出…',
     showingRunStatus: '显示 Run #{number} 的执行状态',
     selectRunToView: '选择运行实例查看状态',
     started: '开始',
     finished: '结束',
     dependsOn: '依赖任务',
+    dependenciesShort: '依赖',
+    branch: '分支',
     executor: '执行器',
+    sensorType: '传感器类型',
+    sensorTarget: '探测目标',
+    stream: '日志流',
+    stdout: '标准输出',
+    stderr: '错误输出',
+    live: '实时连接',
+    disconnected: '连接中断',
+    autoScroll: '自动滚动',
+    allTasks: '全部任务',
+    allStreams: '全部日志流',
+    jumpToLatest: '跳到最新',
+    taskSearchPlaceholder: '搜索任务名称或 ID',
+    firstAttempt: '首次执行',
+    retriedTimes: '已重试 {count} 次',
+    triggerRule: '触发规则',
+    attempt: '尝试次数',
+    exitCode: '退出码',
+    error: '错误信息',
+    command: '命令',
+    xcomStats: 'XCom',
     executionTime: '执行时长',
     variables: '个变量',
   },
@@ -297,7 +382,8 @@ const zhTranslations: Translations = {
     running: '运行中',
     success: '成功',
     failed: '失败',
-    pending: '等待中',
+    pending: '等待依赖',
+    ready: '可运行',
     upstreamFailed: '上游失败',
     retrying: '重试中',
     skipped: '已跳过',
@@ -313,6 +399,8 @@ const zhTranslations: Translations = {
     dagTriggered: '已触发 DAG',
     dagTriggerFailed: '触发 DAG 失败',
     newRunCreated: '已创建新的运行实例',
+    commandCopied: '命令已复制',
+    commandCopyFailed: '复制命令失败',
     fetchDagsFailed: '获取 DAG 列表失败',
     fetchDagDetailFailed: '获取 DAG 详情失败',
     fetchHistoryFailed: '获取运行历史失败',
@@ -401,6 +489,10 @@ const zhTranslations: Translations = {
     noResults: '未找到结果',
     navigation: '导航',
     recentRuns: '最近运行',
+    shortcuts: '快捷键提示',
+    navigateHint: '导航',
+    selectHint: '选择',
+    closeHint: '关闭',
   },
 };
 
@@ -409,6 +501,8 @@ const enTranslations: Translations = {
     loading: 'Loading…',
     error: 'Error',
     success: 'Success',
+    copy: 'Copy',
+    manualOnly: 'None',
     warning: 'Warning',
     confirm: 'Confirm',
     cancel: 'Cancel',
@@ -418,11 +512,11 @@ const enTranslations: Translations = {
     search: 'Search',
     refresh: 'Refresh',
     back: 'Back',
-    viewAll: 'View all',
-    noData: 'No data',
-    run: 'Run',
+    viewAll: 'View All',
+    noData: 'No data found',
+    run: 'Trigger',
     pause: 'Pause',
-    resume: 'Resume',
+    resume: 'Unpause',
     paused: 'Paused',
     home: 'Home',
     yes: 'Yes',
@@ -431,151 +525,194 @@ const enTranslations: Translations = {
   nav: {
     dashboard: 'Dashboard',
     dags: 'DAGs',
-    history: 'History',
+    history: 'DAG Runs',
     settings: 'Settings',
   },
   dashboard: {
     title: 'Dashboard',
-    subtitle: 'Scheduling overview',
+    subtitle: 'DAG orchestration and system metrics overview',
     dagCount: 'DAGs',
-    activeRuns: 'Active runs',
+    activeRuns: 'Active Runs',
     totalTasks: 'Total Tasks',
     systemStatus: 'System Status',
     running: 'Running',
     stopped: 'Stopped',
     quickActions: 'Quick Actions',
-    schedulerEngine: 'Scheduler Engine',
+    schedulerEngine: 'Scheduler',
     dags: 'DAGs',
     failedTasks: 'Failed Tasks',
     successRate: 'Success Rate',
     moreMetrics: 'More Metrics',
     hideMetrics: 'Hide Details',
-    searchPlaceholder: 'Search DAG name or description...',
-    allDags: 'All',
+    searchPlaceholder: 'Search DAGs by name, ID, or description...',
+    allDags: 'All DAGs',
     healthy: 'Healthy',
-    abnormal: 'Abnormal',
-    runHistory: 'Run History',
+    abnormal: 'Critical',
+    runHistory: 'DAG Runs',
     runs: 'runs',
-    noRecords: 'No records',
-    queueBacklog: 'Queue Backlog',
+    noRecords: 'No DAG runs found',
+    queueBacklog: 'Queued Tasks',
     runningInstances: 'running',
-    recentSuccessRate: 'Recent Success Rate',
+    recentSuccessRate: 'Success Rate (Recent)',
     noMatchingDags: 'No matching DAGs found',
+    autoRefreshOn: 'Auto-refresh (5s)',
+    autoRefreshOff: 'Refresh Paused',
+    tableName: 'DAG',
+    tableTasks: 'Tasks',
+    tableHistory: 'Recent Runs',
+    tableStatus: 'Status',
+    tableActions: 'Actions',
+    vsYesterday: 'vs yesterday',
   },
   dags: {
     title: 'DAGs',
-    subtitle: 'All workflows at a glance',
+    subtitle: 'Manage and monitor your DAGs',
     searchPlaceholder: 'Search DAGs…',
-    totalCount: '{count} DAGs',
+    totalCount: '{count} DAGs total',
+    pageInfo: 'Page {page} of {total}',
     noDescription: 'No description',
     taskCount: '{count} tasks',
-    trigger: 'Run',
+    trigger: 'Trigger DAG',
     triggering: 'Triggering…',
+    prevPage: 'Previous',
+    nextPage: 'Next',
     notFound: 'No matching DAGs found',
-    adjustSearch: 'Try adjusting your search',
+    adjustSearch: 'Try adjusting your search criteria',
   },
   dagDetail: {
-    backToDags: 'Back to DAG list',
-    triggerRun: 'Trigger run',
-    taskDefinitions: 'Task Definitions',
-    flowGraph: 'Flow Graph',
-    runInstances: 'Run instances',
-    xcomData: 'XCom Data',
-    xcomDescription: 'Data passed between tasks',
-    selectRun: 'Select a run',
-    noRuns: 'No run instances yet',
-    clickTrigger: 'Click “Trigger run” to start',
+    backToDags: 'Back to DAGs',
+    triggerRun: 'Trigger DAG',
+    taskDefinitions: 'Tasks',
+    flowGraph: 'Graph',
+    runInstances: 'DAG Runs',
+    logs: 'Logs',
+    logsDescription: 'View task instance logs and real-time output',
+    xcomData: 'XCom',
+    xcomDescription: 'Cross-communication data between tasks',
+    selectRun: 'Select Run',
+    selectTask: 'Select Task',
+    task: 'Task',
+    time: 'Time',
+    noRuns: 'No run history available',
+    clickTrigger: 'Click “Trigger DAG” to start execution',
     noXcom: 'No XCom data for this run',
-    showingRunStatus: 'Showing status for Run #{number}',
-    selectRunToView: 'Select a run to view status',
-    started: 'Started',
-    finished: 'Finished',
+    noLogs: 'No logs for this run',
+    waitingLogs: 'Waiting for logs…',
+    showingRunStatus: 'Status for Run #{number}',
+    selectRunToView: 'Select a DAG run to view details',
+    started: 'Start Date',
+    finished: 'End Date',
     dependsOn: 'Dependencies',
+    dependenciesShort: 'deps',
+    branch: 'Branch',
     executor: 'Executor',
-    executionTime: 'Run time',
+    sensorType: 'Sensor Type',
+    sensorTarget: 'Sensor Target',
+    stream: 'Stream',
+    stdout: 'stdout',
+    stderr: 'stderr',
+    live: 'Live',
+    disconnected: 'Disconnected',
+    autoScroll: 'Auto-scroll',
+    allTasks: 'All Tasks',
+    allStreams: 'All Streams',
+    jumpToLatest: 'Jump to Latest',
+    taskSearchPlaceholder: 'Filter by task ID',
+    firstAttempt: '1st Attempt',
+    retriedTimes: 'Retried {count} times',
+    triggerRule: 'Trigger Rule',
+    attempt: 'Attempt',
+    exitCode: 'Exit Code',
+    error: 'Error',
+    command: 'Command',
+    xcomStats: 'XCom',
+    executionTime: 'Duration',
     variables: 'variables',
   },
   runStatus: {
     running: 'Running',
     success: 'Success',
     failed: 'Failed',
-    pending: 'Pending',
-    upstreamFailed: 'Upstream failed',
-    retrying: 'Retrying',
+    pending: 'Awaiting Dependencies',
+    ready: 'Queued',
+    upstreamFailed: 'Upstream Failed',
+    retrying: 'Up for Retry',
     skipped: 'Skipped',
-    noRun: 'Not run',
+    noRun: 'None',
     inactive: 'Inactive',
   },
   triggerType: {
     manual: 'Manual',
-    schedule: 'Schedule',
+    schedule: 'Scheduled',
     api: 'API',
   },
   toast: {
     dagTriggered: 'DAG triggered',
     dagTriggerFailed: 'Failed to trigger DAG',
-    newRunCreated: 'New run instance created',
-    fetchDagsFailed: 'Failed to fetch DAG list',
+    newRunCreated: 'Created new DAG run',
+    commandCopied: 'Command copied to clipboard',
+    commandCopyFailed: 'Failed to copy command',
+    fetchDagsFailed: 'Failed to fetch DAGs',
     fetchDagDetailFailed: 'Failed to fetch DAG details',
-    fetchHistoryFailed: 'Failed to fetch run history',
-    unknownError: 'Unknown error',
-    cannotTriggerEmptyDAG: 'Cannot trigger DAG',
+    fetchHistoryFailed: 'Failed to fetch DAG runs',
+    unknownError: 'An unexpected error occurred',
+    cannotTriggerEmptyDAG: 'Cannot trigger empty DAG',
     noDagTasks: 'This DAG has no tasks',
   },
   history: {
-    title: 'Run history',
-    subtitle: 'View DAG execution records',
-    searchPlaceholder: 'Search DAGs…',
-    allStatus: 'All statuses',
-    noRecords: 'No records yet',
-    executionDate: 'Execution time',
+    title: 'DAG Runs',
+    subtitle: 'History of all DAG executions',
+    searchPlaceholder: 'Filter by DAG ID…',
+    allStatus: 'All Statuses',
+    noRecords: 'No execution history',
+    executionDate: 'Execution Date',
     tasks: 'tasks',
     failed: 'Failed',
-    inProgress: 'In progress',
+    inProgress: 'In Progress',
     duration: 'Duration',
-    records: 'Records',
+    records: 'Runs',
   },
   settings: {
-    title: 'System settings',
-    subtitle: 'Configuration & status',
+    title: 'Settings',
+    subtitle: 'System configuration and health status',
     systemStatus: 'System Status',
-    systemStatusDesc: 'Current system status',
-    healthStatus: 'Health Status',
+    systemStatusDesc: 'Current operational status',
+    healthStatus: 'Health',
     healthy: 'Healthy',
     unhealthy: 'Unhealthy',
-    lastUpdated: 'Last Updated',
+    lastUpdated: 'Last Update',
     resourceStats: 'Resource Stats',
-    resourceStatsDesc: 'DAG run stats',
+    resourceStatsDesc: 'Aggregate execution metrics',
     totalDAGs: 'Total DAGs',
-    activeRuns: 'Active runs',
+    activeRuns: 'Active Runs',
     language: 'Language',
-    languageDesc: 'Select interface language',
-    zh: '中文',
+    languageDesc: 'Choose interface language',
+    zh: 'Chinese (简体中文)',
     en: 'English',
     notifications: 'Notifications',
     clearAll: 'Clear All',
-    noNotifications: 'No notifications yet',
+    noNotifications: 'No notifications',
     appearance: 'Appearance',
-    appearanceDesc: 'Customize your experience',
+    appearanceDesc: 'Customize the look and feel',
     theme: 'Theme',
     themeDesc: 'Select interface theme',
     themeLight: 'Light',
     themeDark: 'Dark',
     themeSystem: 'System',
-    selectLanguage: 'Select interface language',
+    selectLanguage: 'Select Language',
     dataRefresh: 'Data Refresh',
-    dataRefreshDesc: 'Control automatic data refresh',
+    dataRefreshDesc: 'Configure auto-refresh behavior',
     refreshInterval: 'Refresh Interval',
-    refreshIntervalDesc: 'Set data refresh frequency',
-    interval3s: '3 seconds',
-    interval5s: '5 seconds',
-    interval10s: '10 seconds',
-    interval30s: '30 seconds',
+    refreshIntervalDesc: 'Frequency of UI updates',
+    interval3s: '3 Seconds',
+    interval5s: '5 Seconds',
+    interval10s: '10 Seconds',
+    interval30s: '30 Seconds',
     intervalOff: 'Off',
-    notifyOnFailure: 'Failure Notifications',
-    notifyOnFailureDesc: 'Alert when DAG runs fail',
+    notifyOnFailure: 'Failure Alerts',
+    notifyOnFailureDesc: 'Notify on DAG run failures',
     systemInfo: 'System Information',
-    systemInfoDesc: 'About DAGForge system',
+    systemInfoDesc: 'Technical details of this instance',
     webUIVersion: 'Web UI Version',
     apiEndpoint: 'API Endpoint',
     buildTime: 'Build Time',
@@ -583,26 +720,30 @@ const enTranslations: Translations = {
     languageSwitchedZh: '语言已切换为中文',
     languageSwitchedEn: 'Language switched to English',
     refreshDisabled: 'Auto-refresh disabled',
-    refreshIntervalSet: 'Refresh interval set to {seconds} seconds',
-    notifyEnabled: 'Failure notifications enabled',
-    notifyDisabled: 'Failure notifications disabled',
+    refreshIntervalSet: 'Refresh interval set to {seconds}s',
+    notifyEnabled: 'Failure alerts enabled',
+    notifyDisabled: 'Failure alerts disabled',
   },
   notFound: {
-    title: 'Page not found',
-    message: 'Sorry, we couldn’t find {path}',
-    backHome: 'Back home',
-    viewDAGs: 'View DAG list',
+    title: 'Page Not Found',
+    message: 'Could not find path: {path}',
+    backHome: 'Back to Dashboard',
+    viewDAGs: 'View DAGs',
   },
   sidebar: {
-    mainFeatures: 'Main features',
+    mainFeatures: 'Main',
     system: 'System',
-    apiConnected: 'API connected',
+    apiConnected: 'Connected',
   },
   commandPalette: {
-    placeholder: 'Search DAGs, tasks, history...',
+    placeholder: 'Search DAGs, tasks, or history...',
     noResults: 'No results found',
     navigation: 'Navigation',
     recentRuns: 'Recent Runs',
+    shortcuts: 'Shortcuts',
+    navigateHint: 'Navigate',
+    selectHint: 'Select',
+    closeHint: 'Dismiss',
   },
 };
 

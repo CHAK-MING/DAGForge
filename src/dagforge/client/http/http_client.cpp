@@ -3,6 +3,7 @@
 #include "dagforge/core/asio_awaitable.hpp"
 #include "dagforge/util/log.hpp"
 
+
 #include <boost/asio/cancel_after.hpp>
 #include <boost/asio/connect.hpp>
 #include <boost/asio/write.hpp>
@@ -53,6 +54,12 @@ auto to_response(
 }
 
 template <typename Stream>
+auto close_stream(Stream &stream) -> void {
+  boost::system::error_code ec;
+  stream.close(ec);
+}
+
+template <typename Stream>
 auto request_over_stream(Stream &stream, HttpRequest req,
                          HttpClientConfig config, const std::string &host)
     -> task<HttpResponse> {
@@ -73,6 +80,7 @@ auto request_over_stream(Stream &stream, HttpRequest req,
       boost::asio::cancel_after(config.read_timeout, use_nothrow));
   (void)written;
   if (write_ec) {
+    close_stream(stream);
     log::error("HTTP request write failed host={} method={} target={}: {}",
                host, method_to_string(method), target, write_ec.message());
     co_return HttpResponse{
@@ -89,6 +97,7 @@ auto request_over_stream(Stream &stream, HttpRequest req,
       boost::asio::cancel_after(config.read_timeout, use_nothrow));
   (void)read_n;
   if (read_ec) {
+    close_stream(stream);
     log::error("HTTP response read failed host={} method={} target={}: {}",
                host, method_to_string(method), target, read_ec.message());
     co_return HttpResponse{

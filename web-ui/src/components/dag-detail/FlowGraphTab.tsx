@@ -9,6 +9,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { TaskConfig, RunRecord, TaskRunRecord } from "@/lib/api";
+import { ExecutorType, TaskState } from "@/types/dag";
+import { formatTime } from "@/lib/status";
+import { useI18n } from "@/contexts/I18nContext";
 
 const DAGFlow = lazy(() => import("@/components/DAGFlow").then(m => ({ default: m.DAGFlow })));
 
@@ -24,6 +27,13 @@ interface FlowGraphTabProps {
   onSelectRun: (runId: string) => void;
 }
 
+function formatExecutionSeconds(milliseconds: number): string {
+  if (milliseconds <= 0) {
+    return "<0.001 s";
+  }
+  return `${(milliseconds / 1000).toFixed(3)} s`;
+}
+
 export function FlowGraphTab({
   taskDefinitions,
   runs,
@@ -31,6 +41,7 @@ export function FlowGraphTab({
   taskInstances,
   onSelectRun,
 }: FlowGraphTabProps) {
+  const { t, tf } = useI18n();
   const selectedRun = runs.find(r => r.dag_run_id === selectedRunId);
   const runNumber = selectedRun ? runs.length - runs.indexOf(selectedRun) : 0;
 
@@ -47,19 +58,32 @@ export function FlowGraphTab({
   );
 
   const flowTasks = useMemo(() => taskDefinitions.map((td) => {
-    let status: "pending" | "running" | "retrying" | "success" | "failed" | "upstream_failed" | "skipped" = "pending";
+    let status: TaskState = "pending";
+    let duration: string | undefined;
+    let attempt: number | undefined;
+    let exitCode: number | undefined;
+    let error: string | undefined;
+    let startedAt: string | undefined;
+    let finishedAt: string | undefined;
 
     if (selectedRun) {
       const taskInstance = taskInstanceById.get(td.task_id);
       if (taskInstance) {
-        const taskState = taskInstance.state;
-        if (taskState === "success") status = "success";
-        else if (taskState === "failed") status = "failed";
-        else if (taskState === "upstream_failed") status = "upstream_failed";
-        else if (taskState === "skipped") status = "skipped";
-        else if (taskState === "running") status = "running";
-        else if (taskState === "retrying") status = "retrying";
-        else if (taskState === "pending") status = "pending";
+        status = taskInstance.state;
+        attempt = taskInstance.attempt;
+        exitCode = taskInstance.exit_code;
+        error = taskInstance.error || undefined;
+        startedAt = taskInstance.started_at && taskInstance.started_at !== "-" ? formatTime(taskInstance.started_at) : undefined;
+        finishedAt = taskInstance.finished_at && taskInstance.finished_at !== "-" ? formatTime(taskInstance.finished_at) : undefined;
+        if (typeof taskInstance.duration_ms === "number" && taskInstance.duration_ms > 0) {
+          duration = formatExecutionSeconds(taskInstance.duration_ms);
+        } else if (taskInstance.started_at && taskInstance.finished_at) {
+          const start = Date.parse(taskInstance.started_at);
+          const end = Date.parse(taskInstance.finished_at);
+          if (!Number.isNaN(start) && !Number.isNaN(end) && end >= start) {
+            duration = formatExecutionSeconds(Math.max(0, end - start));
+          }
+        }
       } else if (selectedRun.state === "running") {
         status = "pending";
       }
@@ -68,9 +92,26 @@ export function FlowGraphTab({
     return {
       id: td.task_id,
       name: td.name,
+      taskId: td.task_id,
       status,
-      duration: undefined,
-      executor: "shell" as const,
+      duration,
+      executor: ((td.executor && ["shell", "docker", "sensor", "noop"].includes(td.executor))
+        ? td.executor
+        : "shell") as ExecutorType,
+      dependsOn: (td.dependencies ?? []).map((dep) => dep.task),
+      attempt,
+      exitCode,
+      error,
+      startedAt,
+      finishedAt,
+      command: td.command,
+      sensorType: td.sensor_type,
+      sensorTarget: td.sensor_target,
+      triggerRule: td.trigger_rule || "all_success",
+      isBranch: td.is_branch,
+      dependsOnPast: td.depends_on_past,
+      xcomPushCount: td.xcom_push_count ?? 0,
+      xcomPullCount: td.xcom_pull_count ?? 0,
     };
   }), [taskDefinitions, selectedRun, taskInstanceById]);
 
@@ -79,9 +120,9 @@ export function FlowGraphTab({
       <CardHeader>
         <div className="flex items-center justify-between">
           <div>
-            <CardTitle className="text-base">任务依赖关系图</CardTitle>
+            <CardTitle className="text-base">{t.dagDetail.flowGraph}</CardTitle>
             <p className="text-sm text-muted-foreground mt-1">
-              {selectedRun ? `显示 Run #${runNumber} 的状态` : "选择运行实例查看状态"}
+              {selectedRun ? tf(t.dagDetail.showingRunStatus, { number: runNumber }) : t.dagDetail.selectRunToView}
             </p>
           </div>
           {runs.length > 0 && (
@@ -90,14 +131,14 @@ export function FlowGraphTab({
               onValueChange={onSelectRun}
             >
               <SelectTrigger className="w-48">
-                <SelectValue placeholder="选择运行实例" />
+                <SelectValue placeholder={t.dagDetail.selectRun} />
               </SelectTrigger>
               <SelectContent>
                 {runs.map((run, index) => {
                   const num = runs.length - index;
                   return (
                     <SelectItem key={run.dag_run_id} value={run.dag_run_id}>
-                      Run #{num} - {run.state === "success" ? "成功" : run.state === "failed" ? "失败" : "运行中"}
+                      Run #{num} - {t.runStatus[run.state]}
                     </SelectItem>
                   );
                 })}

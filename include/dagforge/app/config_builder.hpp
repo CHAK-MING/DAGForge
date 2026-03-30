@@ -1,8 +1,11 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/executor/executor.hpp"
+#endif
 
 #include <vector>
+
 
 namespace dagforge {
 

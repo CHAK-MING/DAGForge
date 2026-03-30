@@ -13,9 +13,9 @@ interface RunHistoryTabProps {
 
 const getTriggerLabel = (type: string) => {
   switch (type) {
-    case "schedule": return "定时";
-    case "manual": return "手动";
-    default: return "API";
+    case "schedule": return "schedule";
+    case "manual": return "manual";
+    default: return "api";
   }
 };
 
@@ -37,6 +37,7 @@ export function RunHistoryTab({ runs, selectedRunId, onSelectRun }: RunHistoryTa
             {runs.map((run, index) => {
               const TriggerIcon = getTriggerIcon(run.trigger_type || "manual");
               const runNumber = runs.length - index;
+              const triggerLabel = t.triggerType[getTriggerLabel(run.trigger_type || "manual") as keyof typeof t.triggerType];
 
               return (
                 <div
@@ -56,7 +57,7 @@ export function RunHistoryTab({ runs, selectedRunId, onSelectRun }: RunHistoryTa
                         <DAGStatusBadge status={run.state} />
                         <Badge variant="outline" className="text-xs gap-1">
                           <TriggerIcon className="h-3 w-3" />
-                          {getTriggerLabel(run.trigger_type || "manual")}
+                          {triggerLabel}
                         </Badge>
                       </div>
                       <p className="text-sm text-muted-foreground mt-1">

@@ -1,59 +1,42 @@
 #pragma once
 
-#include "dagforge/core/error.hpp"
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
+#include "dagforge/config/task_types.hpp"
+#include "dagforge/util/string_hash.hpp"
+#endif
+
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/util/hash.hpp"
 #include "dagforge/util/id.hpp"
-#include "dagforge/util/json.hpp"
-#include "dagforge/util/string_hash.hpp"
+#endif
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include <chrono>
+#include <functional>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_map>
+#endif
+
 
 namespace dagforge {
 
 struct XComEntry {
   std::string key;
-  JsonValue value;
+  // Serialized JSON payload.
+  std::string value;
   std::size_t byte_size{0};
-  std::chrono::system_clock::time_point created_at;
+  std::chrono::system_clock::time_point created_at{};
 };
 
 struct XComTaskEntry {
   TaskId task_id;
   std::string key;
-  JsonValue value;
+  // Serialized JSON payload.
+  std::string value;
   std::size_t byte_size{0};
-  std::chrono::system_clock::time_point created_at;
-};
-
-struct XComRef {
-  TaskId task_id;
-  std::string key;
-
-  auto operator==(const XComRef &other) const -> bool = default;
-};
-
-struct XComPullConfig {
-  XComRef ref;
-  std::string env_var;
-  bool required{false};
-  std::optional<JsonValue> default_value;
-
-  [[nodiscard]] auto source_task() const noexcept -> const TaskId & {
-    return ref.task_id;
-  }
-
-  [[nodiscard]] auto key() const noexcept -> const std::string & {
-    return ref.key;
-  }
-};
-
-struct XComRefHash {
-  auto operator()(const XComRef &ref) const -> std::size_t {
-    return util::combine(ref.task_id, ref.key);
-  }
+  std::chrono::system_clock::time_point created_at{};
 };
 
 using XComMap =
@@ -64,8 +47,10 @@ public:
   // Thread-safety:
   // This cache is intentionally unsynchronized. It is expected to live inside
   // shard-local / run-local state and be accessed only from the owning shard's
-  // event loop thread. Callers that want cross-thread access must provide their
-  // own external synchronization.
+  // event loop thread. Values are stored in their rendered, template-ready
+  // representation so xcom_pull resolution avoids repeated JSON parsing.
+  // Callers that want cross-thread access must provide their own external
+  // synchronization.
   struct CacheKey {
     DAGRunId run_id;
     TaskId task_id;
@@ -75,7 +60,7 @@ public:
   };
 
   using CacheKeyView =
-      std::tuple<const DAGRunId &, const TaskId &, const std::string &>;
+      std::tuple<const DAGRunId &, const TaskId &, std::string_view>;
 
   struct CacheKeyHash {
     using is_transparent = void;
@@ -104,14 +89,15 @@ public:
     }
   };
 
-  void set(const DAGRunId &run_id, const TaskId &task_id,
-           const std::string &key, const JsonValue &value) {
-    cache_[CacheKey{run_id.clone(), task_id.clone(), key}] = value;
+  void set(const DAGRunId &run_id, const TaskId &task_id, std::string_view key,
+           std::string_view rendered_value) {
+    cache_[CacheKey{run_id.clone(), task_id.clone(), std::string(key)}] =
+        std::string(rendered_value);
   }
 
   [[nodiscard]] auto get(const DAGRunId &run_id, const TaskId &task_id,
-                         const std::string &key) const
-      -> Result<std::reference_wrapper<const JsonValue>> {
+                         std::string_view key) const
+      -> Result<std::reference_wrapper<const std::string>> {
     auto it = cache_.find(CacheKeyView{run_id, task_id, key});
     if (it != cache_.end()) {
       return ok(std::cref(it->second));
@@ -130,7 +116,7 @@ public:
   void clear() { cache_.clear(); }
 
 private:
-  std::unordered_map<CacheKey, JsonValue, CacheKeyHash, CacheKeyEqual> cache_;
+  std::unordered_map<CacheKey, std::string, CacheKeyHash, CacheKeyEqual> cache_;
 };
 
 } // namespace dagforge

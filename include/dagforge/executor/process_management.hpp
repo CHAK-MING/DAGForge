@@ -1,7 +1,9 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/core/asio_awaitable.hpp"
 #include "dagforge/core/coroutine.hpp"
+#endif
 
 #include <boost/process/v2/process.hpp>
 

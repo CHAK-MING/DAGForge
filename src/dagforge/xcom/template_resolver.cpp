@@ -1,8 +1,9 @@
 #include "dagforge/xcom/template_resolver.hpp"
-
-#include "dagforge/util/log.hpp"
+#include "dagforge/core/runtime.hpp"
 #include "dagforge/util/time.hpp"
+#include "dagforge/util/log.hpp"
 #include "dagforge/xcom/xcom_util.hpp"
+
 
 #include <boost/algorithm/string/find.hpp>
 #include <boost/algorithm/string/replace.hpp>
@@ -15,7 +16,6 @@
 #include <unordered_map>
 #include <utility>
 
-#include "dagforge/core/runtime.hpp"
 #include <ankerl/unordered_dense.h>
 
 namespace dagforge {
@@ -26,6 +26,17 @@ TemplateResolver::TemplateResolver(XComLookupFn lookup)
 
 auto TemplateResolver::set_xcom_lookup(XComLookupFn lookup) -> void {
   xcom_lookup_ = std::move(lookup);
+}
+
+auto TemplateResolver::prefetch_xcom(const DAGRunId &run_id,
+                                     const TaskId &task_id,
+                                     std::string_view key,
+                                     std::string_view value_json) -> void {
+  auto rendered = xcom::render_serialized_json(value_json);
+  if (!rendered) {
+    return;
+  }
+  xcom_cache_.set(run_id, task_id, key, *rendered);
 }
 
 auto TemplateResolver::resolve_env_vars(
@@ -53,19 +64,17 @@ auto TemplateResolver::resolve_env_vars(
 auto TemplateResolver::resolve_xcom_pull(const TemplateContext &ctx,
                                          const XComPullConfig &pull)
     -> Result<std::optional<std::string>> {
-  // Check cache first
   auto cached = xcom_cache_.get(ctx.dag_run_id, pull.ref.task_id, pull.ref.key);
   if (cached.has_value()) {
-    return ok(std::optional<std::string>(xcom::stringify(*cached)));
+    return ok(std::optional<std::string>(cached->get()));
   }
 
   if (!xcom_lookup_) {
     if (pull.required) {
       return fail(Error::NotFound);
     }
-    if (pull.default_value) {
-      return ok(
-          std::optional<std::string>(xcom::stringify(*pull.default_value)));
+    if (pull.has_default_value) {
+      return ok(std::optional<std::string>(pull.default_value_rendered));
     }
     return ok(std::nullopt);
   }
@@ -78,19 +87,20 @@ auto TemplateResolver::resolve_xcom_pull(const TemplateContext &ctx,
       if (pull.required) {
         return fail(Error::NotFound);
       }
-      if (pull.default_value) {
-        return ok(
-            std::optional<std::string>(xcom::stringify(*pull.default_value)));
+      if (pull.has_default_value) {
+        return ok(std::optional<std::string>(pull.default_value_rendered));
       }
       return ok(std::nullopt);
     }
     return fail(xcom_result.error());
   }
 
-  // Cache the value
-  xcom_cache_.set(ctx.dag_run_id, pull.ref.task_id, pull.ref.key,
-                  xcom_result->value);
-  return ok(std::optional<std::string>(xcom::stringify(xcom_result->value)));
+  auto rendered = xcom::render_serialized_json(xcom_result->value);
+  if (!rendered) {
+    return fail(rendered.error());
+  }
+  xcom_cache_.set(ctx.dag_run_id, pull.ref.task_id, pull.ref.key, *rendered);
+  return ok(std::optional<std::string>(std::move(*rendered)));
 }
 
 namespace {
@@ -155,8 +165,8 @@ auto compute_date_formats_t(
 
   {
     char buf[32]{0};
-    const int n = std::snprintf(buf, sizeof(buf), "%04d-%02u-%02u", year,
-                                month, day);
+    const int n =
+        std::snprintf(buf, sizeof(buf), "%04d-%02u-%02u", year, month, day);
     if (n > 0) {
       fmts.ds.assign(buf, static_cast<std::size_t>(n));
     }
@@ -252,8 +262,7 @@ auto try_replace_date_token(pmr::string &output, std::string_view token,
   return false;
 }
 
-auto try_replace_interval_token(pmr::string &output,
-                                std::string_view token,
+auto try_replace_interval_token(pmr::string &output, std::string_view token,
                                 const DateFormatsPmr &date_fmts) -> bool {
   if (token == "data_interval_start" &&
       !date_fmts.data_interval_start.empty()) {
@@ -267,8 +276,7 @@ auto try_replace_interval_token(pmr::string &output,
   return false;
 }
 
-auto try_replace_metadata_token(pmr::string &output,
-                                std::string_view token,
+auto try_replace_metadata_token(pmr::string &output, std::string_view token,
                                 const TemplateContext &ctx) -> bool {
   if (token == "dag_id") {
     output.append(ctx.dag_id.value());
@@ -285,9 +293,9 @@ auto try_replace_metadata_token(pmr::string &output,
   return false;
 }
 
-auto try_replace_xcom_token(TemplateResolver &resolver,
-                            pmr::string &output, std::string_view token,
-                            const TemplateContext &ctx, bool strict_whitelist,
+auto try_replace_xcom_token(TemplateResolver &resolver, pmr::string &output,
+                            std::string_view token, const TemplateContext &ctx,
+                            bool strict_whitelist,
                             const XComWhitelist &whitelist) -> Result<bool> {
   auto xcom_parts = parse_xcom_token(token);
   if (!xcom_parts) {
@@ -319,7 +327,7 @@ auto try_replace_xcom_token(TemplateResolver &resolver,
                        .key = std::string(key_str)},
         .env_var = "",
         .required = true,
-        .default_value = std::nullopt};
+        .has_default_value = false};
     pull_result = resolver.resolve_xcom_pull(ctx, temp_pull);
   }
 

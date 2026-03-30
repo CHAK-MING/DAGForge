@@ -1,0 +1,190 @@
+#pragma once
+
+#include "../api_context.hpp"
+#include "../dto_mapper.hpp"
+
+#include <unordered_map>
+
+namespace dagforge::api_detail {
+
+inline auto register_run_routes(ApiContext &ctx) -> void {
+  auto &router = ctx.router();
+
+  router.get(
+      "/api/history",
+      ctx.make_instrumented_route(
+          http::HttpMethod::GET, "/api/history",
+          [&ctx](http::HttpRequest) -> task<http::HttpResponse> {
+            auto res = co_await ctx.list_run_views_async(50);
+            if (!res) {
+              co_return to_result_response(res.error()).value();
+            }
+
+            api_dto::HistoryResponseDto dto;
+            dto.runs.reserve(res->size());
+            for (const auto &run : *res) {
+              dto.runs.emplace_back(api_dto::RunHistoryEntryDto{
+                  .dag_run_id = run.entry.dag_run_id.str(),
+                  .dag_id = run.entry.dag_id.str(),
+                  .state = enum_to_string(run.state),
+                  .trigger_type = enum_to_string(run.entry.trigger_type),
+                  .started_at = util::format_iso8601(run.entry.started_at),
+                  .finished_at = util::format_iso8601(run.entry.finished_at),
+                  .execution_date =
+                      util::format_iso8601(run.entry.execution_date),
+              });
+            }
+            co_return json_response_glz(dto);
+          }));
+
+  router.get(
+      "/api/history/{dag_run_id}",
+      ctx.make_instrumented_route(
+          http::HttpMethod::GET, "/api/history/{dag_run_id}",
+          [&ctx](http::HttpRequest req) -> task<http::HttpResponse> {
+            auto dag_run_id = req.path_param("dag_run_id");
+            if (!dag_run_id) {
+              co_return error_response(400, "Missing dag_run_id");
+            }
+
+            auto res = co_await ctx.get_run_view_async(DAGRunId{*dag_run_id});
+            if (!res) {
+              co_return to_result_response(res.error()).value();
+            }
+            co_return json_response_glz(api_dto::RunHistoryEntryDto{
+                .dag_run_id = res->entry.dag_run_id.str(),
+                .dag_id = res->entry.dag_id.str(),
+                .state = enum_to_string(res->state),
+                .trigger_type = enum_to_string(res->entry.trigger_type),
+                .started_at = util::format_iso8601(res->entry.started_at),
+                .finished_at = util::format_iso8601(res->entry.finished_at),
+                .execution_date =
+                    util::format_iso8601(res->entry.execution_date),
+            });
+          }));
+
+  router.get(
+      "/api/runs/{dag_run_id}/tasks/{task_id}/xcom",
+      ctx.make_instrumented_route(
+          http::HttpMethod::GET, "/api/runs/{dag_run_id}/tasks/{task_id}/xcom",
+          [&ctx](http::HttpRequest req) -> task<http::HttpResponse> {
+            auto dag_run_id = req.path_param("dag_run_id");
+            auto task_id = req.path_param("task_id");
+            if (!dag_run_id || !task_id) {
+              co_return error_response(400, "Missing dag_run_id or task_id");
+            }
+
+            auto res = co_await ctx.get_task_xcoms_async(DAGRunId{*dag_run_id},
+                                                         TaskId{*task_id});
+            co_return res
+                .transform([&](const auto &xcoms) {
+                  return json_response(
+                      {{"task_id", *task_id},
+                       {"xcom", xcom_entries_to_json_object(xcoms)}});
+                })
+                .or_else(to_result_response)
+                .value();
+          }));
+
+  router.get("/api/runs/{dag_run_id}/xcom",
+             ctx.make_instrumented_route(
+                 http::HttpMethod::GET, "/api/runs/{dag_run_id}/xcom",
+                 [&ctx](http::HttpRequest req) -> task<http::HttpResponse> {
+                   auto dag_run_id = req.path_param("dag_run_id");
+                   if (!dag_run_id) {
+                     co_return error_response(400, "Missing dag_run_id");
+                   }
+
+                   auto run_id = DAGRunId{*dag_run_id};
+                   auto run_res = co_await ctx.get_run_history_async(run_id);
+                   if (!run_res) {
+                     co_return to_result_response(run_res.error()).value();
+                   }
+
+                   auto dag_res =
+                       co_await ctx.get_dag_snapshot_async(run_res->dag_id);
+                   if (!dag_res) {
+                     co_return to_result_response(dag_res.error()).value();
+                   }
+
+                   json all_xcoms = json::object_t{};
+                   for (const auto &task : dag_res->tasks) {
+                     auto xcoms_res = co_await ctx.get_task_xcoms_async(
+                         run_id, task.task_id);
+                     if (xcoms_res && !xcoms_res->empty()) {
+                       all_xcoms[task.task_id.str()] =
+                           xcom_entries_to_json_object(*xcoms_res);
+                     }
+                   }
+                   co_return json_response(
+                       {{"dag_run_id", *dag_run_id}, {"xcom", all_xcoms}});
+                 }));
+
+  router.get(
+      "/api/runs/{dag_run_id}/tasks",
+      ctx.make_instrumented_route(
+          http::HttpMethod::GET, "/api/runs/{dag_run_id}/tasks",
+          [&ctx](http::HttpRequest req) -> task<http::HttpResponse> {
+            auto dag_run_id = req.path_param("dag_run_id");
+            if (!dag_run_id) {
+              co_return error_response(400, "Missing dag_run_id");
+            }
+
+            auto run_id = DAGRunId{*dag_run_id};
+            auto run_res = co_await ctx.get_run_history_async(run_id);
+            if (!run_res) {
+              co_return to_result_response(run_res.error()).value();
+            }
+
+            auto tasks_res = co_await ctx.get_task_instances_async(run_id);
+            co_return tasks_res
+                .transform([&](const auto &tasks) {
+                  api_dto::RunTasksResponseDto dto{
+                      .dag_run_id = *dag_run_id,
+                      .tasks = {},
+                  };
+                  std::unordered_map<std::string, TaskInstanceInfo,
+                                     util::TransparentStringHash,
+                                     util::TransparentStringEqual>
+                      latest_by_task_id;
+                  latest_by_task_id.reserve(tasks.size());
+                  for (const auto &t : tasks) {
+                    auto it = latest_by_task_id.find(t.task_id.str());
+                    if (it == latest_by_task_id.end() ||
+                        t.attempt > it->second.attempt) {
+                      latest_by_task_id[t.task_id.str()] = t;
+                    }
+                  }
+
+                  dto.tasks.reserve(latest_by_task_id.size());
+                  for (const auto &[task_id, t] : latest_by_task_id) {
+                    const auto duration_ms =
+                        (t.started_at !=
+                             std::chrono::system_clock::time_point{} &&
+                         t.finished_at !=
+                             std::chrono::system_clock::time_point{} &&
+                         t.finished_at >= t.started_at)
+                            ? std::chrono::duration_cast<
+                                  std::chrono::milliseconds>(t.finished_at -
+                                                             t.started_at)
+                                  .count()
+                            : 0;
+                    dto.tasks.emplace_back(api_dto::TaskInstanceDto{
+                        .task_id = task_id,
+                        .state = enum_to_string(t.state),
+                        .attempt = t.attempt,
+                        .exit_code = t.exit_code,
+                        .duration_ms = duration_ms,
+                        .started_at = util::format_iso8601(t.started_at),
+                        .finished_at = util::format_iso8601(t.finished_at),
+                        .error = t.error_message,
+                    });
+                  }
+                  return json_response_glz(dto);
+                })
+                .or_else(to_result_response)
+                .value();
+          }));
+}
+
+} // namespace dagforge::api_detail

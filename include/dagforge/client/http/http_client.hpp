@@ -1,9 +1,11 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/client/http/http_types.hpp"
 #include "dagforge/core/coroutine.hpp"
 #include "dagforge/core/error.hpp"
 #include "dagforge/io/context.hpp"
+#endif
 
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/local/stream_protocol.hpp>
@@ -15,6 +17,7 @@
 #include <string_view>
 #include <utility>
 #include <variant>
+
 
 namespace dagforge::http {
 

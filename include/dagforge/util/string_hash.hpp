@@ -1,12 +1,13 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include <functional>
 #include <string>
 #include <string_view>
+#endif
 
 namespace dagforge {
 
-// Transparent string hash for heterogeneous lookup
 struct StringHash {
   using is_transparent = void;
 

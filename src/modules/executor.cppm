@@ -1,0 +1,18 @@
+module;
+
+#include "dagforge/util/enum.hpp"
+
+#include <chrono>
+#include <cstdint>
+#include <flat_map>
+#include <memory>
+#include <new>
+#include <string>
+
+export module dagforge.executor;
+
+export {
+#define DAGFORGE_BUILDING_MODULE_INTERFACE 1
+#include "dagforge/executor/executor_types.hpp"
+#undef DAGFORGE_BUILDING_MODULE_INTERFACE
+}

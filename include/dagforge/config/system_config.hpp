@@ -1,20 +1,28 @@
 #pragma once
 
+#if !defined(DAGFORGE_BUILDING_MODULE_INTERFACE) &&                              \
+    (!defined(DAGFORGE_CONSUME_NAMED_MODULES) ||                                \
+     !DAGFORGE_CONSUME_NAMED_MODULES)
 #include "dagforge/util/enum.hpp"
+#endif
+
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include <boost/describe/enum.hpp>
 #include <cstdint>
 #include <string>
+#endif
+
 
 namespace dagforge {
 
 struct DatabaseConfig {
   std::string host{"127.0.0.1"};
-  uint16_t port{3306};
+  std::uint16_t port{3306};
   std::string username{"dagforge"};
   std::string password{"dagforge"};
   std::string database{"dagforge"};
-  uint16_t pool_size{4};       // per-shard pool size
-  uint16_t connect_timeout{5}; // seconds
+  std::uint16_t pool_size{4};       // per-shard pool size
+  std::uint16_t connect_timeout{5}; // seconds
 
   auto operator==(const DatabaseConfig &) const -> bool = default;
 };
@@ -37,7 +45,7 @@ struct SchedulerConfig {
 
 struct ApiConfig {
   bool enabled{false};
-  uint16_t port{8080};
+  std::uint16_t port{8080};
   std::string host{"127.0.0.1"};
   bool reuse_port{false};
   bool tls_enabled{false};
@@ -49,7 +57,17 @@ struct ApiConfig {
 
 enum class DAGSourceMode : std::uint8_t { File, Api, Hybrid };
 BOOST_DESCRIBE_ENUM(DAGSourceMode, File, Api, Hybrid)
-DAGFORGE_DEFINE_ENUM_SERDE(DAGSourceMode, DAGSourceMode::File)
+
+[[nodiscard]] constexpr auto to_string_view(DAGSourceMode value) noexcept
+    -> std::string_view {
+  return ::dagforge::util::enum_to_snake_case_view(value);
+}
+
+template <>
+[[nodiscard]] inline auto parse<DAGSourceMode>(std::string_view s) noexcept
+    -> DAGSourceMode {
+  return ::dagforge::util::parse_enum(s, DAGSourceMode::File);
+}
 
 struct DAGSourceConfig {
   DAGSourceMode mode{DAGSourceMode::File};

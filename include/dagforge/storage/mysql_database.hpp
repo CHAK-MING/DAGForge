@@ -1,8 +1,11 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/config/system_config.hpp"
 #include "dagforge/storage/database_service.hpp"
+#endif
 
+#include <atomic>
 #include <boost/mysql/any_connection.hpp>
 #include <boost/mysql/connection_pool.hpp>
 #include <boost/mysql/pool_params.hpp>
@@ -32,6 +35,7 @@ public:
   auto get_dag(const DAGId &dag_id) -> task<Result<DAGInfo>> override;
   auto get_dag_by_rowid(int64_t dag_rowid) -> task<Result<DAGInfo>> override;
   auto list_dags() -> task<Result<std::vector<DAGInfo>>> override;
+  auto list_dag_states() -> task<Result<std::vector<DagStateRecord>>> override;
 
   auto save_task(const DAGId &dag_id, const TaskConfig &t)
       -> task<Result<int64_t>> override;
@@ -55,6 +59,22 @@ public:
       -> task<Result<int64_t>>;
   auto acquire_batch_writer_connection()
       -> task<Result<boost::mysql::pooled_connection>>;
+  auto save_dag_on_connection(boost::mysql::any_connection &conn,
+                              const DAGInfo &dag) -> task<Result<int64_t>>;
+  auto save_task_on_connection(boost::mysql::any_connection &conn,
+                               int64_t dag_rowid, const TaskConfig &task_cfg)
+      -> task<Result<int64_t>>;
+  auto save_tasks_on_connection(boost::mysql::any_connection &conn,
+                                int64_t dag_rowid,
+                                std::vector<TaskConfig> &tasks)
+      -> task<Result<void>>;
+  auto replace_task_dependencies_on_connection(
+      boost::mysql::any_connection &conn, int64_t dag_rowid,
+      const std::vector<TaskConfig> &tasks) -> task<Result<void>>;
+  [[nodiscard]] auto connection_acquire_histogram() const
+      -> metrics::Histogram::Snapshot;
+  [[nodiscard]] auto connection_acquire_failures_total() const noexcept
+      -> std::uint64_t;
   auto create_runs_with_task_instances_transaction(
       boost::mysql::any_connection &conn,
       const std::vector<RunInsertBundle> &bundles)
@@ -76,10 +96,14 @@ public:
   auto save_task_instances_batch(const DAGRunId &run_id,
                                  const std::vector<TaskInstanceInfo> &instances)
       -> task<Result<void>> override;
+  auto save_task_instances_batch_on_connection(
+      boost::mysql::any_connection &conn, const DAGRunId &run_id,
+      const std::vector<TaskInstanceInfo> &instances, int64_t run_rowid,
+      std::int64_t execution_date_ms = -1) -> task<Result<void>>;
   auto claim_task_instances(std::size_t limit, std::string_view worker_id)
       -> task<Result<std::vector<ClaimedTaskInstance>>> override;
-  auto touch_task_heartbeat(const DAGRunId &run_id, int64_t task_rowid,
-                            int attempt) -> task<Result<void>> override;
+  auto touch_task_heartbeat(const TaskInstanceKey &key)
+      -> task<Result<void>> override;
   auto reap_zombie_task_instances(std::int64_t heartbeat_timeout_ms)
       -> task<Result<std::size_t>> override;
 
@@ -90,9 +114,8 @@ public:
   auto get_run_history(const DAGRunId &run_id)
       -> task<Result<RunHistoryEntry>> override;
 
-  auto save_xcom(const DAGRunId &run_id, const TaskId &task_id,
-                 std::string key, const JsonValue &value)
-      -> task<Result<void>> override;
+  auto save_xcom(const DAGRunId &run_id, const TaskId &task_id, std::string key,
+                 std::string value_json) -> task<Result<void>> override;
   auto get_xcom(const DAGRunId &run_id, const TaskId &task_id,
                 std::string_view key) -> task<Result<XComEntry>> override;
   auto get_task_xcoms(const DAGRunId &run_id, const TaskId &task_id)
@@ -144,15 +167,13 @@ private:
       -> task<Result<int64_t>>;
   auto save_dag_run_on_connection(boost::mysql::any_connection &conn,
                                   const DAGRun &run) -> task<Result<int64_t>>;
-  auto save_task_instances_batch_on_connection(
-      boost::mysql::any_connection &conn, const DAGRunId &run_id,
-      const std::vector<TaskInstanceInfo> &instances, int64_t run_rowid,
-      std::int64_t execution_date_ms = -1)
-      -> task<Result<void>>;
 
   DatabaseConfig cfg_;
+  boost::asio::any_io_executor executor_;
   boost::mysql::connection_pool pool_;
   bool open_{false};
+  metrics::Histogram connection_acquire_histogram_{};
+  std::atomic<std::uint64_t> connection_acquire_failures_total_{0};
 };
 
 } // namespace dagforge::storage

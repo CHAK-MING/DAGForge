@@ -1,7 +1,9 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include <chrono>
 #include <cstddef>
+#endif
 
 namespace dagforge {
 

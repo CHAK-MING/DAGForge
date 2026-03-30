@@ -1,10 +1,14 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include <chrono>
 #include <cstdint>
 #include <ctime>
 #include <format>
 #include <string>
+#include <string_view>
+#include <utility>
+#endif
 
 namespace dagforge::util {
 
@@ -22,7 +26,6 @@ template <typename FormatFn>
 
 } // namespace detail
 
-// Formats time point to ISO 8601 (YYYY-MM-DDTHH:MM:SSZ)
 [[nodiscard]] inline auto
 format_iso8601(std::chrono::system_clock::time_point tp) -> std::string {
   return detail::format_time_or(
@@ -32,12 +35,10 @@ format_iso8601(std::chrono::system_clock::time_point tp) -> std::string {
       });
 }
 
-// Formats current time to ISO 8601
 [[nodiscard]] inline auto format_timestamp() -> std::string {
   return format_iso8601(std::chrono::system_clock::now());
 }
 
-// Formats time point to local timestamp (YYYY-MM-DD HH:MM:SS)
 [[nodiscard]] inline auto
 format_local_timestamp(std::chrono::system_clock::time_point tp)
     -> std::string {
@@ -47,7 +48,6 @@ format_local_timestamp(std::chrono::system_clock::time_point tp)
       });
 }
 
-// Formats time point to short local timestamp (YYYY-MM-DD HH:MM)
 [[nodiscard]] inline auto
 format_local_timestamp_short(std::chrono::system_clock::time_point tp)
     -> std::string {
@@ -57,7 +57,6 @@ format_local_timestamp_short(std::chrono::system_clock::time_point tp)
       });
 }
 
-// Formats epoch milliseconds to ISO 8601
 [[nodiscard]] inline auto format_iso8601(std::int64_t millis) -> std::string {
   if (millis <= 0) {
     return {};
@@ -66,7 +65,6 @@ format_local_timestamp_short(std::chrono::system_clock::time_point tp)
       std::chrono::system_clock::time_point{std::chrono::milliseconds{millis}});
 }
 
-// Converts time_point to UTC tm
 [[nodiscard]] inline auto to_utc(std::chrono::system_clock::time_point tp)
     -> std::tm {
   auto t = std::chrono::system_clock::to_time_t(tp);
@@ -75,7 +73,6 @@ format_local_timestamp_short(std::chrono::system_clock::time_point tp)
   return tm;
 }
 
-// Converts time_point to Unix epoch milliseconds.
 [[nodiscard]] inline auto
 to_unix_millis(std::chrono::system_clock::time_point tp) -> std::int64_t {
   return std::chrono::duration_cast<std::chrono::milliseconds>(

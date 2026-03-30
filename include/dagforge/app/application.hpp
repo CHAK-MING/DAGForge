@@ -1,8 +1,10 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
+#include "dagforge/app/metrics_registry.hpp"
 #include "dagforge/app/services/persistence_service.hpp"
-#include "dagforge/config/config.hpp"
-#include "dagforge/config/dag_definition.hpp"
+#include "dagforge/config/system_config_loader.hpp"
+#include "dagforge/config/dag_info_loader.hpp"
 #include "dagforge/core/coroutine.hpp"
 #include "dagforge/core/error.hpp"
 #include "dagforge/core/runtime.hpp"
@@ -10,6 +12,7 @@
 #include "dagforge/dag/dag_manager.hpp"
 #include "dagforge/dag/dag_run.hpp"
 #include "dagforge/executor/executor.hpp"
+#endif
 
 #include <ankerl/unordered_dense.h>
 
@@ -21,12 +24,15 @@
 #include <string_view>
 #include <vector>
 
+
 namespace dagforge {
 
 class ApiServer;
 class ConfigWatcher;
 class DAGRun;
 class Engine;
+class DagCatalogService;
+class ExecutionEventBridge;
 class ExecutionService;
 class PersistenceService;
 class SchedulerService;
@@ -35,7 +41,7 @@ class SchedulerService;
 class Application {
 public:
   Application();
-  explicit Application(Config config);
+  explicit Application(SystemConfig config);
   ~Application();
 
   Application(const Application &) = delete;
@@ -43,8 +49,8 @@ public:
 
   // Configuration
   [[nodiscard]] auto load_config(std::string_view path) -> Result<void>;
-  [[nodiscard]] auto config() const noexcept -> const Config &;
-  [[nodiscard]] auto config() noexcept -> Config &;
+  [[nodiscard]] auto config() const noexcept -> const SystemConfig &;
+  [[nodiscard]] auto config() noexcept -> SystemConfig &;
 
   // Lifecycle
   [[nodiscard]] auto init() -> Result<void>;
@@ -88,6 +94,24 @@ public:
   [[nodiscard]] auto trigger_batch_fallback_total() const -> std::uint64_t;
   [[nodiscard]] auto trigger_batch_rejected_total() const -> std::uint64_t;
   [[nodiscard]] auto trigger_batch_wakeup_lag_us() const -> std::uint64_t;
+  [[nodiscard]] auto task_update_batch_queue_depth() const -> std::size_t;
+  [[nodiscard]] auto task_update_batch_last_size() const -> std::size_t;
+  [[nodiscard]] auto task_update_batch_last_linger_us() const
+      -> std::uint64_t;
+  [[nodiscard]] auto task_update_batch_last_flush_ms() const -> std::uint64_t;
+  [[nodiscard]] auto task_update_batch_requests_total() const
+      -> std::uint64_t;
+  [[nodiscard]] auto task_update_batch_commits_total() const
+      -> std::uint64_t;
+  [[nodiscard]] auto task_update_batch_fallback_total() const
+      -> std::uint64_t;
+  [[nodiscard]] auto task_update_batch_rejected_total() const
+      -> std::uint64_t;
+  [[nodiscard]] auto task_update_batch_wakeup_lag_us() const
+      -> std::uint64_t;
+  using DagRunMetricsSnapshot = detail::DagRunMetricsSnapshot;
+  [[nodiscard]] auto dag_run_metrics() const
+      -> std::vector<DagRunMetricsSnapshot>;
   [[nodiscard]] auto shard_stall_age_ms(shard_id id) const -> std::uint64_t;
   [[nodiscard]] auto get_run_state(const DAGRunId &dag_run_id) const
       -> Result<DAGRunState>;
@@ -115,24 +139,35 @@ public:
   // Service access
   [[nodiscard]] auto dag_manager() -> DAGManager &;
   [[nodiscard]] auto dag_manager() const -> const DAGManager &;
+  [[nodiscard]] auto execution_service() -> ExecutionService *;
+  [[nodiscard]] auto execution_service() const -> const ExecutionService *;
+  [[nodiscard]] auto scheduler_service() -> SchedulerService *;
+  [[nodiscard]] auto scheduler_service() const -> const SchedulerService *;
   [[nodiscard]] auto engine() -> Engine &;
   [[nodiscard]] auto persistence_service() -> PersistenceService *;
+  [[nodiscard]] auto persistence_service() const
+      -> const PersistenceService *;
   [[nodiscard]] auto api_server() -> ApiServer *;
+  [[nodiscard]] auto api_server() const -> const ApiServer *;
   [[nodiscard]] auto get_active_dag_run(DAGRunId dag_run_id) -> DAGRun *;
   [[nodiscard]] auto runtime() -> Runtime &;
+  [[nodiscard]] auto runtime() const -> const Runtime &;
 
   // Debug
   auto list_tasks() const -> void;
   auto show_status() const -> void;
 
 private:
+  using DagStateIndex = ankerl::unordered_dense::map<DAGId, DagStateRecord>;
+
   struct RunLaunchPlan {
     DAGId dag_id;
     int64_t dag_rowid{0};
     int version{1};
     std::shared_ptr<const DAG> graph;
     std::shared_ptr<const std::vector<ExecutorConfig>> executor_configs;
-    std::shared_ptr<const std::vector<TaskConfig>> indexed_task_configs;
+    std::shared_ptr<const std::vector<TaskConfig::Compiled>>
+        indexed_task_configs;
   };
 
   struct DagOwnerState {
@@ -143,7 +178,9 @@ private:
     ankerl::unordered_dense::map<DAGId, DagOwnerState> dags;
   };
 
-  auto setup_callbacks() -> void;
+  auto rebuild_execution_event_bridge() -> void;
+  auto record_dag_run_metrics(const DAGRunId &dag_run_id,
+                              const DAGRun &run) -> void;
   [[nodiscard]] auto owner_shard(const DAGId &dag_id) const noexcept
       -> shard_id;
   [[nodiscard]] auto owner_shard(const DAGRunId &dag_run_id) const noexcept
@@ -167,49 +204,19 @@ private:
   auto on_run_finished(const DAGRunId &dag_run_id, DAGRunState status) -> void;
   [[nodiscard]] auto resolve_dag_id(const DAGRunId &dag_run_id) const
       -> std::optional<DAGId>;
-  auto spawn_persistence_task(spawn_task task) -> void;
-  template <typename OpFactory>
-  auto run_persistence_factory(std::shared_ptr<OpFactory> factory,
-                               bool count_mysql_write) -> spawn_task {
-    auto res = co_await (*factory)();
-    record_persistence_result(res, count_mysql_write);
-    co_return;
-  }
-  template <typename OpFactory>
-  auto enqueue_persistence(OpFactory &&factory,
-                           bool count_mysql_write = true) -> void {
-    auto shared_factory =
-        std::make_shared<std::decay_t<OpFactory>>(std::forward<OpFactory>(factory));
-    spawn_persistence_task(run_persistence_factory(std::move(shared_factory),
-                                                  count_mysql_write));
-  }
-  template <typename T>
-  auto record_persistence_result(const Result<T> &result,
-                                 bool count_mysql_write = true) -> void {
-    if (!result) {
-      dropped_persistence_events_.fetch_add(1, std::memory_order_relaxed);
-      return;
-    }
-    if (count_mysql_write) {
-      mysql_batch_write_ops_.fetch_add(1, std::memory_order_relaxed);
-    }
-  }
   auto setup_config_watcher() -> void;
-  auto handle_file_change(const std::string &filename) -> void;
   auto get_max_retries(const DAGRunId &dag_run_id, NodeIndex idx) const -> int;
   auto get_retry_interval(const DAGRunId &dag_run_id, NodeIndex idx) const
       -> std::chrono::seconds;
 
-  [[nodiscard]] auto validate_dag_info(const DAGInfo &info) -> Result<void>;
-  [[nodiscard]] auto create_dag_atomically(DAGId dag_id, const DAGInfo &info)
-      -> Result<void>;
-  [[nodiscard]] auto reload_single_dag(const DAGId &dag_id, const DAGInfo &info)
-      -> Result<void>;
+  auto rebuild_services_from_config() -> void;
+  auto ensure_services_initialized() -> void;
+  auto rollback_partial_start(bool log_started) noexcept -> void;
   std::atomic<bool> running_{false};
-  Config config_;
+  SystemConfig config_;
 
   // Core runtime
-  Runtime runtime_{0};
+  std::optional<Runtime> runtime_;
   std::unique_ptr<IExecutor> executor_;
 
   // Services
@@ -218,6 +225,9 @@ private:
   std::unique_ptr<PersistenceService> persistence_;
   std::unique_ptr<SchedulerService> scheduler_;
   std::unique_ptr<ExecutionService> execution_;
+  std::unique_ptr<ExecutionEventBridge> execution_event_bridge_;
+  std::unique_ptr<DagCatalogService> dag_catalog_;
+  detail::DagRunMetricsRegistry dag_run_metrics_;
 
   DAGManager dag_manager_;
   std::vector<DagOwnerShardState> dag_owner_states_;

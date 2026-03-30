@@ -1,11 +1,9 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include <boost/describe/enum.hpp>
 #include <boost/describe/enumerators.hpp>
 #include <boost/mp11/algorithm.hpp>
-#if __has_include(<boost/mysql/format_sql.hpp>)
-#include <boost/mysql/format_sql.hpp>
-#endif
 
 #include <array>
 #include <cctype>
@@ -15,6 +13,7 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#endif
 
 namespace dagforge {
 
@@ -30,14 +29,15 @@ namespace util {
 
 [[nodiscard]] inline auto normalize_enum_token(std::string_view token)
     -> std::string {
-  auto alnum_lower =
-      token | std::views::filter([](char c) {
-        return std::isalnum(static_cast<unsigned char>(c)) != 0;
-      }) |
-      std::views::transform([](char c) {
-        return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-      });
-  return std::string(alnum_lower.begin(), alnum_lower.end());
+  std::string out;
+  out.reserve(token.size());
+  for (char c : token) {
+    const auto uch = static_cast<unsigned char>(c);
+    if (std::isalnum(uch) != 0) {
+      out.push_back(static_cast<char>(std::tolower(uch)));
+    }
+  }
+  return out;
 }
 
 [[nodiscard]] inline auto enum_name_to_snake_case(std::string_view name)
@@ -83,21 +83,32 @@ template <typename E>
   return enum_name_to_snake_case(enum_name);
 }
 
+namespace detail {
+
+template <typename E, typename Transform>
+[[nodiscard]] inline auto make_enum_table(Transform transform)
+    -> std::array<std::pair<E, std::string>,
+                  boost::mp11::mp_size<
+                      boost::describe::describe_enumerators<E>>::value> {
+  using descriptors = boost::describe::describe_enumerators<E>;
+  constexpr std::size_t kCount = boost::mp11::mp_size<descriptors>::value;
+  std::array<std::pair<E, std::string>, kCount> out{};
+  std::size_t i = 0;
+  boost::mp11::mp_for_each<descriptors>([&](auto descriptor) {
+    out[i++] = {descriptor.value, transform(descriptor.name)};
+  });
+  return out;
+}
+
+} // namespace detail
+
 template <typename E>
 [[nodiscard]] inline auto
 enum_to_snake_case_view(E value, std::string_view fallback = "unknown") noexcept
     -> std::string_view {
-  using descriptors = boost::describe::describe_enumerators<E>;
-  constexpr std::size_t kCount = boost::mp11::mp_size<descriptors>::value;
-
-  static const auto table = [] {
-    std::array<std::pair<E, std::string>, kCount> out{};
-    std::size_t i = 0;
-    boost::mp11::mp_for_each<descriptors>([&](auto descriptor) {
-      out[i++] = {descriptor.value, enum_name_to_snake_case(descriptor.name)};
-    });
-    return out;
-  }();
+  static const auto table = detail::make_enum_table<E>([](std::string_view name) {
+    return enum_name_to_snake_case(name);
+  });
 
   for (const auto &[enum_value, text] : table) {
     if (enum_value == value) {
@@ -113,12 +124,14 @@ template <typename E>
                                      E default_value) noexcept -> E {
   const auto normalized_input = normalize_enum_token(input);
   E out = default_value;
-  boost::mp11::mp_for_each<boost::describe::describe_enumerators<E>>(
-      [&](auto descriptor) {
-        if (normalized_input == normalize_enum_token(descriptor.name)) {
-          out = descriptor.value;
-        }
-      });
+  static const auto table = detail::make_enum_table<E>([](std::string_view name) {
+    return normalize_enum_token(name);
+  });
+  for (const auto &[enum_value, text] : table) {
+    if (normalized_input == text) {
+      out = enum_value;
+    }
+  }
   return out;
 }
 
@@ -159,21 +172,3 @@ template <typename E, typename I>
   }
 
 } // namespace dagforge
-
-#if __has_include(<boost/mysql/format_sql.hpp>)
-namespace boost::mysql {
-
-template <typename T>
-  requires(std::is_enum_v<T> &&
-           boost::describe::has_describe_enumerators<T>::value)
-struct formatter<T> {
-  auto parse(const char *begin, const char *) -> const char * { return begin; }
-
-  auto format(T value, format_context_base &ctx) const -> void {
-    boost::mysql::format_sql_to(ctx, "{}",
-                                dagforge::util::enum_to_snake_case_view(value));
-  }
-};
-
-} // namespace boost::mysql
-#endif

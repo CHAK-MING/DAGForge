@@ -1,6 +1,9 @@
 #pragma once
 
-#include <boost/asio/io_context.hpp>
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
+#include "dagforge/io/context.hpp"
+#endif
+
 #include <boost/process/v2/environment.hpp>
 #include <boost/process/v2/process.hpp>
 #include <boost/process/v2/start_dir.hpp>
@@ -38,22 +41,23 @@ struct NewProcessGroupInit {
 template <typename Map>
 [[nodiscard]] inline auto build_process_env(const Map &custom)
     -> bp::process_environment {
-  std::vector<bp::environment::key_value_pair> env_vec;
-  env_vec.reserve(64);
-
+  std::vector<std::pair<std::string, std::string>> env_entries;
+  env_entries.reserve(64);
   for (const auto &entry : bp::environment::current()) {
     auto key_sv = entry.key();
     if (custom.contains(std::string(key_sv.data(), key_sv.size()))) {
       continue;
     }
-    env_vec.emplace_back(entry);
+    auto value_sv = entry.value();
+    env_entries.emplace_back(
+        std::string(key_sv.data(), key_sv.size()),
+        std::string(value_sv.data(), value_sv.size()));
   }
 
   for (const auto &[k, v] : custom) {
-    env_vec.emplace_back(bp::environment::key{k}, bp::environment::value{v});
+    env_entries.emplace_back(k, v);
   }
-
-  return bp::process_environment(std::move(env_vec));
+  return bp::process_environment(std::move(env_entries));
 }
 
 struct ProcessLaunchSpec {
@@ -64,7 +68,7 @@ struct ProcessLaunchSpec {
 };
 
 template <typename Launcher, typename... Inits>
-auto invoke_shell_process(Launcher &&launch, boost::asio::io_context &io,
+auto invoke_shell_process(Launcher &&launch, io::IoContext &io,
                           ProcessLaunchSpec spec, Inits &&... extra)
     -> bp::process {
   auto command = "/bin/sh";
@@ -106,7 +110,7 @@ auto invoke_shell_process(Launcher &&launch, boost::asio::io_context &io,
 }
 
 template <typename... Inits>
-auto launch_shell_process(boost::asio::io_context &io, ProcessLaunchSpec spec,
+auto launch_shell_process(io::IoContext &io, ProcessLaunchSpec spec,
                           Inits &&... extra) -> bp::process {
 #if defined(BOOST_PROCESS_V2_POSIX)
   bp::posix::vfork_launcher launcher;

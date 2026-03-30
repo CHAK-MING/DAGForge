@@ -31,6 +31,13 @@ TEST(ExecutorTypeRegistryTest, UnknownString_ReturnsDefaultShell) {
   EXPECT_EQ(parse<ExecutorType>("nonexistent"), ExecutorType::Shell);
 }
 
+TEST(ExecutorTypeRegistryTest, ParseNormalizesCaseAndSeparators) {
+  EXPECT_EQ(parse<ExecutorType>("DOCKER"), ExecutorType::Docker);
+  EXPECT_EQ(parse<ExecutorType>("do-ck_er"), ExecutorType::Docker);
+  EXPECT_EQ(dagforge::util::normalize_enum_token("Do-Ck_Er!"),
+            "docker");
+}
+
 TEST(ExecutorTypeConversionTest, HelperFunctions_MatchRegistry) {
   EXPECT_EQ(to_string_view(ExecutorType::Shell), "shell");
   EXPECT_EQ(parse<ExecutorType>("shell"), ExecutorType::Shell);
@@ -67,6 +74,97 @@ TEST(ExecutorRegistryTest, ValidateTaskUsesExecutorSpecificRules) {
   ASSERT_EQ(errors.size(), 1U);
   EXPECT_NE(errors.front().find("docker image cannot be empty"),
             std::string::npos);
+}
+
+TEST(ExecutorRegistryTest, ParsePersistedDockerConfigRejectsMalformedJson) {
+  auto reparsed = ExecutorRegistry::instance().parse_persisted_config(
+      ExecutorType::Docker, "{not-json");
+
+  ASSERT_FALSE(reparsed);
+  EXPECT_EQ(reparsed.error(), make_error_code(Error::ParseError));
+}
+
+TEST(ExecutorRegistryTest, ParsePersistedSensorConfigRejectsMalformedJson) {
+  auto reparsed = ExecutorRegistry::instance().parse_persisted_config(
+      ExecutorType::Sensor, "[");
+
+  ASSERT_FALSE(reparsed);
+  EXPECT_EQ(reparsed.error(), make_error_code(Error::ParseError));
+}
+
+TEST(ExecutorRegistryTest, PersistedSensorConfigRoundTripsThroughRegistry) {
+  SensorExecutorConfig sensor;
+  sensor.type = SensorType::Http;
+  sensor.target = "http://127.0.0.1:8080/health";
+  sensor.poke_interval = std::chrono::seconds(7);
+  sensor.soft_fail = true;
+  sensor.expected_status = 204;
+  sensor.http_method = "POST";
+
+  const auto json =
+      ExecutorRegistry::instance().serialize_config(ExecutorConfig{sensor});
+  const auto reparsed = ExecutorRegistry::instance().parse_persisted_config(
+      ExecutorType::Sensor, json);
+
+  ASSERT_TRUE(reparsed);
+  const auto *cfg = reparsed->as<SensorExecutorConfig>();
+  ASSERT_NE(cfg, nullptr);
+  EXPECT_EQ(cfg->type, SensorType::Http);
+  EXPECT_EQ(cfg->target, "http://127.0.0.1:8080/health");
+  EXPECT_EQ(cfg->poke_interval, std::chrono::seconds(7));
+  EXPECT_TRUE(cfg->soft_fail);
+  EXPECT_EQ(cfg->expected_status, 204);
+  EXPECT_EQ(cfg->http_method, "POST");
+}
+
+TEST(ExecutorRegistryTest, ValidateSensorTaskRejectsCommandAndMissingTarget) {
+  TaskConfig task{};
+  task.task_id = TaskId{"sensor_task"};
+  task.executor = ExecutorType::Sensor;
+  task.command = "echo should_not_exist";
+  task.executor_config =
+      SensorExecutorConfig{.type = SensorType::File, .target = ""};
+
+  std::vector<std::string> errors;
+  ExecutorRegistry::instance().validate_task(task, errors);
+
+  ASSERT_EQ(errors.size(), 2U);
+  EXPECT_NE(errors[0].find("command is not allowed for sensor tasks"),
+            std::string::npos);
+  EXPECT_NE(errors[1].find("sensor target cannot be empty"),
+            std::string::npos);
+}
+
+TEST(ExecutorConfigBuilderTest, BuildsConfigsInGraphNodeOrder) {
+  DAGInfo info;
+  info.dag_id = DAGId{"builder_test_dag"};
+  info.name = "builder_test_dag";
+
+  TaskConfig shell_task;
+  shell_task.task_id = TaskId{"shell_task"};
+  shell_task.name = "shell_task";
+  shell_task.command = "echo ok";
+  shell_task.executor = ExecutorType::Shell;
+
+  TaskConfig sensor_task;
+  sensor_task.task_id = TaskId{"sensor_task"};
+  sensor_task.name = "sensor_task";
+  sensor_task.executor = ExecutorType::Sensor;
+  sensor_task.executor_config =
+      SensorExecutorConfig{.type = SensorType::File, .target = "/tmp/probe"};
+
+  info.tasks = {shell_task, sensor_task};
+
+  DAG graph;
+  auto sensor_idx = graph.add_node(sensor_task.task_id);
+  auto shell_idx = graph.add_node(shell_task.task_id);
+  ASSERT_TRUE(sensor_idx.has_value());
+  ASSERT_TRUE(shell_idx.has_value());
+
+  auto configs = ExecutorConfigBuilder::build(info, graph);
+  ASSERT_EQ(configs.size(), 2U);
+  EXPECT_EQ(configs[*sensor_idx].type(), ExecutorType::Sensor);
+  EXPECT_EQ(configs[*shell_idx].type(), ExecutorType::Shell);
 }
 
 namespace {
@@ -111,20 +209,14 @@ TEST(ExecutorResultTest, DefaultConstruction_HasZeroValues) {
 TEST(ShellExecutorConfigTest, DefaultConstruction_HasExpectedDefaults) {
   ShellExecutorConfig config;
 
-  EXPECT_TRUE(config.command.empty());
-  EXPECT_TRUE(config.working_dir.empty());
-  EXPECT_EQ(config.execution_timeout, std::chrono::seconds(3600));
+  EXPECT_TRUE(config.env.empty());
 }
 
 TEST(ShellExecutorConfigTest, CustomValues_ArePreserved) {
   ShellExecutorConfig config;
-  config.command = "echo hello";
-  config.working_dir = "/tmp";
-  config.execution_timeout = std::chrono::seconds(60);
+  config.env["KEY"] = "VALUE";
 
-  EXPECT_EQ(config.command, "echo hello");
-  EXPECT_EQ(config.working_dir, "/tmp");
-  EXPECT_EQ(config.execution_timeout, std::chrono::seconds(60));
+  EXPECT_EQ(config.env["KEY"], "VALUE");
 }
 
 class ShellExecutorTest : public ::testing::Test {
@@ -147,16 +239,36 @@ protected:
   std::unique_ptr<IExecutor> executor_;
 };
 
+class NoopExecutorTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    runtime_ = std::make_unique<Runtime>(1);
+    ASSERT_TRUE(runtime_->start().has_value());
+    executor_ = create_noop_executor(*runtime_);
+  }
+
+  void TearDown() override {
+    executor_.reset();
+    if (runtime_) {
+      runtime_->stop();
+      runtime_.reset();
+    }
+  }
+
+  std::unique_ptr<Runtime> runtime_;
+  std::unique_ptr<IExecutor> executor_;
+};
+
 TEST_F(ShellExecutorTest, ExecuteValidCommand_ReturnsZeroExitCode) {
   ShellExecutorConfig config;
-  config.command = "echo hello";
-  config.execution_timeout = std::chrono::seconds(5);
 
   ExecutorResult result;
   std::atomic<bool> completed{false};
 
   ExecutorRequest req;
   req.instance_id = InstanceId("test_instance");
+  req.command = "echo hello";
+  req.execution_timeout = std::chrono::seconds(5);
   req.config = config;
 
   ExecutionSink sink;
@@ -179,14 +291,14 @@ TEST_F(ShellExecutorTest, ExecuteValidCommand_ReturnsZeroExitCode) {
 
 TEST_F(ShellExecutorTest, ExecuteFailingCommand_ReturnsNonZeroExitCode) {
   ShellExecutorConfig config;
-  config.command = "exit 42";
-  config.execution_timeout = std::chrono::seconds(5);
 
   ExecutorResult result;
   std::atomic<bool> completed{false};
 
   ExecutorRequest req;
   req.instance_id = InstanceId("test_failing");
+  req.command = "exit 42";
+  req.execution_timeout = std::chrono::seconds(5);
   req.config = config;
 
   ExecutionSink sink;
@@ -209,14 +321,14 @@ TEST_F(ShellExecutorTest, ExecuteFailingCommand_ReturnsNonZeroExitCode) {
 
 TEST_F(ShellExecutorTest, ExecuteInvalidCommand_ReturnsError) {
   ShellExecutorConfig config;
-  config.command = "nonexistent_command_12345";
-  config.execution_timeout = std::chrono::seconds(5);
 
   ExecutorResult result;
   std::atomic<bool> completed{false};
 
   ExecutorRequest req;
   req.instance_id = InstanceId("test_invalid");
+  req.command = "nonexistent_command_12345";
+  req.execution_timeout = std::chrono::seconds(5);
   req.config = config;
 
   ExecutionSink sink;
@@ -238,14 +350,14 @@ TEST_F(ShellExecutorTest, ExecuteInvalidCommand_ReturnsError) {
 
 TEST_F(ShellExecutorTest, ExecuteTimedOutCommand_ReturnsTimeoutResult) {
   ShellExecutorConfig config;
-  config.command = "sleep 2";
-  config.execution_timeout = std::chrono::seconds(1);
 
   ExecutorResult result;
   std::atomic<bool> completed{false};
 
   ExecutorRequest req;
   req.instance_id = InstanceId("test_timeout");
+  req.command = "sleep 2";
+  req.execution_timeout = std::chrono::seconds(1);
   req.config = config;
 
   ExecutionSink sink;
@@ -269,8 +381,6 @@ TEST_F(ShellExecutorTest, ExecuteTimedOutCommand_ReturnsTimeoutResult) {
 
 TEST_F(ShellExecutorTest, StreamsStdoutLineByLineBeforeCompletion) {
   ShellExecutorConfig config;
-  config.command = "printf 'line1\\nline2\\nline3\\n'";
-  config.execution_timeout = std::chrono::seconds(5);
 
   ExecutorResult result;
   std::atomic<bool> completed{false};
@@ -278,6 +388,8 @@ TEST_F(ShellExecutorTest, StreamsStdoutLineByLineBeforeCompletion) {
 
   ExecutorRequest req;
   req.instance_id = InstanceId("test_stream_lines");
+  req.command = "printf 'line1\\nline2\\nline3\\n'";
+  req.execution_timeout = std::chrono::seconds(5);
   req.config = config;
 
   ExecutionSink sink;
@@ -308,13 +420,13 @@ TEST_F(ShellExecutorTest, StreamsStdoutLineByLineBeforeCompletion) {
 
 TEST_F(ShellExecutorTest, ExecuteWithMaliciousEnvKey_ReturnsError) {
   ShellExecutorConfig config;
-  config.command = "echo hello";
   config.env["VALID_KEY"] = "value";
   config.env["MALICIOUS_KEY; rm -rf /"] = "value";
-  config.execution_timeout = std::chrono::seconds(5);
 
   ExecutorRequest req;
   req.instance_id = InstanceId("test_malicious");
+  req.command = "echo hello";
+  req.execution_timeout = std::chrono::seconds(5);
   req.config = config;
 
   ExecutionSink sink;
@@ -322,6 +434,42 @@ TEST_F(ShellExecutorTest, ExecuteWithMaliciousEnvKey_ReturnsError) {
   auto result = executor_->start(req, std::move(sink));
   ASSERT_FALSE(result);
   EXPECT_EQ(result.error(), Error::InvalidArgument);
+}
+
+TEST_F(NoopExecutorTest, CompletesImmediatelyWithConfiguredExitCode) {
+  ExecutorResult result;
+  std::atomic<bool> completed{false};
+
+  ExecutorRequest req;
+  req.instance_id = InstanceId("noop_ok");
+  req.config = NoopExecutorConfig{.exit_code = 17};
+
+  ExecutionSink sink;
+  sink.on_complete = [&](const InstanceId &, ExecutorResult r) {
+    result = std::move(r);
+    completed = true;
+  };
+
+  ASSERT_TRUE(executor_->start(req, std::move(sink)).has_value());
+
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!completed && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  ASSERT_TRUE(completed);
+  EXPECT_EQ(result.exit_code, 17);
+  EXPECT_FALSE(result.timed_out);
+}
+
+TEST_F(NoopExecutorTest, RejectsMismatchedExecutorConfigType) {
+  ExecutorRequest req;
+  req.instance_id = InstanceId("noop_bad");
+  req.config = ShellExecutorConfig{};
+
+  auto start_res = executor_->start(req, ExecutionSink{});
+  ASSERT_FALSE(start_res.has_value());
+  EXPECT_EQ(start_res.error(), make_error_code(Error::InvalidArgument));
 }
 
 TEST(ShellExecutorAffinityTest, ExecutorRunsOnCallingShard) {
@@ -343,11 +491,9 @@ TEST(ShellExecutorAffinityTest, ExecutorRunsOnCallingShard) {
     auto start = executor->start(
         ExecutorRequest{
             .instance_id = InstanceId{"affinity_instance"},
-            .config = ShellExecutorConfig{.command = "echo hello",
-                                          .working_dir = {},
-                                          .execution_timeout =
-                                              std::chrono::seconds(5),
-                                          .env = {}},
+            .command = "echo hello",
+            .execution_timeout = std::chrono::seconds(5),
+            .config = ShellExecutorConfig{.env = {}},
             .memory_resource = {}},
         std::move(sink));
     EXPECT_TRUE(start.has_value());

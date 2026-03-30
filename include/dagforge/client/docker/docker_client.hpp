@@ -1,5 +1,6 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/client/http/http_client.hpp"
 #include "dagforge/core/error.hpp"
 #include "dagforge/core/coroutine.hpp"
@@ -8,11 +9,13 @@
 #include "dagforge/util/json.hpp"
 #include "dagforge/util/log.hpp"
 #include "dagforge/util/url.hpp"
+#endif
 
 #include <cstdint>
 
 #include <bit>
 #include <chrono>
+#include <cstring>
 #include <expected>
 #include <flat_map>
 #include <format>
@@ -205,8 +208,10 @@ template <dagforge::http::HttpConnector Connector = dagforge::http::HttpClient>
 class DockerClient {
 public:
   DockerClient(io::IoContext &ctx, std::unique_ptr<Connector> client,
-               DockerClientConfig config = {})
-      : ctx_(&ctx), connector_(std::move(client)), config_(std::move(config)) {}
+               DockerClientConfig config = {},
+               std::string socket_path = "/var/run/docker.sock")
+      : ctx_(&ctx), connector_(std::move(client)), config_(std::move(config)),
+        socket_path_(std::move(socket_path)) {}
 
   ~DockerClient() = default;
 
@@ -235,12 +240,16 @@ public:
     }
 
     co_return std::make_unique<DockerClient<Connector>>(
-        ctx, std::move(*http_client_res), std::move(config));
+        ctx, std::move(*http_client_res), std::move(config),
+        std::string(socket_path));
   }
 
   auto create_container(const ContainerConfig &config,
                         std::string_view name = "")
       -> task<Result<CreateContainerResponse>> {
+    if (auto ready = co_await ensure_connected(); !ready) {
+      co_return fail(ready.error());
+    }
     json body;
     body["Image"] = config.image;
     body["AttachStdout"] = true;
@@ -305,6 +314,9 @@ public:
   }
 
   auto pull_image(std::string_view image) -> task<Result<void>> {
+    if (auto ready = co_await ensure_connected(); !ready) {
+      co_return fail(ready.error());
+    }
     if (image.empty()) {
       log::error("Empty image name");
       co_return fail(make_error_code(DockerError::InvalidInput));
@@ -346,6 +358,9 @@ public:
 
   auto start_container(std::string_view container_id)
       -> task<Result<void>> {
+    if (auto ready = co_await ensure_connected(); !ready) {
+      co_return fail(ready.error());
+    }
     if (!detail::is_valid_container_id(container_id)) {
       log::error("Invalid container ID: {}", container_id);
       co_return fail(make_error_code(DockerError::InvalidInput));
@@ -372,6 +387,9 @@ public:
 
   auto wait_container(std::string_view container_id)
       -> task<Result<WaitContainerResponse>> {
+    if (auto ready = co_await ensure_connected(); !ready) {
+      co_return fail(ready.error());
+    }
     if (!detail::is_valid_container_id(container_id)) {
       log::error("Invalid container ID: {}", container_id);
       co_return fail(make_error_code(DockerError::InvalidInput));
@@ -407,6 +425,9 @@ public:
 
   auto get_logs(std::string_view container_id)
       -> task<Result<ContainerLogs>> {
+    if (auto ready = co_await ensure_connected(); !ready) {
+      co_return fail(ready.error());
+    }
     if (!detail::is_valid_container_id(container_id)) {
       log::error("Invalid container ID: {}", container_id);
       co_return fail(make_error_code(DockerError::InvalidInput));
@@ -437,6 +458,9 @@ public:
   auto stop_container(std::string_view container_id,
                       std::chrono::seconds timeout = std::chrono::seconds{10})
       -> task<Result<void>> {
+    if (auto ready = co_await ensure_connected(); !ready) {
+      co_return fail(ready.error());
+    }
     if (!detail::is_valid_container_id(container_id)) {
       log::error("Invalid container ID: {}", container_id);
       co_return fail(make_error_code(DockerError::InvalidInput));
@@ -464,6 +488,9 @@ public:
 
   auto remove_container(std::string_view container_id, bool force = false)
       -> task<Result<void>> {
+    if (auto ready = co_await ensure_connected(); !ready) {
+      co_return fail(ready.error());
+    }
     if (!detail::is_valid_container_id(container_id)) {
       log::error("Invalid container ID: {}", container_id);
       co_return fail(make_error_code(DockerError::InvalidInput));
@@ -492,6 +519,28 @@ public:
   }
 
 private:
+  auto ensure_connected() -> task<Result<void>> {
+    if (connector_ && connector_->is_connected()) {
+      co_return ok();
+    }
+
+    http::HttpClientConfig http_config{
+        .connect_timeout = config_.connect_timeout,
+        .read_timeout = config_.read_timeout,
+        .max_response_size = 100ULL * 1024ULL * 1024ULL,
+        .keep_alive = true,
+    };
+    auto connector_res =
+        co_await Connector::connect_unix(*ctx_, socket_path_, http_config);
+    if (!connector_res) {
+      log::error("Failed to reconnect to Docker socket: {}", socket_path_);
+      co_return fail(make_error_code(DockerError::ConnectionFailed));
+    }
+
+    connector_ = std::move(*connector_res);
+    co_return ok();
+  }
+
   auto parse_log_stream(std::string_view raw_logs) -> ContainerLogs {
     ContainerLogs logs;
     std::size_t pos = 0;
@@ -517,6 +566,7 @@ private:
   io::IoContext *ctx_;
   std::unique_ptr<Connector> connector_;
   DockerClientConfig config_;
+  std::string socket_path_;
 };
 
 } // namespace dagforge::docker

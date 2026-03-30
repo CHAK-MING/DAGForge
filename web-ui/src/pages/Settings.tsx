@@ -221,7 +221,7 @@ export default function Settings() {
                         <div className="grid gap-4 md:grid-cols-3">
                             <div className="space-y-1">
                                 <p className="text-sm font-medium">{t.settings.webUIVersion}</p>
-                                <p className="text-2xl font-bold">v0.2.0</p>
+                                <p className="text-2xl font-bold">v0.3.0</p>
                             </div>
                             <div className="space-y-1">
                                 <p className="text-sm font-medium">{t.settings.apiEndpoint}</p>

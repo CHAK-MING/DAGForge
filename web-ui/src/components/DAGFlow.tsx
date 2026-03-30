@@ -1,12 +1,10 @@
-import { useCallback, useMemo, useState, useEffect } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import ReactFlow, {
   Node,
   Edge,
   Background,
   Controls,
   MiniMap,
-  useNodesState,
-  useEdgesState,
   Position,
   MarkerType,
 } from "reactflow";
@@ -20,24 +18,37 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Separator } from "@/components/ui/separator";
+import { toast } from "@/components/ui/use-toast";
 import { useI18n } from "@/contexts/I18nContext";
+import { TaskState } from "@/types/dag";
+import { executorLabels, sensorTypeLabels, triggerRuleLabels } from "@/lib/status";
+import { Check, Copy } from "lucide-react";
 
-type FlowTaskStatus =
-  | "success"
-  | "failed"
-  | "upstream_failed"
-  | "running"
-  | "retrying"
-  | "pending"
-  | "skipped";
+type FlowTaskStatus = TaskState;
 
 interface Task {
   id: string;
   name: string;
   status: FlowTaskStatus;
+  taskId?: string;
   duration?: string;
   executor?: string;
   dependsOn?: string[];
+  attempt?: number;
+  exitCode?: number;
+  error?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  command?: string;
+  sensorType?: string;
+  sensorTarget?: string;
+  triggerRule?: string;
+  isBranch?: boolean;
+  dependsOnPast?: boolean;
+  xcomPushCount?: number;
+  xcomPullCount?: number;
 }
 
 interface FlowDependency {
@@ -79,10 +90,15 @@ const statusColors: Record<FlowTaskStatus, { bg: string; border: string; text: s
     border: "hsl(45 93% 47%)",
     text: "hsl(45 93% 32%)",
   },
-  pending: {
+  ready: {
     bg: "hsl(38 92% 50% / 0.15)",
     border: "hsl(38 92% 50%)",
     text: "hsl(38 92% 35%)",
+  },
+  pending: {
+    bg: "hsl(215 16% 47% / 0.08)",
+    border: "hsl(215 16% 60% / 0.6)",
+    text: "hsl(215 16% 34%)",
   },
   skipped: {
     bg: "hsl(215 16% 47% / 0.15)",
@@ -99,15 +115,44 @@ function useStatusLabels(): Record<FlowTaskStatus, string> {
     upstream_failed: t.runStatus.upstreamFailed,
     running: t.runStatus.running,
     retrying: t.runStatus.retrying,
+    ready: t.runStatus.ready,
     pending: t.runStatus.pending,
     skipped: t.runStatus.skipped,
   };
 }
 
+function DetailField({
+  label,
+  children,
+  className,
+}: {
+  label: string;
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <div className={cn("rounded-xl border border-border/60 bg-muted/20 px-3 py-3", className)}>
+      <div className="mb-1.5 text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground/80">
+        {label}
+      </div>
+      <div className="text-sm text-foreground">{children}</div>
+    </div>
+  );
+}
+
 export function DAGFlow({ tasks, dependencies, className, onTaskClick }: DAGFlowProps) {
-  const { t } = useI18n();
+  const { t, tf } = useI18n();
   const statusLabels = useStatusLabels();
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
+  const [copiedCommand, setCopiedCommand] = useState(false);
+
+  useEffect(() => {
+    if (!copiedCommand) {
+      return;
+    }
+    const timer = window.setTimeout(() => setCopiedCommand(false), 1600);
+    return () => window.clearTimeout(timer);
+  }, [copiedCommand]);
 
   const normalizedDependencies = useMemo<FlowDependency[]>(() => {
     if (dependencies && dependencies.length > 0) {
@@ -121,8 +166,8 @@ export function DAGFlow({ tasks, dependencies, className, onTaskClick }: DAGFlow
 
   // Build adjacency lists and compute topological layers
   const { nodePositions } = useMemo(() => {
-    const nodeWidth = 180;
-    const nodeHeight = 70;
+    const nodeWidth = 220;
+    const nodeHeight = 96;
     const horizontalGap = 120;
     const verticalGap = 100;
 
@@ -231,7 +276,8 @@ export function DAGFlow({ tasks, dependencies, className, onTaskClick }: DAGFlow
   }, [tasks, normalizedDependencies]);
 
   const initialNodes: Node[] = useMemo(() => {
-    const nodeWidth = 180;
+    const nodeWidth = 220;
+    const nodeMinHeight = 96;
 
     return tasks.map((task) => {
       const colors = statusColors[task.status];
@@ -242,23 +288,39 @@ export function DAGFlow({ tasks, dependencies, className, onTaskClick }: DAGFlow
         id: task.id,
         data: {
           label: (
-            <div className="text-center cursor-pointer">
-              <div className="font-semibold text-[13px] tracking-wide mb-1.5 truncate">{task.name}</div>
+            <div className="cursor-pointer text-left">
               <div
-                className="text-[11px] font-medium px-2.5 py-0.5 rounded-full inline-block"
-                style={{
-                  backgroundColor: colors.bg,
-                  color: colors.text,
-                  border: `1px solid ${colors.border}40`,
-                }}
+                className="line-clamp-2 break-words text-[13px] font-semibold leading-5 tracking-wide text-foreground"
+                title={task.name}
               >
-                {statusLabels[task.status]}
+                {task.name}
               </div>
-              {task.duration && (
-                <div className="text-xs text-muted-foreground mt-1">
-                  {task.duration}
+              {task.taskId && (
+                <div
+                  className="mt-1 truncate text-[10px] font-mono text-muted-foreground"
+                  title={task.taskId}
+                >
+                  {task.taskId}
                 </div>
               )}
+              <div className="mt-3 flex items-center justify-between gap-2">
+                <div
+                  className="inline-flex min-w-0 max-w-[132px] items-center rounded-full px-2.5 py-1 text-[11px] font-medium"
+                  style={{
+                    backgroundColor: colors.bg,
+                    color: colors.text,
+                    border: `1px solid ${colors.border}40`,
+                  }}
+                  title={statusLabels[task.status]}
+                >
+                  <span className="truncate">{statusLabels[task.status]}</span>
+                </div>
+                {task.duration && (
+                  <div className="shrink-0 text-[11px] text-muted-foreground">
+                    {task.duration}
+                  </div>
+                )}
+              </div>
             </div>
           ),
           task,
@@ -269,8 +331,9 @@ export function DAGFlow({ tasks, dependencies, className, onTaskClick }: DAGFlow
           backdropFilter: "blur(12px)",
           border: `1px solid ${colors.border}`,
           borderRadius: "10px",
-          padding: "16px",
+          padding: "14px 16px",
           width: nodeWidth,
+          minHeight: nodeMinHeight,
           boxShadow: isRunning
             ? `0 0 0 1px ${colors.border}55, 0 8px 16px -4px ${colors.border}33`
             : `0 4px 12px -2px hsl(var(--foreground) / 0.05)`,
@@ -282,7 +345,7 @@ export function DAGFlow({ tasks, dependencies, className, onTaskClick }: DAGFlow
         targetPosition: Position.Left,
       };
     });
-  }, [tasks, nodePositions]);
+  }, [nodePositions, statusLabels, tasks]);
 
   const initialEdges: Edge[] = useMemo(() => {
     if (normalizedDependencies.length === 0) {
@@ -325,18 +388,7 @@ export function DAGFlow({ tasks, dependencies, className, onTaskClick }: DAGFlow
         },
       };
     });
-  }, [tasks, dependencies]);
-
-  const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
-
-  useEffect(() => {
-    setNodes(initialNodes);
-  }, [initialNodes, setNodes]);
-
-  useEffect(() => {
-    setEdges(initialEdges);
-  }, [initialEdges, setEdges]);
+  }, [normalizedDependencies, tasks]);
 
   const handleNodeClick = useCallback((_: React.MouseEvent, node: Node) => {
     const task = node.data.task as Task;
@@ -347,14 +399,41 @@ export function DAGFlow({ tasks, dependencies, className, onTaskClick }: DAGFlow
     }
   }, [onTaskClick]);
 
+  const handleCopyCommand = useCallback(async () => {
+    if (!selectedTask?.command) {
+      return;
+    }
+    if (!navigator.clipboard?.writeText) {
+      toast({
+        variant: "destructive",
+        title: t.common.error,
+        description: t.toast.commandCopyFailed,
+      });
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(selectedTask.command);
+      setCopiedCommand(true);
+      toast({
+        title: t.toast.commandCopied,
+        description: selectedTask.taskId,
+      });
+    } catch {
+      toast({
+        variant: "destructive",
+        title: t.common.error,
+        description: t.toast.commandCopyFailed,
+      });
+    }
+  }, [selectedTask, t]);
+
   return (
     <>
       <div className={cn("h-[400px] w-full rounded-lg border border-border bg-card", className)}>
         <ReactFlow
-          nodes={nodes}
-          edges={edges}
-          onNodesChange={onNodesChange}
-          onEdgesChange={onEdgesChange}
+          nodes={initialNodes}
+          edges={initialEdges}
           onNodeClick={handleNodeClick}
           fitView
           attributionPosition="bottom-left"
@@ -377,47 +456,171 @@ export function DAGFlow({ tasks, dependencies, className, onTaskClick }: DAGFlow
         </ReactFlow>
       </div>
 
-      <Dialog open={!!selectedTask} onOpenChange={(open) => !open && setSelectedTask(null)}>
-        <DialogContent className="sm:max-w-lg">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              {selectedTask?.name}
-              <Badge
-                variant="outline"
-                className="ml-2"
-                style={{
-                  backgroundColor: selectedTask ? statusColors[selectedTask.status].bg : undefined,
-                  color: selectedTask ? statusColors[selectedTask.status].text : undefined,
-                  borderColor: selectedTask ? statusColors[selectedTask.status].border : undefined,
-                }}
-              >
-                {selectedTask && statusLabels[selectedTask.status]}
-              </Badge>
-            </DialogTitle>
-            <DialogDescription>
-              {t.dagDetail.taskDefinitions}
-            </DialogDescription>
+      <Dialog
+        open={!!selectedTask}
+        onOpenChange={(open) => {
+          if (!open) {
+            setSelectedTask(null);
+            setCopiedCommand(false);
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader className="space-y-3">
+            <div className="flex items-start justify-between gap-3 pr-6">
+              <div className="min-w-0 flex-1">
+                <DialogTitle className="break-words pr-2 leading-snug">
+                  {selectedTask?.name}
+                </DialogTitle>
+                {selectedTask?.taskId && (
+                  <div className="mt-2 inline-flex max-w-full rounded-full border border-border/70 bg-muted/30 px-2.5 py-1 font-mono text-[11px] text-muted-foreground">
+                    <span className="truncate">{selectedTask.taskId}</span>
+                  </div>
+                )}
+              </div>
+              {selectedTask && (
+                <Badge
+                  variant="outline"
+                  className="shrink-0"
+                  style={{
+                    backgroundColor: statusColors[selectedTask.status].bg,
+                    color: statusColors[selectedTask.status].text,
+                    borderColor: statusColors[selectedTask.status].border,
+                  }}
+                >
+                  {statusLabels[selectedTask.status]}
+                </Badge>
+              )}
+            </div>
+            <DialogDescription>{t.dagDetail.taskDefinitions}</DialogDescription>
           </DialogHeader>
-          <div className="space-y-4 py-4">
-            {selectedTask?.executor && (
-              <div className="flex items-center gap-2">
-                <span className="text-sm text-muted-foreground">{t.dagDetail.executor}:</span>
-                <Badge variant="secondary">{selectedTask.executor}</Badge>
-              </div>
-            )}
+          <Separator />
+          <div className="space-y-4 py-2">
+            <div className="grid gap-3 sm:grid-cols-2">
+              {selectedTask?.executor && (
+                <DetailField label={t.dagDetail.executor}>
+                  <Badge variant="secondary">
+                    {executorLabels[(selectedTask.executor as keyof typeof executorLabels) ?? "shell"] ?? selectedTask.executor}
+                  </Badge>
+                </DetailField>
+              )}
+              {selectedTask?.triggerRule && (
+                <DetailField label={t.dagDetail.triggerRule}>
+                  <Badge variant="outline">
+                    {triggerRuleLabels[selectedTask.triggerRule] ?? selectedTask.triggerRule}
+                  </Badge>
+                </DetailField>
+              )}
+              {selectedTask?.executor === "sensor" && selectedTask?.sensorType && (
+                <DetailField label={t.dagDetail.sensorType}>
+                  <Badge variant="outline">
+                    {sensorTypeLabels[selectedTask.sensorType] ?? selectedTask.sensorType}
+                  </Badge>
+                </DetailField>
+              )}
+              {typeof selectedTask?.attempt === "number" && (
+                <DetailField label={t.dagDetail.attempt}>
+                  <span>
+                    {selectedTask.attempt}
+                    {" "}
+                    {selectedTask.attempt > 1
+                      ? `(${tf(t.dagDetail.retriedTimes, { count: selectedTask.attempt - 1 })})`
+                      : `(${t.dagDetail.firstAttempt})`}
+                  </span>
+                </DetailField>
+              )}
+              {typeof selectedTask?.exitCode === "number" && selectedTask.exitCode !== 0 && (
+                <DetailField label={t.dagDetail.exitCode}>
+                  <span>{selectedTask.exitCode}</span>
+                </DetailField>
+              )}
+              {selectedTask?.startedAt && (
+                <DetailField label={t.dagDetail.started}>
+                  <span>{selectedTask.startedAt}</span>
+                </DetailField>
+              )}
+              {selectedTask?.finishedAt && (
+                <DetailField label={t.dagDetail.finished}>
+                  <span>{selectedTask.finishedAt}</span>
+                </DetailField>
+              )}
+              {selectedTask?.duration && (
+                <DetailField label={t.dagDetail.executionTime}>
+                  <span>{selectedTask.duration}</span>
+                </DetailField>
+              )}
+              {(selectedTask?.xcomPushCount || selectedTask?.xcomPullCount) ? (
+                <DetailField label={t.dagDetail.xcomStats}>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant="outline">push {selectedTask?.xcomPushCount ?? 0}</Badge>
+                    <Badge variant="outline">pull {selectedTask?.xcomPullCount ?? 0}</Badge>
+                  </div>
+                </DetailField>
+              ) : null}
+            </div>
+
             {selectedTask?.dependsOn && selectedTask.dependsOn.length > 0 && (
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-sm text-muted-foreground">{t.dagDetail.dependsOn}:</span>
-                {selectedTask.dependsOn.map((dep) => (
-                  <Badge key={dep} variant="secondary">{dep}</Badge>
-                ))}
+              <DetailField label={t.dagDetail.dependsOn}>
+                <div className="flex flex-wrap gap-2">
+                  {selectedTask.dependsOn.map((dep) => (
+                    <Badge key={dep} variant="secondary">{dep}</Badge>
+                  ))}
+                </div>
+              </DetailField>
+            )}
+
+            {selectedTask?.executor === "sensor" && selectedTask?.sensorTarget && (
+              <DetailField label={t.dagDetail.sensorTarget}>
+                <div className="font-mono text-[12px] break-all text-muted-foreground">
+                  {selectedTask.sensorTarget}
+                </div>
+              </DetailField>
+            )}
+
+            {selectedTask?.command && (
+              <div className="overflow-hidden rounded-2xl border border-border/70 bg-muted/25 shadow-[0_18px_40px_-24px_rgba(15,23,42,0.18)] dark:border-slate-800/80 dark:bg-slate-950 dark:text-slate-100 dark:shadow-[0_18px_40px_-24px_rgba(15,23,42,0.85)]">
+                <div className="flex items-center justify-between border-b border-border/70 bg-background/70 px-4 py-2.5 backdrop-blur dark:border-slate-800/90 dark:bg-slate-900/80">
+                  <div className="flex min-w-0 items-center gap-3">
+                    <div className="flex items-center gap-1.5">
+                      <span className="h-2.5 w-2.5 rounded-full bg-rose-400/90" />
+                      <span className="h-2.5 w-2.5 rounded-full bg-amber-300/90" />
+                      <span className="h-2.5 w-2.5 rounded-full bg-emerald-400/90" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="truncate text-xs font-medium text-foreground dark:text-slate-200">
+                        {t.dagDetail.command}
+                      </div>
+                      <div className="truncate text-[11px] text-muted-foreground dark:text-slate-400">
+                        {selectedTask.taskId || selectedTask.name}
+                      </div>
+                    </div>
+                  </div>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    onClick={handleCopyCommand}
+                    className="h-8 shrink-0 gap-1.5 rounded-lg px-2.5 text-foreground/80 hover:bg-accent hover:text-foreground dark:text-slate-200 dark:hover:bg-slate-800 dark:hover:text-white"
+                  >
+                    {copiedCommand ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                    {copiedCommand ? t.toast.commandCopied : t.common.copy}
+                  </Button>
+                </div>
+                <div className="grid grid-cols-[auto,1fr] gap-3 px-4 py-4">
+                  <div className="pt-0.5 font-mono text-xs font-semibold text-emerald-600 dark:text-emerald-400">$</div>
+                  <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words font-mono text-[12.5px] leading-6 text-slate-800 dark:text-slate-100">
+                    <code>{selectedTask.command}</code>
+                  </pre>
+                </div>
               </div>
             )}
-            {selectedTask?.duration && (
-              <div className="flex items-center gap-2">
-                <span className="text-sm text-muted-foreground">{t.dagDetail.executionTime}:</span>
-                <span className="text-sm">{selectedTask.duration}</span>
-              </div>
+
+            {selectedTask?.error && (
+              <DetailField label={t.dagDetail.error}>
+                <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-xl bg-destructive/8 px-3 py-3 font-mono text-[12px] leading-6 text-destructive">
+                  {selectedTask.error}
+                </pre>
+              </DetailField>
             )}
           </div>
         </DialogContent>

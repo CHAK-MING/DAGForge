@@ -1,9 +1,9 @@
 #include "dagforge/app/http/websocket.hpp"
-
 #include "dagforge/core/asio_awaitable.hpp"
 #include "dagforge/core/runtime.hpp"
 #include "dagforge/util/json.hpp"
 #include "dagforge/util/log.hpp"
+
 
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/associated_executor.hpp>
@@ -21,6 +21,7 @@
 #include <boost/system/system_error.hpp>
 
 #include <atomic>
+#include <array>
 #include <cstddef>
 #include <deque>
 #include <exception>
@@ -46,6 +47,40 @@ using WsStream =
 using WsTlsStream =
     beast_ws::stream<boost::asio::ssl::stream<boost::asio::ip::tcp::socket>>;
 using UpgradeRequest = beast_http::request<beast_http::empty_body>;
+
+constexpr std::array<std::uint64_t, 17> kWebSocketMessageSizeBucketsBytes{
+    64ULL,     128ULL,    256ULL,    512ULL,    1'024ULL,  2'048ULL,
+    4'096ULL,  8'192ULL,  16'384ULL, 32'768ULL, 65'536ULL, 131'072ULL,
+    262'144ULL, 524'288ULL, 1'048'576ULL, 4'194'304ULL, 8'388'608ULL};
+
+struct WebSocketMetricsState {
+  std::atomic<std::uint64_t> messages_sent_total{0};
+  std::atomic<std::uint64_t> messages_received_total{0};
+  metrics::Histogram message_size_sent{std::span<const std::uint64_t>(
+      kWebSocketMessageSizeBucketsBytes)};
+  metrics::Histogram message_size_received{std::span<const std::uint64_t>(
+      kWebSocketMessageSizeBucketsBytes)};
+};
+
+auto websocket_metrics() -> WebSocketMetricsState & {
+  static WebSocketMetricsState state;
+  return state;
+}
+
+auto record_websocket_sent(std::size_t size_bytes) -> void {
+  auto &metrics_state = websocket_metrics();
+  metrics_state.messages_sent_total.fetch_add(1, std::memory_order_relaxed);
+  metrics_state.message_size_sent.observe_ns(
+      static_cast<std::uint64_t>(size_bytes));
+}
+
+auto record_websocket_received(std::size_t size_bytes) -> void {
+  auto &metrics_state = websocket_metrics();
+  metrics_state.messages_received_total.fetch_add(1,
+                                                 std::memory_order_relaxed);
+  metrics_state.message_size_received.observe_ns(
+      static_cast<std::uint64_t>(size_bytes));
+}
 
 // Write request discriminated union — all fields needed by write_loop.
 struct WriteText {
@@ -300,6 +335,7 @@ auto WebSocketConnection::send_text(std::string text) -> spawn_task {
   if (impl->closed.load(std::memory_order_acquire)) {
     co_return;
   }
+  record_websocket_sent(text.size());
   enqueue_write(std::move(impl), WriteText{std::move(text)},
                 impl->ws.get_executor());
 }
@@ -313,6 +349,7 @@ auto WebSocketConnection::send_binary(std::vector<std::byte> data)
   if (impl->closed.load(std::memory_order_acquire)) {
     co_return;
   }
+  record_websocket_sent(data.size());
   enqueue_write(std::move(impl), WriteBinary{std::move(data)},
                 impl->ws.get_executor());
 }
@@ -322,6 +359,7 @@ auto WebSocketConnection::send_close() -> spawn_task {
   if (impl->closed.load(std::memory_order_acquire)) {
     co_return;
   }
+  record_websocket_sent(0);
   enqueue_write(std::move(impl), WriteClose{}, impl->ws.get_executor());
 }
 
@@ -335,6 +373,7 @@ auto WebSocketConnection::send_pong(std::vector<std::byte> data) -> spawn_task {
   for (std::size_t i = 0; i < data.size(); ++i) {
     payload[i] = static_cast<char>(std::to_integer<unsigned char>(data[i]));
   }
+  record_websocket_sent(payload.size());
   enqueue_write(std::move(impl), WritePong{std::move(payload)},
                 impl->ws.get_executor());
 }
@@ -391,6 +430,7 @@ auto WebSocketConnection::handle_frames(
     boost::asio::buffer_copy(
         boost::asio::buffer(payload.data(), payload.size()),
         impl->read_buffer.data());
+    record_websocket_received(data_size);
 
     const auto opcode =
         impl->ws.got_text() ? WebSocketOpCode::Text : WebSocketOpCode::Binary;
@@ -506,6 +546,7 @@ auto TlsWebSocketConnection::send_text(std::string text) -> spawn_task {
   if (impl->closed.load(std::memory_order_acquire)) {
     co_return;
   }
+  record_websocket_sent(text.size());
   enqueue_write(std::move(impl), WriteText{std::move(text)},
                 impl->ws.get_executor());
 }
@@ -519,6 +560,7 @@ auto TlsWebSocketConnection::send_binary(std::vector<std::byte> data)
   if (impl->closed.load(std::memory_order_acquire)) {
     co_return;
   }
+  record_websocket_sent(data.size());
   enqueue_write(std::move(impl), WriteBinary{std::move(data)},
                 impl->ws.get_executor());
 }
@@ -528,6 +570,7 @@ auto TlsWebSocketConnection::send_close() -> spawn_task {
   if (impl->closed.load(std::memory_order_acquire)) {
     co_return;
   }
+  record_websocket_sent(0);
   enqueue_write(std::move(impl), WriteClose{}, impl->ws.get_executor());
 }
 
@@ -541,6 +584,7 @@ auto TlsWebSocketConnection::send_pong(std::vector<std::byte> data)
   for (std::size_t i = 0; i < data.size(); ++i) {
     payload[i] = static_cast<char>(std::to_integer<unsigned char>(data[i]));
   }
+  record_websocket_sent(payload.size());
   enqueue_write(std::move(impl), WritePong{std::move(payload)},
                 impl->ws.get_executor());
 }
@@ -595,6 +639,7 @@ auto TlsWebSocketConnection::handle_frames(
     boost::asio::buffer_copy(
         boost::asio::buffer(payload.data(), payload.size()),
         impl->read_buffer.data());
+    record_websocket_received(data_size);
 
     const auto opcode =
         impl->ws.got_text() ? WebSocketOpCode::Text : WebSocketOpCode::Binary;
@@ -714,6 +759,10 @@ struct WebSocketHub::Impl : std::enable_shared_from_this<WebSocketHub::Impl> {
 
   auto broadcast_json(const std::string &json_str,
                       const std::optional<std::string> &dag_run_id) -> void {
+    if (total_connections_.load(std::memory_order_relaxed) == 0) {
+      return;
+    }
+
     const auto n = runtime.shard_count();
     for (unsigned i = 0; i < n; ++i) {
       // Post to each shard's executor so that broadcast_on_shard runs
@@ -762,6 +811,10 @@ auto WebSocketHub::remove_connection(int fd) -> void {
 }
 
 auto WebSocketHub::broadcast_log(const LogMessage &msg) -> void {
+  if (impl_->total_connections_.load(std::memory_order_relaxed) == 0) {
+    return;
+  }
+
   JsonValue j = {{"type", "log"},
                  {"timestamp", msg.timestamp},
                  {"dag_run_id", msg.dag_run_id},
@@ -772,6 +825,10 @@ auto WebSocketHub::broadcast_log(const LogMessage &msg) -> void {
 }
 
 auto WebSocketHub::broadcast_event(const EventMessage &event) -> void {
+  if (impl_->total_connections_.load(std::memory_order_relaxed) == 0) {
+    return;
+  }
+
   JsonValue j = {{"type", "event"},          {"timestamp", event.timestamp},
                  {"event", event.event},     {"dag_run_id", event.dag_run_id},
                  {"task_id", event.task_id}, {"data", event.data}};
@@ -780,6 +837,25 @@ auto WebSocketHub::broadcast_event(const EventMessage &event) -> void {
 
 auto WebSocketHub::connection_count() const -> size_t {
   return impl_->total_connections_.load(std::memory_order_relaxed);
+}
+
+auto WebSocketHub::messages_sent_total() const -> std::uint64_t {
+  return websocket_metrics().messages_sent_total.load(
+      std::memory_order_relaxed);
+}
+
+auto WebSocketHub::messages_received_total() const -> std::uint64_t {
+  return websocket_metrics().messages_received_total.load(
+      std::memory_order_relaxed);
+}
+
+auto WebSocketHub::message_size_snapshots() const
+    -> std::vector<std::pair<std::string, metrics::Histogram::Snapshot>> {
+  std::vector<std::pair<std::string, metrics::Histogram::Snapshot>> out;
+  out.emplace_back("sent", websocket_metrics().message_size_sent.snapshot());
+  out.emplace_back("received",
+                   websocket_metrics().message_size_received.snapshot());
+  return out;
 }
 
 auto WebSocketHub::close_all() -> void {

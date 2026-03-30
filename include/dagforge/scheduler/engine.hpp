@@ -1,12 +1,14 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
+#include "dagforge/io/context.hpp"
 #include "dagforge/scheduler/event_queue.hpp"
 #include "dagforge/scheduler/task.hpp"
 #include "dagforge/util/id.hpp"
+#endif
 
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/executor_work_guard.hpp>
-#include <boost/asio/io_context.hpp>
 #include <boost/asio/steady_timer.hpp>
 
 #include <atomic>
@@ -18,6 +20,7 @@
 #include <optional>
 #include <unordered_map>
 #include <vector>
+
 
 namespace dagforge {
 
@@ -44,7 +47,7 @@ public:
           const DAGId &, TimePoint)>;
 
   explicit Engine(Runtime &runtime);
-  Engine(Runtime &runtime, boost::asio::io_context &io);
+  Engine(Runtime &runtime, io::IoContext &io);
   ~Engine();
 
   Engine(const Engine &) = delete;
@@ -66,6 +69,9 @@ public:
   auto set_get_watermark_callback(GetWatermarkCallback cb) -> void;
   auto set_save_watermark_callback(SaveWatermarkCallback cb) -> void;
 
+  [[nodiscard]] auto scheduled_task_count() const -> std::size_t;
+  [[nodiscard]] auto missed_schedules_total() const -> std::uint64_t;
+
 private:
   auto run_cron_task(DAGTaskId dag_task_id, TimePoint first_time)
       -> boost::asio::awaitable<void>;
@@ -80,9 +86,9 @@ private:
   alignas(64) std::atomic<bool> stopped_{true};
   mutable std::mutex stop_mutex_;
   std::condition_variable stop_cv_;
-  boost::asio::io_context &io_;
+  io::IoContext &io_;
   std::optional<
-      boost::asio::executor_work_guard<boost::asio::io_context::executor_type>>
+      boost::asio::executor_work_guard<io::IoContext::executor_type>>
       work_guard_;
 
   // Accessed only in event loop thread
@@ -98,6 +104,7 @@ private:
   ListRunExecutionDatesCallback list_run_execution_dates_;
   GetWatermarkCallback get_watermark_;
   SaveWatermarkCallback save_watermark_;
+  std::atomic<std::uint64_t> missed_schedules_total_{0};
 };
 
 } // namespace dagforge

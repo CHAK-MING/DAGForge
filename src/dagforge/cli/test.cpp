@@ -1,12 +1,12 @@
 #include "dagforge/cli/commands.hpp"
+#include "dagforge/cli/context.hpp"
 #include "dagforge/cli/management_client.hpp"
-
-#include "dagforge/config/config.hpp"
-#include "dagforge/config/dag_definition.hpp"
+#include "dagforge/config/dag_info_loader.hpp"
 #include "dagforge/executor/composite_executor.hpp"
 #include "dagforge/util/json.hpp"
 #include "dagforge/util/log.hpp"
 #include "dagforge/util/time.hpp"
+
 
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/use_future.hpp>
@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <format>
 #include <print>
+
 
 namespace dagforge::cli {
 namespace {
@@ -29,29 +30,29 @@ auto to_executor_config(const TaskConfig &task) -> ExecutorConfig {
   return fallback ? std::move(*fallback) : ExecutorConfig{};
 }
 
-auto load_dag(const Config &config, const DAGId &dag_id) -> Result<DAGInfo> {
+auto load_dag(const SystemConfig &config, const DAGId &dag_id)
+    -> Result<DAGInfo> {
   if (!config.dag_source.directory.empty()) {
     const auto dag_file = std::filesystem::path(config.dag_source.directory) /
                           std::format("{}.toml", dag_id.str());
     if (std::filesystem::exists(dag_file)) {
-      return DAGDefinitionLoader::load_from_file(dag_file.string());
+      return DAGInfoLoader::load_from_file(dag_file.string());
     }
   }
 
-  ManagementClient client(config.database);
-  if (auto r = client.open(); !r) {
-    return fail(r.error());
+  auto client = open_client_or_print(config.database);
+  if (!client) {
+    return fail(client.error());
   }
-  return client.get_dag(dag_id);
+  return (*client)->get_dag(dag_id);
 }
 
 } // namespace
 
 auto cmd_test_task(const TestTaskOptions &opts) -> int {
   log::set_output_stderr();
-  auto config_res = ConfigLoader::load_from_file(opts.config_file);
+  auto config_res = load_config_or_print(opts.config_file);
   if (!config_res) {
-    std::println(stderr, "Error: {}", config_res.error().message());
     return 1;
   }
 
@@ -83,8 +84,13 @@ auto cmd_test_task(const TestTaskOptions &opts) -> int {
 
   auto fut = boost::asio::co_spawn(
       runtime.shard(0).ctx(),
-      execute_async(runtime, *executor, InstanceId{iid},
-                    to_executor_config(*task)),
+      execute_async(runtime, *executor,
+                    ExecutorRequest{.instance_id = InstanceId{iid},
+                                    .command = task->command,
+                                    .working_dir = task->working_dir,
+                                    .execution_timeout = task->execution_timeout,
+                                    .config = to_executor_config(*task),
+                                    .memory_resource = {}}),
       boost::asio::use_future);
 
   ExecutorResult result;

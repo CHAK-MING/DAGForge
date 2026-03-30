@@ -1,18 +1,14 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
+#include <cstdint>
 #include <string>
 #include <system_error>
-
-#include "dagforge/core/error.hpp"
+#include <type_traits>
+#include <utility>
+#endif
 
 namespace dagforge::io {
-
-// I/O Error Codes
-//
-// This category intentionally groups transport-facing failures under one
-// project category. We still map common cases back to `std::errc` via
-// equivalent(), but callers also rely on the stable DAGForge-specific domain
-// for API/status translation and cross-module error handling.
 
 enum class IoError : std::uint8_t {
   Success = 0,
@@ -34,6 +30,8 @@ enum class IoError : std::uint8_t {
 
 class IoErrorCategory : public std::error_category {
 public:
+  ~IoErrorCategory() override = default;
+
   [[nodiscard]] auto name() const noexcept -> const char * override {
     return "dagforge.io";
   }
@@ -74,7 +72,6 @@ public:
     std::unreachable();
   }
 
-  // Bring base class overloads into scope to avoid hiding
   using std::error_category::equivalent;
 
   [[nodiscard]] auto equivalent(int code,
@@ -114,6 +111,5 @@ public:
 
 } // namespace dagforge::io
 
-// Enable ADL for error_code
 template <>
 struct std::is_error_code_enum<dagforge::io::IoError> : std::true_type {};

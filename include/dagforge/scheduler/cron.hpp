@@ -1,13 +1,18 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/core/error.hpp"
+#endif
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include <bitset>
 #include <chrono>
+#include <cstddef>
 #include <generator>
 #include <string>
 #include <string_view>
 #include <vector>
+#endif
 
 namespace dagforge {
 
@@ -27,7 +32,7 @@ public:
 
   [[nodiscard]] auto all_between(std::chrono::system_clock::time_point start,
                                  std::chrono::system_clock::time_point end,
-                                 size_t max_count = 1000) const
+                                 std::size_t max_count = 1000) const
       -> std::vector<std::chrono::system_clock::time_point>;
 
   [[nodiscard]] auto raw() const noexcept -> std::string_view { return raw_; }

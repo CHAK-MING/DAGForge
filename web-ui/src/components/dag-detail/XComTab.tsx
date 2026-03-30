@@ -8,6 +8,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { RunRecord, XComValue } from "@/lib/api";
+import { useI18n } from "@/contexts/I18nContext";
 
 interface XComTabProps {
   runs: RunRecord[];
@@ -22,6 +23,7 @@ export function XComTab({
   xcomData,
   onSelectRun,
 }: XComTabProps) {
+  const { t } = useI18n();
   const selectedRun = runs.find(r => r.dag_run_id === selectedRunId);
 
   return (
@@ -29,9 +31,9 @@ export function XComTab({
       <CardHeader>
         <div className="flex items-center justify-between">
           <div>
-            <CardTitle className="text-base">XCom 跨任务数据</CardTitle>
+            <CardTitle className="text-base">{t.dagDetail.xcomData}</CardTitle>
             <p className="text-sm text-muted-foreground mt-1">
-              任务间传递的数据值
+              {t.dagDetail.xcomDescription}
             </p>
           </div>
           {runs.length > 0 && (
@@ -40,14 +42,14 @@ export function XComTab({
               onValueChange={onSelectRun}
             >
               <SelectTrigger className="w-48">
-                <SelectValue placeholder="选择运行实例" />
+                <SelectValue placeholder={t.dagDetail.selectRun} />
               </SelectTrigger>
               <SelectContent>
                 {runs.map((run, index) => {
                   const num = runs.length - index;
                   return (
                     <SelectItem key={run.dag_run_id} value={run.dag_run_id}>
-                      Run #{num} - {run.state === "success" ? "成功" : run.state === "failed" ? "失败" : "运行中"}
+                      Run #{num} - {t.runStatus[run.state]}
                     </SelectItem>
                   );
                 })}
@@ -59,7 +61,7 @@ export function XComTab({
       <CardContent>
         {!selectedRun ? (
           <div className="text-center py-8 text-muted-foreground">
-            请选择一个运行实例查看 XCom 数据
+            {t.dagDetail.selectRunToView}
           </div>
         ) : Object.keys(xcomData).length > 0 ? (
           <div className="space-y-4">
@@ -68,7 +70,7 @@ export function XComTab({
                 <div className="flex items-center gap-2 mb-3">
                   <Badge variant="outline">{taskId}</Badge>
                   <span className="text-sm text-muted-foreground">
-                    {Object.keys(values).length} 个键值
+                    {Object.keys(values).length} {t.dagDetail.variables}
                   </span>
                 </div>
                 <div className="bg-muted/50 rounded p-3 font-mono text-sm overflow-x-auto">
@@ -79,7 +81,7 @@ export function XComTab({
           </div>
         ) : (
           <div className="text-center py-8 text-muted-foreground">
-            该运行实例没有 XCom 数据
+            {t.dagDetail.noXcom}
           </div>
         )}
       </CardContent>

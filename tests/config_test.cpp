@@ -1,4 +1,4 @@
-#include "dagforge/config/config.hpp"
+#include "dagforge/config/system_config_loader.hpp"
 #include "dagforge/config/task_config.hpp"
 
 #include "gtest/gtest.h"
@@ -61,7 +61,7 @@ directory = "./dags"
 scan_interval_sec = 30
 )";
 
-  auto result = ConfigLoader::load_from_string(toml);
+  auto result = SystemConfigLoader::load_from_string(toml);
   ASSERT_TRUE(result.has_value()) << result.error().message();
 
   EXPECT_EQ(result->database.database, "dagforge_test");
@@ -101,7 +101,7 @@ directory = "./dags"
 port = 8080
 )";
 
-  auto result = ConfigLoader::load_from_string(toml);
+  auto result = SystemConfigLoader::load_from_string(toml);
 
   ::unsetenv(kApiPort);
   ::unsetenv(kDbHost);

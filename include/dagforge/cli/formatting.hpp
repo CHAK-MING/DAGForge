@@ -1,6 +1,8 @@
 #pragma once
 
+#ifndef DAGFORGE_BUILDING_MODULE_INTERFACE
 #include "dagforge/util/time.hpp"
+#endif
 
 #include <chrono>
 #include <cstdio>
@@ -10,6 +12,7 @@
 #include <string_view>
 #include <unistd.h>
 #include <vector>
+
 
 namespace dagforge::cli::fmt {
 

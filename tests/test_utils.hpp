@@ -1,19 +1,22 @@
 #pragma once
 
 #include "dagforge/core/coroutine.hpp"
+#include "dagforge/config/system_config.hpp"
+#include "dagforge/app/services/persistence_service.hpp"
 #include "dagforge/dag/dag_manager.hpp"
+#include "dagforge/io/context.hpp"
 #include "dagforge/util/id.hpp"
 
 #include <arpa/inet.h>
 #include <atomic>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
-#include <boost/asio/io_context.hpp>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <format>
 #include <functional>
 #include <mutex>
 #include <netinet/in.h>
@@ -31,13 +34,51 @@
 
 namespace dagforge::test {
 
-// Run a coroutine synchronously on a fresh io_context and return its result.
+[[nodiscard]] inline auto env_or_default(const char *key, std::string fallback)
+    -> std::string {
+  if (const char *v = std::getenv(key); v && *v != '\0') {
+    return v;
+  }
+  return fallback;
+}
+
+[[nodiscard]] inline auto unique_token(std::string_view base) -> std::string {
+  static std::atomic<std::uint64_t> seq{0};
+  const auto n = seq.fetch_add(1, std::memory_order_relaxed);
+  return std::format("{}_{}", base, n);
+}
+
+[[nodiscard]] inline auto load_test_db_config() -> DatabaseConfig {
+  DatabaseConfig cfg;
+  cfg.host = env_or_default("DAGFORGE_TEST_MYSQL_HOST", cfg.host);
+  cfg.username = env_or_default("DAGFORGE_TEST_MYSQL_USER", cfg.username);
+  cfg.password = env_or_default("DAGFORGE_TEST_MYSQL_PASSWORD", cfg.password);
+  cfg.database = env_or_default(
+      "DAGFORGE_TEST_MYSQL_DB",
+      std::format("dagforge_test_{}", static_cast<long long>(::getpid())));
+  cfg.connect_timeout = 2;
+  return cfg;
+}
+
+[[nodiscard]] inline auto make_test_config(std::uint16_t api_port = 0)
+    -> SystemConfig {
+  SystemConfig cfg{};
+  cfg.api.enabled = true;
+  cfg.api.host = "127.0.0.1";
+  cfg.api.port = api_port;
+  cfg.scheduler.shards = 2;
+  cfg.scheduler.max_concurrency = 16;
+  cfg.database = load_test_db_config();
+  return cfg;
+}
+
+// Run a coroutine synchronously on a fresh IoContext and return its result.
 // Aborts (throws) if the coroutine does not complete within `timeout`.
 template <typename T>
 [[nodiscard]] inline auto
 run_coro(task<T> coro,
          std::chrono::milliseconds timeout = std::chrono::seconds(10)) -> T {
-  boost::asio::io_context io;
+  io::IoContext io;
   std::exception_ptr eptr;
   std::optional<T> result;
   boost::asio::co_spawn(
@@ -47,7 +88,7 @@ run_coro(task<T> coro,
         co_return;
       },
       [&](std::exception_ptr e) { eptr = e; });
-  io.run_for(timeout);
+  (void)io.run_for(timeout);
   if (!result && !eptr)
     throw std::runtime_error("run_coro timed out");
   if (eptr)
@@ -59,7 +100,7 @@ run_coro(task<T> coro,
 inline auto
 run_coro(task<void> coro,
          std::chrono::milliseconds timeout = std::chrono::seconds(10)) -> void {
-  boost::asio::io_context io;
+  io::IoContext io;
   std::exception_ptr eptr;
   bool done = false;
   boost::asio::co_spawn(
@@ -70,11 +111,30 @@ run_coro(task<void> coro,
         co_return;
       },
       [&](std::exception_ptr e) { eptr = e; });
-  io.run_for(timeout);
+  (void)io.run_for(timeout);
   if (!done && !eptr)
     throw std::runtime_error("run_coro timed out");
   if (eptr)
     std::rethrow_exception(eptr);
+}
+
+inline auto reset_mysql_test_database(const DatabaseConfig &db_cfg) -> void {
+  Runtime runtime(1);
+  auto runtime_res = runtime.start();
+  if (!runtime_res) {
+    return;
+  }
+
+  {
+    PersistenceService service(runtime, db_cfg);
+    auto open_res = run_coro(service.open());
+    if (open_res) {
+      auto clear_res = run_coro(service.clear_all_dag_data());
+      (void)clear_res;
+    }
+    run_coro(service.close());
+  }
+  runtime.stop();
 }
 
 template <typename Predicate>
